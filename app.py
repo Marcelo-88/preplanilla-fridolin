@@ -10,7 +10,7 @@ st.set_page_config(
     layout="wide"
 )
 
-st.title("🏭 Sistema de Pre-Planilla - Fridolin")
+st.title("🏭 Control de Asistencia y Reportes - Fridolin")
 
 st.sidebar.image("https://em-content.zobj.net/source/apple/354/factory_1f3ed.png", width=80)
 st.sidebar.title("Menú Principal")
@@ -71,42 +71,57 @@ elif opcion == "✅ Aprobaciones Supervisores":
         st.error(f"Error al cargar la pestaña: {e}")
 
 elif opcion == "📑 Pre-Planilla y Reportes":
-    st.header("Generación y Procesamiento de Pre-Planilla")
+    st.header("Reporte Consolidado de Asistencia para RRHH / Contabilidad")
     
-    with st.spinner("Procesando datos del biométrico..."):
+    with st.spinner("Procesando marcaciones y tiempos..."):
         try:
             df_bio = load_sheet_data("02_Importacion_Biometrico")
             df_params = load_sheet_data("05_Parametros_y_Reglas")
             
-            df_resultado = process_attendance(df_bio, df_params)
+            try:
+                df_nov = load_sheet_data("04_Novedades_y_Permisos")
+            except Exception:
+                df_nov = None
+                
+            df_resultado = process_attendance(df_bio, df_params, df_nov)
             
             if not df_resultado.empty:
-                # Filtro por Empleado
-                empleados = ["Todos"] + list(df_resultado['Nombre'].unique())
-                emp_sel = st.selectbox("Filtrar por Empleado:", empleados)
+                col_filtro1, col_filtro2 = st.columns(2)
+                
+                with col_filtro1:
+                    empleados = ["Todos"] + list(df_resultado['Nombre'].unique())
+                    emp_sel = st.selectbox("Filtrar por Empleado:", empleados)
+                
+                with col_filtro2:
+                    turnos = ["Todos", "Diurno", "Nocturno"]
+                    turno_sel = st.selectbox("Filtrar por Turno:", turnos)
                 
                 df_filtrado = df_resultado.copy()
                 if emp_sel != "Todos":
                     df_filtrado = df_filtrado[df_filtrado['Nombre'] == emp_sel]
+                if turno_sel != "Todos":
+                    df_filtrado = df_filtrado[df_filtrado['Turno Dominante'] == turno_sel]
                 
-                st.subheader("Resumen de Asistencia Procesada")
+                st.subheader("Planilla de Control de Tiempos")
                 st.dataframe(df_filtrado, use_container_width=True, hide_index=True)
                 
-                # Resumen de métricas
-                col1, col2, col3 = st.columns(3)
-                col1.metric("Total Días Procesados", len(df_filtrado))
-                col2.metric("Total Horas Trabajadas", f"{df_filtrado['Horas Trabajadas'].sum():.2f} hrs")
-                col3.metric("Total Minutos Atraso", f"{df_filtrado['Atraso (Minutos)'].sum()} min")
+                # Métricas operativas (sin montos de dinero)
+                col1, col2, col3, col4, col5 = st.columns(5)
+                col1.metric("Días / Registros", len(df_filtrado))
+                col2.metric("Total Horas Trabalhadas", f"{df_filtrado['Horas Trabajadas'].sum():.2f} hrs")
+                col3.metric("Total Atrasos", f"{df_filtrado['Atraso (Minutos)'].sum()} min")
+                col4.metric("Horas Extras", f"{df_filtrado['Horas Extras'].sum():.2f} hrs")
+                col5.metric("Horas Nocturnas", f"{df_filtrado['Horas Nocturnas'].sum():.2f} hrs")
                 
-                # Función para generar descarga Excel
+                # Botón de Descarga Excel
                 buffer = io.BytesIO()
                 with pd.ExcelWriter(buffer, engine='openpyxl') as writer:
-                    df_filtrado.to_excel(writer, index=False, sheet_name='Pre-Planilla')
+                    df_filtrado.to_excel(writer, index=False, sheet_name='Reporte_Asistencia')
                 
                 st.download_button(
-                    label="📥 Descargar Reporte en Excel",
+                    label="📥 Descargar Reporte de Asistencia (Excel)",
                     data=buffer.getvalue(),
-                    file_name="PrePlanilla_Fridolin.xlsx",
+                    file_name="Reporte_Asistencia_Fridolin.xlsx",
                     mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
                 )
             else:
