@@ -33,37 +33,45 @@ def process_attendance(df_bio, df_params, df_novedades=None, df_empleados=None):
     - Reporta Días, Horas Trabajadas, Atrasos (min), Horas Extras y Horas Nocturnas.
     - Identifica tipo de turno (Diurno / Nocturno) y cómputo de turno para Jornaleros.
     """
-    if df_bio.empty:
+    if df_bio is None or df_bio.empty:
         return pd.DataFrame()
     
     df = df_bio.copy()
     
-    df['Fecha_Hora'] = pd.to_datetime(df['Fecha_Hora'], format='%d/%m/%Y %H:%M', errors='coerce')
-    df = df.dropna(subset=['Fecha_Hora'])
-    df['Fecha'] = df['Fecha_Hora'].dt.date
+    # Asegurar nombres de columnas principales
+    col_id = [c for c in df.columns if str(c).strip().upper() in ['ID', 'ID_EMPLEADO', 'CODIGO', 'CI']][0] if any(str(c).strip().upper() in ['ID', 'ID_EMPLEADO', 'CODIGO', 'CI'] for c in df.columns) else df.columns[0]
+    col_nombre = [c for c in df.columns if str(c).strip().upper() in ['NOMBRE', 'EMPLEADO', 'NOMBRES']][0] if any(str(c).strip().upper() in ['NOMBRE', 'EMPLEADO', 'NOMBRES'] for c in df.columns) else df.columns[1]
+    col_fecha_hora = [c for c in df.columns if 'FECHA' in str(c).strip().upper() or 'HORA' in str(c).strip().upper()][0] if any('FECHA' in str(c).strip().upper() or 'HORA' in str(c).strip().upper() for c in df.columns) else df.columns[2]
+    col_estado = [c for c in df.columns if str(c).strip().upper() in ['ESTADO', 'TIPO', 'TIPO_REGISTRO', 'EVENTO']][0] if any(str(c).strip().upper() in ['ESTADO', 'TIPO', 'TIPO_REGISTRO', 'EVENTO'] for c in df.columns) else df.columns[3]
+
+    df['Fecha_Hora_Parsed'] = pd.to_datetime(df[col_fecha_hora], format='%d/%m/%Y %H:%M', errors='coerce')
+    df = df.dropna(subset=['Fecha_Hora_Parsed'])
+    df['Fecha'] = df['Fecha_Hora_Parsed'].dt.date
     
     tolerancia_min = 10
     jornada_diurna = 8.5
     
     if df_params is not None and not df_params.empty:
         try:
-            tol_row = df_params[df_params['Parametro'].str.strip() == 'Tolerancia_Retraso_Min']
+            param_col = df_params.columns[0]
+            val_col = df_params.columns[1]
+            tol_row = df_params[df_params[param_col].astype(str).str.strip() == 'Tolerancia_Retraso_Min']
             if not tol_row.empty:
-                tolerancia_min = int(tol_row['Valor'].values[0])
-            jornada_row = df_params[df_params['Parametro'].str.strip() == 'Horas_Jornada_Diurna']
+                tolerancia_min = int(tol_row[val_col].values[0])
+            jornada_row = df_params[df_params[param_col].astype(str).str.strip() == 'Horas_Jornada_Diurna']
             if not jornada_row.empty:
-                jornada_diurna = float(str(jornada_row['Valor'].values[0]).replace(',', '.'))
+                jornada_diurna = float(str(jornada_row[val_col].values[0]).replace(',', '.'))
         except Exception:
             pass
 
     records = []
     
-    for (emp_id, nombre, fecha), group in df.groupby(['ID', 'Nombre', 'Fecha']):
-        entradas = group[group['Estado'].str.strip().str.capitalize() == 'Entrada']
-        salidas = group[group['Estado'].str.strip().str.capitalize() == 'Salida']
+    for (emp_id, nombre, fecha), group in df.groupby([col_id, col_nombre, 'Fecha']):
+        entradas = group[group[col_estado].astype(str).str.strip().str.capitalize() == 'Entrada']
+        salidas = group[group[col_estado].astype(str).str.strip().str.capitalize() == 'Salida']
         
-        hora_entrada = entradas['Fecha_Hora'].min() if not entradas.empty else None
-        hora_salida = salidas['Fecha_Hora'].max() if not salidas.empty else None
+        hora_entrada = entradas['Fecha_Hora_Parsed'].min() if not entradas.empty else None
+        hora_salida = salidas['Fecha_Hora_Parsed'].max() if not salidas.empty else None
         
         horas_trabajadas = 0.0
         atraso_min = 0
@@ -84,12 +92,17 @@ def process_attendance(df_bio, df_params, df_novedades=None, df_empleados=None):
                 
             # Descuento de atraso si existe novedad/permiso justificado
             if df_novedades is not None and not df_novedades.empty:
-                permiso = df_novedades[
-                    (df_novedades['ID'].astype(str) == str(emp_id)) & 
-                    (df_novedades['Fecha'].astype(str) == fecha.strftime('%d/%m/%Y'))
-                ]
-                if not permiso.empty:
-                    atraso_min = 0
+                try:
+                    nov_id_col = [c for c in df_novedades.columns if str(c).strip().upper() in ['ID', 'ID_EMPLEADO', 'CODIGO']][0]
+                    nov_f_col = [c for c in df_novedades.columns if 'FECHA' in str(c).strip().upper()][0]
+                    permiso = df_novedades[
+                        (df_novedades[nov_id_col].astype(str) == str(emp_id)) & 
+                        (df_novedades[nov_f_col].astype(str) == fecha.strftime('%d/%m/%Y'))
+                    ]
+                    if not permiso.empty:
+                        atraso_min = 0
+                except Exception:
+                    pass
             
             # Excedente de horas
             if horas_trabajadas > jornada_diurna:
