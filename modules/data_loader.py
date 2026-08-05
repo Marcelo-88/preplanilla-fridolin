@@ -1,29 +1,18 @@
 import streamlit as st
 import pandas as pd
-import gspread
-from google.oauth2.service_account import Credentials
+import re
 
-# Alcances requeridos para Google Sheets y Drive
-SCOPES = [
-    "https://www.googleapis.com/auth/spreadsheets",
-    "https://www.googleapis.com/auth/drive"
-]
+def get_sheet_id(url: str) -> str:
+    """Extrae el ID del Google Sheet desde la URL completa."""
+    match = re.search(r"/d/([a-zA-Z0-9-_]+)", url)
+    if match:
+        return match.group(1)
+    raise ValueError("URL de Google Sheet inválida")
 
-@st.cache_resource
-def get_gspread_client():
-    """Autentica y devuelve el cliente de gspread utilizando los secretos de Streamlit."""
-    credentials_dict = dict(st.secrets["gcp_service_account"])
-    credentials = Credentials.from_service_account_info(
-        credentials_dict, 
-        scopes=SCOPES
-    )
-    return gspread.authorize(credentials)
-
-@st.cache_data(ttl=300)  # Caché de 5 minutos para optimizar lecturas
+@st.cache_data(ttl=300)  # Reutiliza datos durante 5 minutos
 def load_sheet_data(sheet_name: str) -> pd.DataFrame:
-    """Carga una pestaña específica de Google Sheets en un DataFrame de pandas."""
-    client = get_gspread_client()
-    spreadsheet = client.open_by_url(st.secrets["gsheets"]["spreadsheet_url"])
-    worksheet = spreadsheet.worksheet(sheet_name)
-    data = worksheet.get_all_records()
-    return pd.DataFrame(data)
+    """Carga una pestaña de Google Sheets mediante exportación CSV."""
+    sheet_url = st.secrets["gsheets"]["spreadsheet_url"]
+    sheet_id = get_sheet_id(sheet_url)
+    csv_url = f"https://docs.google.com/spreadsheets/d/{sheet_id}/gviz/tq?tqx=out:csv&sheet={sheet_name}"
+    return pd.read_csv(csv_url)
