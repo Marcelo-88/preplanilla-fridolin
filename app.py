@@ -79,11 +79,16 @@ elif opcion == "📑 Pre-Planilla y Reportes":
             df_params = load_sheet_data("05_Parametros_y_Reglas")
             
             try:
+                df_emp = load_sheet_data("01_Maestro_Empleados")
+            except Exception:
+                df_emp = None
+                
+            try:
                 df_nov = load_sheet_data("04_Novedades_y_Permisos")
             except Exception:
                 df_nov = None
                 
-            df_resultado = process_attendance(df_bio, df_params, df_nov)
+            df_resultado = process_attendance(df_bio, df_params, df_nov, df_emp)
             
             if not df_resultado.empty:
                 col_filtro1, col_filtro2 = st.columns(2)
@@ -108,7 +113,7 @@ elif opcion == "📑 Pre-Planilla y Reportes":
                 # Métricas operativas (sin montos de dinero)
                 col1, col2, col3, col4, col5 = st.columns(5)
                 col1.metric("Días / Registros", len(df_filtrado))
-                col2.metric("Total Horas Trabalhadas", f"{df_filtrado['Horas Trabajadas'].sum():.2f} hrs")
+                col2.metric("Total Horas Trabajadas", f"{df_filtrado['Horas Trabajadas'].sum():.2f} hrs")
                 col3.metric("Total Atrasos", f"{df_filtrado['Atraso (Minutos)'].sum()} min")
                 col4.metric("Horas Extras", f"{df_filtrado['Horas Extras'].sum():.2f} hrs")
                 col5.metric("Horas Nocturnas", f"{df_filtrado['Horas Nocturnas'].sum():.2f} hrs")
