@@ -1,5 +1,6 @@
 import streamlit as st
 import pandas as pd
+import io
 from modules.data_loader import load_sheet_data
 from modules.attendance_processor import process_attendance
 
@@ -80,14 +81,34 @@ elif opcion == "📑 Pre-Planilla y Reportes":
             df_resultado = process_attendance(df_bio, df_params)
             
             if not df_resultado.empty:
+                # Filtro por Empleado
+                empleados = ["Todos"] + list(df_resultado['Nombre'].unique())
+                emp_sel = st.selectbox("Filtrar por Empleado:", empleados)
+                
+                df_filtrado = df_resultado.copy()
+                if emp_sel != "Todos":
+                    df_filtrado = df_filtrado[df_filtrado['Nombre'] == emp_sel]
+                
                 st.subheader("Resumen de Asistencia Procesada")
-                st.dataframe(df_resultado, use_container_width=True, hide_index=True)
+                st.dataframe(df_filtrado, use_container_width=True, hide_index=True)
                 
                 # Resumen de métricas
                 col1, col2, col3 = st.columns(3)
-                col1.metric("Total Días Procesados", len(df_resultado))
-                col2.metric("Total Horas Trabajadas", f"{df_resultado['Horas Trabajadas'].sum():.2f} hrs")
-                col3.metric("Total Minutos Atraso", f"{df_resultado['Atraso (Minutos)'].sum()} min")
+                col1.metric("Total Días Procesados", len(df_filtrado))
+                col2.metric("Total Horas Trabajadas", f"{df_filtrado['Horas Trabajadas'].sum():.2f} hrs")
+                col3.metric("Total Minutos Atraso", f"{df_filtrado['Atraso (Minutos)'].sum()} min")
+                
+                # Función para generar descarga Excel
+                buffer = io.BytesIO()
+                with pd.ExcelWriter(buffer, engine='openpyxl') as writer:
+                    df_filtrado.to_excel(writer, index=False, sheet_name='Pre-Planilla')
+                
+                st.download_button(
+                    label="📥 Descargar Reporte en Excel",
+                    data=buffer.getvalue(),
+                    file_name="PrePlanilla_Fridolin.xlsx",
+                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+                )
             else:
                 st.warning("No hay datos disponibles para procesar.")
         except Exception as e:
