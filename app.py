@@ -35,6 +35,17 @@ def run_cached_exceptions(df_res):
 def run_cached_canje(df_res):
     return get_canje_summary(df_res)
 
+def obtener_decisiones_defensivo(lm, periodo):
+    """
+    Función de apoyo defensiva para prevenir errores si Streamlit Cloud no ha limpiado el caché.
+    """
+    if hasattr(lm, 'obtener_decisiones_excepciones'):
+        try:
+            return lm.obtener_decisiones_excepciones(periodo)
+        except Exception:
+            return {}
+    return {}
+
 st.set_page_config(
     page_title="Pre-Planilla Fridolin",
     page_icon="🏭",
@@ -289,7 +300,7 @@ elif opcion == "✅ Aprobaciones Supervisores":
         df_excepciones = filter_dataframe_by_supervisor(df_excepciones, 'Carnet_Identidad', empleados_permitidos, rol_actual)
         df_canje_resumen = filter_dataframe_by_supervisor(df_canje_resumen, 'Carnet_Identidad', empleados_permitidos, rol_actual)
 
-        decisiones_previas = lock_mgr.obtener_decisiones_excepciones(periodo_sel)
+        decisiones_previas = obtener_decisiones_defensivo(lock_mgr, periodo_sel)
         if df_excepciones is not None and not df_excepciones.empty:
             for idx, r in df_excepciones.iterrows():
                 key = (clean_ci_str(r['Carnet_Identidad']), str(r['Fecha']).strip(), str(r['Tipo Excepción']).strip())
@@ -428,12 +439,32 @@ elif opcion == "📑 Pre-Planilla y Reportes":
 
             df_resultado = run_cached_attendance_processing(df_bio_rep, df_params, df_emp, nov_mgr)
 
-            # ASEGURAR QUE EL CI NUNCA SEA NULO NI VACÍO
+            # AUTOCOMPLETADO Y RELLENO DEFENSIVO DE CARNET DE IDENTIDAD
             if df_resultado is not None and not df_resultado.empty:
-                if 'Carnet_Identidad' in df_resultado.columns:
-                    df_resultado['Carnet_Identidad'] = df_resultado['Carnet_Identidad'].apply(clean_ci_str)
+                # 1. Crear mapa de Nombre -> CI desde el Maestro de Empleados
+                mapa_nombre_ci = {}
+                if df_emp is not None and not df_emp.empty:
+                    for _, row_e in df_emp.iterrows():
+                        nom_m = str(row_e.get('Nombre_Completo', row_e.get('Nombre', ''))).strip().upper()
+                        ci_m = clean_ci_str(row_e.get('Carnet_Identidad', ''))
+                        if nom_m and ci_m:
+                            mapa_nombre_ci[nom_m] = ci_m
 
-                # Reordenar columnas para que Carnet_Identidad aparezca de primero
+                # 2. Asegurar columna Carnet_Identidad
+                if 'Carnet_Identidad' not in df_resultado.columns:
+                    df_resultado['Carnet_Identidad'] = ""
+
+                # 3. Limpiar y rellenar faltantes por Nombre si están en blanco
+                def rellenar_ci(row):
+                    ci_actual = clean_ci_str(row.get('Carnet_Identidad', ''))
+                    if ci_actual:
+                        return ci_actual
+                    nom_r = str(row.get('Nombre', '')).strip().upper()
+                    return mapa_nombre_ci.get(nom_r, "")
+
+                df_resultado['Carnet_Identidad'] = df_resultado.apply(rellenar_ci, axis=1)
+
+                # 4. Reordenar columnas para visualización clara
                 cols = list(df_resultado.columns)
                 if 'Carnet_Identidad' in cols:
                     cols.remove('Carnet_Identidad')
@@ -442,7 +473,7 @@ elif opcion == "📑 Pre-Planilla y Reportes":
 
             # Impactar decisiones guardadas en la Pre-Planilla
             if df_resultado is not None and not df_resultado.empty and p_sel_rep != "Todos":
-                decisiones_guardadas = lock_mgr.obtener_decisiones_excepciones(p_sel_rep)
+                decisiones_guardadas = obtener_decisiones_defensivo(lock_mgr, p_sel_rep)
                 for idx, row in df_resultado.iterrows():
                     ci_row = clean_ci_str(row.get('Carnet_Identidad', ''))
                     f_row = str(row.get('Fecha', '')).strip()
