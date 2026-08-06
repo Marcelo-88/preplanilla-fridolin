@@ -53,13 +53,25 @@ if opcion == "📊 Parámetros y Reglas":
         st.error(f"Error al cargar la pestaña: {e}")
 
 # -----------------------------------------------------------------------------
-# 2. MAESTRO DE EMPLEADOS (PÚBLICO)
+# 2. MAESTRO DE EMPLEADOS (PÚBLICO - CON SEGURIDAD Y LIMPIEZA DE PIN)
 # -----------------------------------------------------------------------------
 elif opcion == "👥 Maestro de Empleados":
     st.header("Maestro de Empleados")
     try:
         df_emp = load_sheet_data("01_Maestro_Empleados")
-        st.dataframe(df_emp, use_container_width=True, hide_index=True)
+        
+        if df_emp is not None and not df_emp.empty:
+            # 1. Eliminar columnas vacías creadas por Google Sheets (Unnamed)
+            cols_visibles = [c for c in df_emp.columns if not str(c).startswith('Unnamed')]
+            
+            # 2. Ocultar la columna PIN por seguridad
+            cols_visibles = [c for c in cols_visibles if str(c).strip().upper() != 'PIN']
+            
+            # Renderizar solo el catálogo seguro
+            st.dataframe(df_emp[cols_visibles], use_container_width=True, hide_index=True)
+        else:
+            st.info("No hay datos disponibles en el Maestro de Empleados.")
+            
     except Exception as e:
         st.error(f"Error al cargar la pestaña: {e}")
 
