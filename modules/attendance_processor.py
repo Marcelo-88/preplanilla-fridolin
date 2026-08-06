@@ -5,6 +5,16 @@ from datetime import datetime, time, timedelta
 TOLERANCIA_MINUTOS = 10
 DESCUENTO_COMIDA_HORAS = 0.5  # 30 minutos obligatorios
 
+DIAS_ESPANOL = {
+    0: 'Lunes',
+    1: 'Martes',
+    2: 'Miércoles',
+    3: 'Jueves',
+    4: 'Viernes',
+    5: 'Sábado',
+    6: 'Domingo'
+}
+
 def process_attendance(df_bio, df_params=None, df_nov=None, df_emp=None, nov_mgr=None):
     if df_bio is None or df_bio.empty:
         return pd.DataFrame()
@@ -60,9 +70,8 @@ def process_attendance(df_bio, df_params=None, df_nov=None, df_emp=None, nov_mgr
 
     registros = []
 
-    # 4. Iteración Módulo por Empleado y por Día Calendario (Control de Días sin Marcación)
+    # 4. Iteración Módulo por Empleado y por Día Calendario
     for emp_id_str in todos_emp_ids:
-        # Recuperar Nombre y Turno Asignado
         emp_nombre = dict_nombres_master.get(emp_id_str)
         if not emp_nombre:
             match_bio = df[df[col_id].astype(str).str.strip() == emp_id_str]
@@ -72,18 +81,18 @@ def process_attendance(df_bio, df_params=None, df_nov=None, df_emp=None, nov_mgr
         turno_asignado = dict_turno_personal.get(emp_id_str, "Diurno").capitalize()
         es_turno_nocturno_fijo = "Nocturno" in turno_asignado
 
-        # Filtrar marcaciones del empleado
         group_emp = df[df[col_id].astype(str).str.strip() == emp_id_str]
 
         for single_date in rango_dias:
             fecha_dt = single_date.date()
             fecha_str = fecha_dt.strftime('%Y-%m-%d')
             dia_semana = fecha_dt.weekday() # 0 = Lunes, 5 = Sábado, 6 = Domingo
+            dia_nombre_esp = DIAS_ESPANOL.get(dia_semana, fecha_dt.strftime('%A'))
+            
             es_domingo = (dia_semana == 6)
             es_sabado = (dia_semana == 5)
             es_viernes = (dia_semana == 4)
 
-            # Buscar marcaciones de este día específico
             punches_dia = group_emp[group_emp['dt_parsed'].dt.date == fecha_dt].to_dict('records')
 
             # --- CASO A: EL EMPLEADO REGISTRÓ MARCACIÓN ---
@@ -111,12 +120,10 @@ def process_attendance(df_bio, df_params=None, df_nov=None, df_emp=None, nov_mgr
                     hora_in_str = dt_in.strftime('%H:%M')
                     hora_out_str = dt_out.strftime('%H:%M') if dt_out else 'Falta Marcación'
 
-                    # Detectar si la jornada es Nocturna por Hora de Entrada o Configuración
                     es_ingreso_nocturno = (dt_in.hour >= 18 or dt_in.hour < 5)
                     es_nocturno = es_turno_nocturno_fijo or es_ingreso_nocturno
                     turno_label = 'Nocturno' if es_nocturno else 'Diurno'
 
-                    # Cálculo de horas trabajadas
                     if dt_out:
                         horas_brutas = (dt_out - dt_in).total_seconds() / 3600.0
                         if dt_out <= dt_in:
@@ -126,14 +133,12 @@ def process_attendance(df_bio, df_params=None, df_nov=None, df_emp=None, nov_mgr
 
                     horas_netas = max(0.0, round(horas_brutas - DESCUENTO_COMIDA_HORAS, 2)) if horas_brutas > 0 else 0.0
 
-                    # Tolerancia y Atrasos
                     hora_esperada = time(22, 0) if es_nocturno else time(7, 30)
                     dt_esperada = datetime.combine(dt_in.date(), hora_esperada)
                     
                     minutos_diferencia = (dt_in - dt_esperada).total_seconds() / 60.0
                     atraso_minutos = max(0, int(minutos_diferencia - TOLERANCIA_MINUTOS)) if minutos_diferencia > TOLERANCIA_MINUTOS else 0
 
-                    # Evaluación de Novedades / Licencias
                     novedad_activa = None
                     exento_faltas = False
                     exento_atrasos = False
@@ -154,16 +159,15 @@ def process_attendance(df_bio, df_params=None, df_nov=None, df_emp=None, nov_mgr
                     horas_extras = 0.0
                     horas_nocturnas = horas_netas if es_nocturno else 0.0
 
-                    # REGLA DOMINGO: Nocturno iniciando semana vs Diurno en Temporada Alta
                     if es_domingo:
                         if es_nocturno and dt_in.hour >= 18:
-                            # Es el ingreso normal de su semana laboral (Lunes Nocturno)
+                            # Ingreso normal de semana nocturna (equivale a su inicio laboral)
                             turnos_computados = 1.0
                             horas_extras = 0.0
                             if not novedad_activa:
                                 novedad_activa = 'Inicio Semana Nocturna'
                         else:
-                            # Trabajo en Domingo para Diurnos o Turno Diurno en Temporada Alta
+                            # Trabajo en Día de Descanso (7º Día / Temporada Alta)
                             turnos_computados = 1.5
                             if "Jornal" not in tipo_personal:
                                 horas_extras = horas_netas
@@ -201,7 +205,7 @@ def process_attendance(df_bio, df_params=None, df_nov=None, df_emp=None, nov_mgr
                         'Nombre': emp_nombre,
                         'Tipo Personal': tipo_personal,
                         'Fecha': fecha_str,
-                        'Día': fecha_dt.strftime('%A'),
+                        'Día': dia_nombre_esp,
                         'Entrada': hora_in_str,
                         'Salida': hora_out_str,
                         'Horas Trabajadas': horas_netas,
@@ -218,7 +222,7 @@ def process_attendance(df_bio, df_params=None, df_nov=None, df_emp=None, nov_mgr
                     })
                     i += 1
 
-            # --- CASO B: EL EMPLEADO NO REGISTRÓ MARCACIÓN EN ESTA FECHA ---
+            # --- CASO B: EL EMPLEADO NO REGISTRÓ MARCACIÓN ---
             else:
                 novedad_activa = None
                 if nov_mgr:
@@ -226,7 +230,6 @@ def process_attendance(df_bio, df_params=None, df_nov=None, df_emp=None, nov_mgr
                     if nov_act:
                         novedad_activa = nov_act["tipo_novedad"]
 
-                # Reglas de Faltas vs. Descanso Semanal
                 falta_injustificada = 0
                 falta_justificada = 0
                 estado_registro = 'OK'
@@ -237,14 +240,16 @@ def process_attendance(df_bio, df_params=None, df_nov=None, df_emp=None, nov_mgr
                 else:
                     if es_domingo:
                         if es_turno_nocturno_fijo:
-                            # Para nocturnos, el domingo noche es día laborable obligatorio
+                            # Para nocturnos, el domingo noche es inicio obligatorio de jornada
                             falta_injustificada = 1
                             estado_registro = 'Falta / Omisión Marcación'
                         else:
-                            # Para diurnos, el domingo es su descanso semanal regular
+                            # Para diurnos, el domingo es Descanso Semanal (NO suma falta)
+                            falta_injustificada = 0
                             estado_registro = 'Descanso Semanal'
                     elif es_sabado and es_turno_nocturno_fijo:
-                        # Para nocturnos, el sábado es su día de descanso semanal
+                        # Para nocturnos, el sábado es su día regular de descanso
+                        falta_injustificada = 0
                         estado_registro = 'Descanso Semanal'
                     else:
                         # Lunes a Sábado (Diurno) o Lunes a Viernes (Nocturno)
@@ -256,7 +261,7 @@ def process_attendance(df_bio, df_params=None, df_nov=None, df_emp=None, nov_mgr
                     'Nombre': emp_nombre,
                     'Tipo Personal': tipo_personal,
                     'Fecha': fecha_str,
-                    'Día': fecha_dt.strftime('%A'),
+                    'Día': dia_nombre_esp,
                     'Entrada': 'Sin Marcación',
                     'Salida': 'Sin Marcación',
                     'Horas Trabajadas': 0.0,
@@ -285,7 +290,6 @@ def detect_exceptions(df_resultado):
     df_temp['dt_fecha'] = pd.to_datetime(df_temp['Fecha'])
     df_temp['Semana'] = df_temp['dt_fecha'].dt.isocalendar().week
 
-    # Contar días efectivamente trabajados por semana
     trabajados = df_temp[df_temp['Horas Trabajadas'] > 0]
     dias_por_semana = trabajados.groupby(['ID', 'Semana'])['Fecha'].nunique().reset_index()
     semanas_7dias = set(
@@ -299,9 +303,8 @@ def detect_exceptions(df_resultado):
         dt_f = pd.to_datetime(fecha)
         semana = dt_f.isocalendar().week
 
-        # Caso 1: Marcación omisa / Falta
-        if row['Estado'] in ['Revisar Marcación', 'Falta / Omisión Marcación'] or row['Falta Injustificada'] == 1:
-            tipo_inicial = 'Injustificada' if row['Falta Injustificada'] == 1 else ('Justificada' if row['Falta Justificada'] == 1 else 'N/A')
+        # Solo registrar falta si efectivamente es Injustificada o con revisión omisa
+        if row['Estado'] in ['Revisar Marcación', 'Falta / Omisión Marcación'] and row['Falta Injustificada'] == 1:
             excepciones.append({
                 'ID': emp_id,
                 'Nombre': emp_nom,
@@ -310,11 +313,10 @@ def detect_exceptions(df_resultado):
                 'Detalle Excepción': f"Entrada: {row['Entrada']} | Salida: {row['Salida']}",
                 'Valor a Revisar': '1 Falta a Procesar',
                 'Decisión Supervisor': 'Pendiente',
-                'Tipo Falta': tipo_inicial,
+                'Tipo Falta': 'Injustificada',
                 'Observaciones': ''
             })
 
-        # Caso 2: Horas Extras acumuladas / Trabajo en Domingo
         if row['Horas Extras'] > 0 or row.get('Novedad / Licencia') == 'Trabajo Domingo / Temporada Alta':
             detalle_txt = f"Trabajo Domingo: {row['Horas Trabajadas']} hrs" if row.get('Novedad / Licencia') == 'Trabajo Domingo / Temporada Alta' else f"Marcación excedente: {row['Horas Extras']} hrs"
             excepciones.append({
@@ -329,7 +331,6 @@ def detect_exceptions(df_resultado):
                 'Observaciones': ''
             })
 
-        # Caso 3: 7º día trabajado en la semana
         if (emp_id, semana) in semanas_7dias:
             excepciones.append({
                 'ID': emp_id,
@@ -343,7 +344,6 @@ def detect_exceptions(df_resultado):
                 'Observaciones': ''
             })
 
-        # Caso 4: Desfase de Horario de Ingreso
         if row.get('Desfase Ingreso', False):
             excepciones.append({
                 'ID': emp_id,
