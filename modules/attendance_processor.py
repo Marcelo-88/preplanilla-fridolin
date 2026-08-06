@@ -15,6 +15,14 @@ DIAS_ESPANOL = {
     6: 'Domingo'
 }
 
+def clean_str(val) -> str:
+    if pd.isna(val) or val is None:
+        return ""
+    txt = str(val).strip().upper()
+    if txt.endswith('.0'):
+        txt = txt[:-2]
+    return txt
+
 def process_attendance(df_bio, df_params=None, df_nov=None, df_emp=None, _nov_mgr=None):
     if df_bio is None or df_bio.empty:
         return pd.DataFrame()
@@ -29,17 +37,70 @@ def process_attendance(df_bio, df_params=None, df_nov=None, df_emp=None, _nov_mg
     col_fecha = next((cols[k] for k in cols if any(x in k for x in ['fecha', 'hora', 'marcacion', 'tiempo'])), df.columns[2] if len(df.columns) > 2 else col_id)
     col_tipo = next((cols[k] for k in cols if any(x in k for x in ['tipo', 'movimiento', 'evento', 'estado'])), None)
 
-    # 2. Parseo de fechas y ordenamiento
+    # Parseo de fechas
     df['dt_parsed'] = pd.to_datetime(df[col_fecha], dayfirst=True, errors='coerce')
     df = df.dropna(subset=['dt_parsed']).sort_values([col_id, 'dt_parsed'])
 
     if df.empty:
         return pd.DataFrame()
 
-    df['emp_id_clean'] = df[col_id].astype(str).str.strip()
+    df['raw_id_clean'] = df[col_id].apply(clean_str)
+    df['raw_nombre_clean'] = df[col_nombre].apply(clean_str) if col_nombre else df['raw_id_clean']
     df['fecha_dt'] = df['dt_parsed'].dt.date
 
-    # OPTIMIZACIÓN CRÍTICA: Pre-agrupar marcaciones en un diccionario O(1)
+    # 2. Mapeo inteligente con el Maestro de Empleados para unificar CI y Nombres
+    dict_tipo_personal = {}
+    dict_turno_personal = {}
+    dict_nombres_master = {}
+    
+    mapping_bio_to_ci = {}
+
+    if df_emp is not None and not df_emp.empty:
+        emp_cols = {str(c).strip().lower(): c for c in df_emp.columns}
+        c_emp_id = next((emp_cols[k] for k in emp_cols if any(x in k for x in ['carnet', 'ci', 'id', 'codigo'])), None)
+        c_emp_nom = next((emp_cols[k] for k in emp_cols if any(x in k for x in ['nombre', 'empleado', 'trabajador'])), None)
+        c_emp_tipo = next((emp_cols[k] for k in emp_cols if any(x in k for x in ['tipo', 'modalidad', 'contrato'])), None)
+        c_emp_turno = next((emp_cols[k] for k in emp_cols if any(x in k for x in ['turno', 'horario'])), None)
+
+        name_to_ci_master = {}
+
+        for _, row in df_emp.iterrows():
+            if c_emp_id:
+                ci_official = clean_str(row[c_emp_id])
+                if not ci_official:
+                    continue
+                
+                nom_official = str(row[c_emp_nom]).strip() if c_emp_nom and pd.notna(row[c_emp_nom]) else ci_official
+                dict_nombres_master[ci_official] = nom_official
+                
+                if c_emp_nom:
+                    name_clean = clean_str(row[c_emp_nom])
+                    if name_clean:
+                        name_to_ci_master[name_clean] = ci_official
+
+                if c_emp_tipo and pd.notna(row[c_emp_tipo]):
+                    dict_tipo_personal[ci_official] = str(row[c_emp_tipo]).strip()
+                if c_emp_turno and pd.notna(row[c_emp_turno]):
+                    dict_turno_personal[ci_official] = str(row[c_emp_turno]).strip()
+
+        # Vincular marcaciones biométricas a su CI oficial del Maestro
+        for _, row in df[['raw_id_clean', 'raw_nombre_clean']].drop_duplicates().iterrows():
+            raw_id = row['raw_id_clean']
+            raw_name = row['raw_nombre_clean']
+
+            if raw_id in dict_nombres_master:
+                mapping_bio_to_ci[raw_id] = raw_id
+            elif raw_name in name_to_ci_master:
+                mapping_bio_to_ci[raw_id] = name_to_ci_master[raw_name]
+            elif raw_id in name_to_ci_master:
+                mapping_bio_to_ci[raw_id] = name_to_ci_master[raw_id]
+            else:
+                mapping_bio_to_ci[raw_id] = raw_id
+
+    # Asignar CI oficial unificado
+    df['emp_id_clean'] = df['raw_id_clean'].map(lambda x: mapping_bio_to_ci.get(x, x))
+
+    # Pre-agrupar marcaciones por (CI Unificado, fecha)
     bio_by_emp_date = {}
     for row in df.to_dict('records'):
         key = (row['emp_id_clean'], row['fecha_dt'])
@@ -47,39 +108,16 @@ def process_attendance(df_bio, df_params=None, df_nov=None, df_emp=None, _nov_mg
             bio_by_emp_date[key] = []
         bio_by_emp_date[key].append(row)
 
-    # Determine el rango global de fechas a evaluar
     min_date = df['dt_parsed'].min().date()
     max_date = df['dt_parsed'].max().date()
     rango_dias = pd.date_range(min_date, max_date)
 
-    # 3. Diccionarios de datos del Maestro de Empleados
-    dict_tipo_personal = {}
-    dict_turno_personal = {}
-    dict_nombres_master = {}
-
-    if df_emp is not None and not df_emp.empty:
-        emp_cols = {str(c).strip().lower(): c for c in df_emp.columns}
-        c_emp_id = next((emp_cols[k] for k in emp_cols if any(x in k for x in ['id', 'carnet', 'ci', 'codigo'])), None)
-        c_emp_nom = next((emp_cols[k] for k in emp_cols if any(x in k for x in ['nombre', 'empleado', 'trabajador'])), None)
-        c_emp_tipo = next((emp_cols[k] for k in emp_cols if any(x in k for x in ['tipo', 'modalidad', 'contrato'])), None)
-        c_emp_turno = next((emp_cols[k] for k in emp_cols if any(x in k for x in ['turno', 'horario'])), None)
-
-        for _, row in df_emp.iterrows():
-            if c_emp_id:
-                eid = str(row[c_emp_id]).strip()
-                if c_emp_nom:
-                    dict_nombres_master[eid] = str(row[c_emp_nom]).strip()
-                if c_emp_tipo:
-                    dict_tipo_personal[eid] = str(row[c_emp_tipo]).strip()
-                if c_emp_turno:
-                    dict_turno_personal[eid] = str(row[c_emp_turno]).strip()
-
-    # Lista total de empleados (Unión Maestro + Biométrico)
+    # Lista total de empleados unificada sin duplicados
     emp_ids_bio = list(set(df['emp_id_clean'].unique()))
     emp_ids_master = list(dict_nombres_master.keys())
     todos_emp_ids = sorted(list(set(emp_ids_bio + emp_ids_master)))
 
-    # OPTIMIZACIÓN CRÍTICA: Pre-cargar Novedades en mapa O(1)
+    # Pre-cargar Novedades
     nov_map = {}
     if _nov_mgr:
         try:
@@ -87,7 +125,7 @@ def process_attendance(df_bio, df_params=None, df_nov=None, df_emp=None, _nov_mg
             if isinstance(todas_nov, pd.DataFrame):
                 todas_nov = todas_nov.to_dict('records')
             for n in todas_nov:
-                e_id = str(n.get('empleado_id', '')).strip()
+                e_id = clean_str(n.get('empleado_id', ''))
                 f_ini_str = str(n.get('fecha_inicio', ''))
                 f_fin_str = str(n.get('fecha_fin', ''))
                 t_nov = n.get('tipo_novedad', '')
@@ -118,14 +156,13 @@ def process_attendance(df_bio, df_params=None, df_nov=None, df_emp=None, _nov_mg
                 return None
         return None
 
-    # Map de nombres biométricos como respaldo rápido
     bio_names_map = {}
-    for row in df[['emp_id_clean', col_nombre]].drop_duplicates('emp_id_clean').to_dict('records'):
-        bio_names_map[row['emp_id_clean']] = str(row[col_nombre]).strip()
+    for row in df[['emp_id_clean', 'raw_nombre_clean']].drop_duplicates('emp_id_clean').to_dict('records'):
+        bio_names_map[row['emp_id_clean']] = row['raw_nombre_clean']
 
     registros = []
 
-    # 4. Iteración Optimizada por Empleado y Día
+    # 3. Iteración por Empleado Unificado y Día
     for emp_id_str in todos_emp_ids:
         emp_nombre = dict_nombres_master.get(emp_id_str) or bio_names_map.get(emp_id_str) or f"EMP-{emp_id_str}"
         tipo_personal = dict_tipo_personal.get(emp_id_str, "Fijo").capitalize()
@@ -134,14 +171,13 @@ def process_attendance(df_bio, df_params=None, df_nov=None, df_emp=None, _nov_mg
         for single_date in rango_dias:
             fecha_dt = single_date.date()
             fecha_str = fecha_dt.strftime('%Y-%m-%d')
-            dia_semana = fecha_dt.weekday() # 0 = Lunes, 5 = Sábado, 6 = Domingo
+            dia_semana = fecha_dt.weekday()
             dia_nombre_esp = DIAS_ESPANOL.get(dia_semana, fecha_dt.strftime('%A'))
             
             es_domingo = (dia_semana == 6)
             es_sabado = (dia_semana == 5)
             es_viernes = (dia_semana == 4)
 
-            # Evaluación dinámica de Turno por Novedad (Cambios de Turno temporales o permanentes a medio mes)
             nov_act = obtener_novedad(emp_id_str, fecha_str)
             turno_asignado_dia = turno_asignado_base
 
@@ -155,10 +191,9 @@ def process_attendance(df_bio, df_params=None, df_nov=None, df_emp=None, _nov_mg
                     turno_asignado_dia = "Diurno"
 
             es_turno_nocturno_fijo = "Nocturno" in turno_asignado_dia
-
             punches_dia = bio_by_emp_date.get((emp_id_str, fecha_dt), [])
 
-            # --- CASO A: EL EMPLEADO REGISTRÓ MARCACIÓN ---
+            # --- CASO A: EMPLEADO TIENE MARCACIÓN ---
             if punches_dia:
                 i = 0
                 while i < len(punches_dia):
@@ -260,7 +295,7 @@ def process_attendance(df_bio, df_params=None, df_nov=None, df_emp=None, _nov_mg
                         desfase_ingreso = True
 
                     registros.append({
-                        'ID': emp_id_str,
+                        'Carnet_Identidad': emp_id_str,
                         'Nombre': emp_nombre,
                         'Tipo Personal': tipo_personal,
                         'Fecha': fecha_str,
@@ -281,7 +316,7 @@ def process_attendance(df_bio, df_params=None, df_nov=None, df_emp=None, _nov_mg
                     })
                     i += 1
 
-            # --- CASO B: EL EMPLEADO NO REGISTRÓ MARCACIÓN ---
+            # --- CASO B: EMPLEADO NO TIENE MARCACIÓN ---
             else:
                 novedad_activa = nov_act["tipo_novedad"] if nov_act else None
 
@@ -313,7 +348,7 @@ def process_attendance(df_bio, df_params=None, df_nov=None, df_emp=None, _nov_mg
                         estado_registro = 'Falta / Omisión Marcación'
 
                 registros.append({
-                    'ID': emp_id_str,
+                    'Carnet_Identidad': emp_id_str,
                     'Nombre': emp_nombre,
                     'Tipo Personal': tipo_personal,
                     'Fecha': fecha_str,
@@ -347,13 +382,15 @@ def detect_exceptions(df_resultado):
     df_temp['Semana'] = df_temp['dt_fecha'].dt.isocalendar().week
 
     trabajados = df_temp[df_temp['Horas Trabajadas'] > 0]
-    dias_por_semana = trabajados.groupby(['ID', 'Semana'])['Fecha'].nunique().reset_index()
+    col_id_key = 'Carnet_Identidad' if 'Carnet_Identidad' in df_temp.columns else 'ID'
+    
+    dias_por_semana = trabajados.groupby([col_id_key, 'Semana'])['Fecha'].nunique().reset_index()
     semanas_7dias = set(
-        dias_por_semana[dias_por_semana['Fecha'] >= 7].set_index(['ID', 'Semana']).index
+        dias_por_semana[dias_por_semana['Fecha'] >= 7].set_index([col_id_key, 'Semana']).index
     )
 
     for _, row in df_resultado.iterrows():
-        emp_id = row['ID']
+        emp_id = row.get('Carnet_Identidad', row.get('ID', ''))
         emp_nom = row['Nombre']
         fecha = row['Fecha']
         dt_f = pd.to_datetime(fecha)
@@ -361,7 +398,7 @@ def detect_exceptions(df_resultado):
 
         if row['Estado'] in ['Revisar Marcación', 'Falta / Omisión Marcación'] and row['Falta Injustificada'] == 1:
             excepciones.append({
-                'ID': emp_id,
+                'Carnet_Identidad': emp_id,
                 'Nombre': emp_nom,
                 'Fecha': fecha,
                 'Tipo Excepción': 'Falta / Omisión Marcación',
@@ -375,7 +412,7 @@ def detect_exceptions(df_resultado):
         if row['Horas Extras'] > 0 or row.get('Novedad / Licencia') == 'Trabajo Domingo / Temporada Alta':
             detalle_txt = f"Trabajo Domingo: {row['Horas Trabajadas']} hrs" if row.get('Novedad / Licencia') == 'Trabajo Domingo / Temporada Alta' else f"Marcación excedente: {row['Horas Extras']} hrs"
             excepciones.append({
-                'ID': emp_id,
+                'Carnet_Identidad': emp_id,
                 'Nombre': emp_nom,
                 'Fecha': fecha,
                 'Tipo Excepción': 'Horas Extras / Domingo',
@@ -388,7 +425,7 @@ def detect_exceptions(df_resultado):
 
         if (emp_id, semana) in semanas_7dias:
             excepciones.append({
-                'ID': emp_id,
+                'Carnet_Identidad': emp_id,
                 'Nombre': emp_nom,
                 'Fecha': fecha,
                 'Tipo Excepción': '7º Día Laborado',
@@ -401,7 +438,7 @@ def detect_exceptions(df_resultado):
 
         if row.get('Desfase Ingreso', False):
             excepciones.append({
-                'ID': emp_id,
+                'Carnet_Identidad': emp_id,
                 'Nombre': emp_nom,
                 'Fecha': fecha,
                 'Tipo Excepción': 'Desfase Horario Ingreso',
@@ -420,7 +457,9 @@ def get_canje_summary(df_resultado):
         return pd.DataFrame()
 
     resumen = []
-    for (emp_id, emp_nom), grp in df_resultado.groupby(['ID', 'Nombre']):
+    col_id_key = 'Carnet_Identidad' if 'Carnet_Identidad' in df_resultado.columns else 'ID'
+    
+    for (emp_id, emp_nom), grp in df_resultado.groupby([col_id_key, 'Nombre']):
         total_he = grp['Horas Extras'].sum()
         total_faltas = (grp['Falta Justificada'] + grp['Falta Injustificada']).sum()
         
@@ -431,7 +470,7 @@ def get_canje_summary(df_resultado):
 
         if total_he > 0 or total_faltas > 0:
             resumen.append({
-                'ID': emp_id,
+                'Carnet_Identidad': emp_id,
                 'Nombre': emp_nom,
                 'Turno Dominante': turno_dom,
                 'Horas Costo por Día': costo_hora_dia,
