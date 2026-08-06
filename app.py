@@ -15,7 +15,12 @@ st.set_page_config(
 )
 
 # ==========================================
-# PARÁMETROS Y REGLAS GENERALES
+# ENLACE DE CONEXIÓN A GOOGLE DRIVE / SHEETS
+# ==========================================
+GOOGLE_SHEET_URL = "https://docs.google.com/spreadsheets/d/1h9ZOIOAZbnBzdn6FcV2slUxt1layLigt/export?format=xlsx"
+
+# ==========================================
+# PARÁMETROS Y REGLAS DE NEGOCIO
 # ==========================================
 HORARIO_DIURNO_INICIO = datetime.time(7, 0)
 HORARIO_DIURNO_FIN = datetime.time(15, 30)
@@ -24,13 +29,96 @@ HORARIO_NOCTURNO_FIN = datetime.time(5, 30)
 TOLERANCIA_ATRASO_MIN = 15
 
 # ==========================================
-# LÓGICA DE CÁLCULO DE ASISTENCIA Y REGLAS
+# FUNCIÓN DE CARGA AUTOMÁTICA DESDE DRIVE
+# ==========================================
+@st.cache_data(ttl=60)
+def cargar_datos_drive():
+    try:
+        xls = pd.ExcelFile(GOOGLE_SHEET_URL)
+        
+        # 1. Cargar Maestro de Empleados
+        df_maestro = pd.read_excel(xls, sheet_name='01_Maestro_Empleados') if '01_Maestro_Empleados' in xls.sheet_names else pd.DataFrame()
+        
+        # 2. Cargar Importación Biométrico
+        sheet_bio = '02_Importacion_Biometrico' if '02_Importacion_Biometrico' in xls.sheet_names else xls.sheet_names[0]
+        df_bio_raw = pd.read_excel(xls, sheet_name=sheet_bio)
+        
+        return df_maestro, df_bio_raw
+    except Exception as e:
+        st.error(f"Error al conectar con Google Drive: {e}")
+        return pd.DataFrame(), pd.DataFrame()
+
+# ==========================================
+# MOTOR DE PARSEO DE MARCACIONES
+# ==========================================
+def auto_parse_biometric_df(df_input):
+    if df_input is None or df_input.empty:
+        return pd.DataFrame()
+
+    df = df_input.copy()
+    cols = [str(c).strip() for c in df.columns]
+
+    # Identificación de columnas principales
+    id_col, name_col, dt_col, tipo_col = None, None, None, None
+    for c in cols:
+        c_low = c.lower()
+        if not id_col and any(x in c_low for x in ['id', 'carnet', 'ci', 'codigo', 'unnamed: 0']):
+            id_col = c
+        elif not name_col and any(x in c_low for x in ['nombre', 'empleado', 'trabajador', 'unnamed: 1']):
+            name_col = c
+        elif not dt_col and any(x in c_low for x in ['fecha', 'hora', 'marcacion', 'tiempo', 'unnamed: 2']):
+            dt_col = c
+        elif not tipo_col and any(x in c_low for x in ['tipo', 'movimiento', 'evento', 'unnamed: 3']):
+            tipo_col = c
+
+    if not id_col and len(cols) >= 1: id_col = cols[0]
+    if not name_col and len(cols) >= 2: name_col = cols[1]
+    if not dt_col and len(cols) >= 3: dt_col = cols[2]
+    if not tipo_col and len(cols) >= 4: tipo_col = cols[3]
+
+    df['dt_parsed'] = pd.to_datetime(df[dt_col], dayfirst=True, errors='coerce')
+    df = df.dropna(subset=['dt_parsed']).sort_values([id_col, 'dt_parsed'])
+
+    records = []
+    for (emp_id, emp_name), group in df.groupby([id_col, name_col]):
+        punches = group.to_dict('records')
+        i = 0
+        while i < len(punches):
+            p = punches[i]
+            p_type = str(p.get(tipo_col, '')).strip()
+            p_dt = p['dt_parsed']
+
+            if 'salida' not in p_type.lower():
+                fecha_str = p_dt.strftime('%Y-%m-%d')
+                entrada_str = p_dt.strftime('%H:%M')
+                salida_str = 'Falta Marcación'
+
+                if i + 1 < len(punches):
+                    next_p = punches[i+1]
+                    next_type = str(next_p.get(tipo_col, '')).strip()
+                    next_dt = next_p['dt_parsed']
+
+                    if 'salida' in next_type.lower() and (next_dt - p_dt).total_seconds() <= 16 * 3600:
+                        salida_str = next_dt.strftime('%H:%M')
+                        i += 1
+
+                records.append({
+                    'ID': str(emp_id),
+                    'Nombre': str(emp_name),
+                    'Fecha': fecha_str,
+                    'Entrada': entrada_str,
+                    'Salida': salida_str,
+                    'Tipo Día': 'Domingo' if p_dt.weekday() == 6 else 'Hábil',
+                    'Turno': 'Nocturno' if p_dt.hour >= 18 or p_dt.hour < 5 else 'Diurno'
+                })
+            i += 1
+
+    return pd.DataFrame(records)
+
+# ==========================================
+# CÁLCULO DE JORNADA Y EXCEPCIONES
 # ==========================================
 def calcular_jornada_y_atrasos(row):
-    """
-    Calcula horas trabajadas, atrasos, horas extras y turnos computados
-    resolviendo el cruce de medianoche y aplicando la regla de 1.5 turnos nocturnos.
-    """
     entrada_str = row.get('Entrada')
     salida_str = row.get('Salida')
     turno = str(row.get('Turno', 'Diurno')).strip()
@@ -68,13 +156,11 @@ def calcular_jornada_y_atrasos(row):
     dt_in = datetime.datetime.combine(dummy_date, t_in)
     dt_out = datetime.datetime.combine(dummy_date, t_out)
 
-    # Cruce de medianoche (Salida < Entrada)
     if dt_out <= dt_in:
         dt_out += datetime.timedelta(days=1)
 
     horas_trabajadas = round((dt_out - dt_in).total_seconds() / 3600.0, 2)
 
-    # Cálculo de Atrasos por Turno
     if turno == 'Nocturno':
         target_in = datetime.datetime.combine(dummy_date, HORARIO_NOCTURNO_INICIO)
         if t_in < datetime.time(22, 0) and (fecha.weekday() in [4, 6]):
@@ -85,10 +171,8 @@ def calcular_jornada_y_atrasos(row):
     diferencia_in = (dt_in - target_in).total_seconds() / 60.0
     atraso_minutos = max(0, int(diferencia_in - TOLERANCIA_ATRASO_MIN)) if diferencia_in > TOLERANCIA_ATRASO_MIN else 0
 
-    # Turno y Medio (1.5) para Personal Nocturno los domingos/viernes tarde
     turnos_computados = 1.0
     requiere_aprobacion = False
-
     es_domingo = (fecha.weekday() == 6)
     es_viernes = (fecha.weekday() == 4)
 
@@ -112,7 +196,7 @@ def calcular_jornada_y_atrasos(row):
     })
 
 # ==========================================
-# FUNCIÓN DE GENERACIÓN EXCEL QUINCENAL
+# GENERADOR DE LIBRO EXCEL QUINCENAL
 # ==========================================
 def generar_excel_quincenal(df, mes_nombre, anio):
     output = io.BytesIO()
@@ -144,7 +228,8 @@ def generar_excel_quincenal(df, mes_nombre, anio):
     resumen_q1 = consolidar_quincena(df_q1)
     resumen_q2 = consolidar_quincena(df_q2)
 
-    num_mes = 6 if mes_nombre.upper().startswith('JUN') else 7
+    meses_dict = {"Junio": 6, "Julio": 7, "Agosto": 8, "Septiembre": 9, "Octubre": 10, "Noviembre": 11, "Diciembre": 12}
+    num_mes = meses_dict.get(mes_nombre, 6)
     last_day = calendar.monthrange(anio, num_mes)[1]
 
     with pd.ExcelWriter(output, engine='openpyxl') as writer:
@@ -169,14 +254,17 @@ opcion = st.sidebar.radio(
     ]
 )
 st.sidebar.markdown("---")
-st.sidebar.caption("Sistema de Control de Asistencia v1.4 — Fridolin")
+st.sidebar.caption("Sistema de Control de Asistencia v1.6 — Fridolin")
+
+# Carga automática de Google Drive
+df_maestro_drive, df_bio_drive = cargar_datos_drive()
 
 # ==========================================
 # 1. PARÁMETROS Y REGLAS
 # ==========================================
 if opcion == "📋 Parámetros y Reglas":
     st.title("📋 Configuración de Parámetros y Reglas de Negocio")
-    st.info("Define las políticas de horarios, tolerancias y reglas de turnos aplicables a la fábrica.")
+    st.info("Configuración de horarios, tolerancias y cálculo de turnos nocturnos.")
 
     col1, col2 = st.columns(2)
     with col1:
@@ -190,114 +278,69 @@ if opcion == "📋 Parámetros y Reglas":
         st.subheader("Tolerancias y Turnos Específicos")
         st.number_input("Tolerancia de Atraso (Minutos)", value=TOLERANCIA_ATRASO_MIN, step=1)
         st.checkbox("Pre-aprobar 1.5 Turnos a Personal Nocturno (Domingo/Viernes 18:00)", value=True)
-        st.checkbox("Jornada Operativa Semanal de 6 Días (Lunes a Sábado)", value=True)
-
-    if st.button("Guardar Parámetros"):
-        st.success("Parámetros actualizados correctamente.")
 
 # ==========================================
 # 2. MAESTRO DE EMPLEADOS
 # ==========================================
 elif opcion == "👥 Maestro de Empleados":
-    st.title("👥 Maestro de Empleados")
-    st.markdown("Gestión de la nómina completa de trabajadores.")
-
-    uploaded_maestro = st.file_uploader("Cargar lista maestro de empleados (CSV/Excel)", type=['csv', 'xlsx'])
-    if uploaded_maestro:
-        df_m = pd.read_excel(uploaded_maestro) if uploaded_maestro.name.endswith('.xlsx') else pd.read_csv(uploaded_maestro)
-        st.session_state['df_maestro_empleados'] = df_m
-        st.success(f"Maestro cargado exitosamente con {len(df_m)} empleados.")
-        st.dataframe(df_m.head(10), use_container_width=True)
+    st.title("👥 Maestro de Empleados (Conectado a Google Drive)")
+    st.success("🟢 Datos sincronizados automáticamente desde Google Drive.")
+    st.dataframe(df_maestro_drive, use_container_width=True)
 
 # ==========================================
 # 3. IMPORTACIÓN BIOMÉTRICO
 # ==========================================
 elif opcion == "⏱️ Importación Biométrico":
-    st.title("⏱️ Importación de Datos del Biométrico")
-    st.markdown("Carga del archivo plano de marcaciones capturadas por el reloj biométrico.")
-
-    uploaded_bio = st.file_uploader("Cargar marcaciones del Biométrico (CSV/Excel)", type=['csv', 'xlsx'])
-    if uploaded_bio:
-        df_uploaded = pd.read_excel(uploaded_bio) if uploaded_bio.name.endswith('.xlsx') else pd.read_csv(uploaded_bio)
-        st.session_state['df_biometrico_raw'] = df_uploaded
-        st.success(f"Se cargaron {len(df_uploaded)} marcaciones de TODOS los empleados exitosamente.")
-        st.dataframe(df_uploaded.head(10), use_container_width=True)
+    st.title("⏱️ Importación de Marcaciones (Google Drive)")
+    st.success("🟢 Sincronizado automáticamente desde la hoja 02_Importacion_Biometrico.")
+    df_parsed = auto_parse_biometric_df(df_bio_drive)
+    st.dataframe(df_parsed, use_container_width=True)
 
 # ==========================================
 # 4. NOVEDADES Y PERMISOS
 # ==========================================
 elif opcion == "📝 Novedades y Permisos":
-    st.title("📝 Novedades, Permisos y Faltas")
-    st.markdown("Registro manual de licencias, bajas médicas y permisos justificados.")
-
-    col1, col2, col3 = st.columns(3)
-    with col1:
-        st.text_input("ID / CI Empleado:")
-    with col2:
-        st.date_input("Fecha de Novedad:", datetime.date.today())
-    with col3:
-        st.selectbox("Tipo de Novedad:", ["Falta Justificada", "Permiso Personal", "Baja Médica", "Vacación", "Comisión"])
-    
-    st.text_area("Observaciones / Aclarativas:")
-    if st.button("Registrar Novedad"):
-        st.success("Novedad guardada correctamente.")
+    st.title("📝 Novedades y Permisos")
+    st.text_input("ID / CI Empleado:")
+    st.selectbox("Tipo de Novedad:", ["Falta Justificada", "Permiso Personal", "Baja Médica", "Vacación"])
+    if st.button("Guardar Novedad"):
+        st.success("Novedad registrada.")
 
 # ==========================================
 # 5. APROBACIONES SUPERVISORES
 # ==========================================
 elif opcion == "✅ Aprobaciones Supervisores":
-    st.title("✅ Aprobaciones y Excepciones de Supervisores")
-    st.markdown("Módulo para revisión y validación de horas extras o marcaciones irregulares.")
-    st.warning("No hay marcaciones fuera de regla pendientes de autorización manual.")
+    st.title("✅ Aprobaciones Supervisores")
+    st.info("No hay excepciones pendientes.")
 
 # ==========================================
 # 6. PRE-PLANILLA Y REPORTES
 # ==========================================
 elif opcion == "📊 Pre-Planilla y Reportes":
     st.title("🏭 Control de Asistencia y Reportes - Fridolin")
-    st.subheader("Reporte Consolidado de Asistencia para RRHH / Contabilidad")
-
-    # FILTRO DE PERÍODO / MES
-    f_col1, f_col2 = st.columns([2, 2])
-    with f_col1:
+    
+    col_mes, col_anio = st.columns(2)
+    with col_mes:
         mes_seleccionado = st.selectbox("Seleccionar Mes de Procesamiento:", ["Junio", "Julio", "Agosto", "Septiembre", "Octubre", "Noviembre", "Diciembre"], index=0)
-    with f_col2:
+    with col_anio:
         anio_seleccionado = st.number_input("Año:", value=2026, step=1)
 
-    # LECTURA DE DATOS REALES DE LA SESIÓN O BASE GENERAL
-    df_data = st.session_state.get('df_biometrico_raw', None)
-
-    if df_data is None:
-        st.info("💡 Mostrando la lista completa ingresada en el Maestro de Empleados.")
-        # Si no hay datos subidos en esta sesión, intentamos cargar la base guardada
-        try:
-            df_data = pd.read_excel('Planilla JUNIO 2026.xlsx', sheet_name='Semana 1 al 15 JUN')
-            # Normalizar columnas
-            df_data = df_data.iloc[4:].copy()
-            df_data = df_data[['Unnamed: 3', 'Unnamed: 2', 'Unnamed: 11']].dropna(how='all')
-            df_data.columns = ['ID', 'Nombre', 'Turno']
-            df_data['Fecha'] = f'{anio_seleccionado}-06-01'
-            df_data['Tipo Día'] = 'Hábil'
-            df_data['Entrada'] = '07:00'
-            df_data['Salida'] = '15:30'
-            df_data['Turno'] = df_data['Turno'].map({'AM': 'Diurno', 'PM': 'Nocturno'}).fillna('Diurno')
-        except Exception:
-            df_data = pd.DataFrame(columns=['ID', 'Nombre', 'Fecha', 'Tipo Día', 'Entrada', 'Salida', 'Turno'])
+    df_data = auto_parse_biometric_df(df_bio_drive)
 
     if df_data.empty:
-        st.warning("No se encontraron registros en la base de datos. Sube la información en **Importación Biométrico**.")
+        st.warning("Cargando datos desde Google Drive...")
     else:
         df_data['Fecha_dt'] = pd.to_datetime(df_data['Fecha'], errors='coerce')
         meses_dict = {"Junio": 6, "Julio": 7, "Agosto": 8, "Septiembre": 9, "Octubre": 10, "Noviembre": 11, "Diciembre": 12}
         num_mes = meses_dict.get(mes_seleccionado, 6)
 
-        # Filtrar por fecha si aplica
-        df_mes = df_data[(df_data['Fecha_dt'].dt.month == num_mes) & (df_data['Fecha_dt'].dt.year == anio_seleccionado)] if 'Fecha_dt' in df_data and df_data['Fecha_dt'].notna().any() else df_data
+        df_mes = df_data[(df_data['Fecha_dt'].dt.month == num_mes) & (df_data['Fecha_dt'].dt.year == anio_seleccionado)]
 
-        # Aplicar cálculos a TODOS los empleados
+        if df_mes.empty:
+            df_mes = df_data
+
         df_calculado = df_mes.join(df_mes.apply(calcular_jornada_y_atrasos, axis=1))
 
-        # Filtros de vista web
         col1, col2 = st.columns(2)
         with col1:
             emp_list = ['Todos'] + sorted(list(df_calculado['Nombre'].dropna().unique()))
@@ -312,8 +355,6 @@ elif opcion == "📊 Pre-Planilla y Reportes":
         if turno_selected != 'Todos':
             df_filtered = df_filtered[df_filtered['Turno'] == turno_selected]
 
-        # Tabla Principal con TODOS los colaboradores
-        st.subheader(f"Planilla de Control de Tiempos — {mes_seleccionado} {anio_seleccionado}")
         st.dataframe(
             df_filtered[[
                 'ID', 'Nombre', 'Fecha', 'Tipo Día', 'Entrada', 'Salida', 
@@ -323,7 +364,6 @@ elif opcion == "📊 Pre-Planilla y Reportes":
             use_container_width=True
         )
 
-        # KPIs consolidados
         st.markdown("---")
         k1, k2, k3, k4, k5 = st.columns(5)
         k1.metric("Días / Registros", len(df_filtered))
@@ -332,7 +372,6 @@ elif opcion == "📊 Pre-Planilla y Reportes":
         k4.metric("Horas Extras", f"{df_filtered['Horas Extras'].sum():.2f} hrs")
         k5.metric("Total Turnos", f"{df_filtered['Turnos Computados'].sum():.1f}")
 
-        # BOTÓN DE DESCARGA EXCEL QUINCENAL COMPLETO
         st.markdown("---")
         excel_bytes = generar_excel_quincenal(df_filtered, mes_seleccionado, anio_seleccionado)
         
