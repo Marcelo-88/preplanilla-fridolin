@@ -1,7 +1,6 @@
 import pandas as pd
 import numpy as np
 from datetime import datetime, time, timedelta
-import streamlit as st
 
 TOLERANCIA_MINUTOS = 10
 DESCUENTO_COMIDA_HORAS = 0.5  # 30 minutos obligatorios
@@ -16,8 +15,7 @@ DIAS_ESPANOL = {
     6: 'Domingo'
 }
 
-@st.cache_data(ttl=300, show_spinner=False)
-def process_attendance(df_bio, df_params=None, df_nov=None, df_emp=None, nov_mgr=None, periodo_filtro=None, emp_id_filtro=None):
+def process_attendance(df_bio, df_params=None, df_nov=None, df_emp=None, nov_mgr=None):
     if df_bio is None or df_bio.empty:
         return pd.DataFrame()
 
@@ -33,22 +31,23 @@ def process_attendance(df_bio, df_params=None, df_nov=None, df_emp=None, nov_mgr
 
     # 2. Parseo de fechas y ordenamiento
     df['dt_parsed'] = pd.to_datetime(df[col_fecha], dayfirst=True, errors='coerce')
-    df = df.dropna(subset=['dt_parsed'])
-
-    # --- FILTRADO DE RENDIMIENTO PREVIO AL CÁLCULO ---
-    if periodo_filtro and periodo_filtro != "Todos":
-        df['periodo_str'] = df['dt_parsed'].dt.strftime('%Y-%m')
-        df = df[df['periodo_str'] == periodo_filtro]
-
-    if emp_id_filtro and emp_id_filtro != "Todos":
-        df = df[df[col_id].astype(str).str.strip() == str(emp_id_filtro).strip()]
+    df = df.dropna(subset=['dt_parsed']).sort_values([col_id, 'dt_parsed'])
 
     if df.empty:
         return pd.DataFrame()
 
-    df = df.sort_values([col_id, 'dt_parsed'])
+    df['emp_id_clean'] = df[col_id].astype(str).str.strip()
+    df['fecha_dt'] = df['dt_parsed'].dt.date
 
-    # Determine el rango de fechas evaluado
+    # OPTIMIZACIÓN CRÍTICA: Pre-agrupar marcaciones en un diccionario O(1)
+    bio_by_emp_date = {}
+    for row in df.to_dict('records'):
+        key = (row['emp_id_clean'], row['fecha_dt'])
+        if key not in bio_by_emp_date:
+            bio_by_emp_date[key] = []
+        bio_by_emp_date[key].append(row)
+
+    # Determine el rango global de fechas a evaluar
     min_date = df['dt_parsed'].min().date()
     max_date = df['dt_parsed'].max().date()
     rango_dias = pd.date_range(min_date, max_date)
@@ -75,28 +74,60 @@ def process_attendance(df_bio, df_params=None, df_nov=None, df_emp=None, nov_mgr
                 if c_emp_turno:
                     dict_turno_personal[eid] = str(row[c_emp_turno]).strip()
 
-    # Identificar lista total de empleados filtrados
-    emp_ids_bio = df[col_id].astype(str).str.strip().unique().tolist()
-    
-    if emp_id_filtro and emp_id_filtro != "Todos":
-        todos_emp_ids = [str(emp_id_filtro).strip()]
-    else:
-        todos_emp_ids = sorted(list(set(emp_ids_bio)))
+    # Lista total de empleados (Unión Maestro + Biométrico)
+    emp_ids_bio = list(set(df['emp_id_clean'].unique()))
+    emp_ids_master = list(dict_nombres_master.keys())
+    todos_emp_ids = sorted(list(set(emp_ids_bio + emp_ids_master)))
+
+    # OPTIMIZACIÓN CRÍTICA: Pre-cargar Novedades en mapa O(1)
+    nov_map = {}
+    if nov_mgr:
+        try:
+            todas_nov = nov_mgr.obtener_todas_novedades()
+            if isinstance(todas_nov, pd.DataFrame):
+                todas_nov = todas_nov.to_dict('records')
+            for n in todas_nov:
+                e_id = str(n.get('empleado_id', '')).strip()
+                f_ini_str = str(n.get('fecha_inicio', ''))
+                f_fin_str = str(n.get('fecha_fin', ''))
+                t_nov = n.get('tipo_novedad', '')
+                if e_id and f_ini_str and f_fin_str:
+                    try:
+                        d_start = datetime.strptime(f_ini_str[:10], '%Y-%m-%d').date()
+                        d_end = datetime.strptime(f_fin_str[:10], '%Y-%m-%d').date()
+                        curr = d_start
+                        while curr <= d_end:
+                            nov_map[(e_id, curr.strftime('%Y-%m-%d'))] = {"tipo_novedad": t_nov}
+                            curr += timedelta(days=1)
+                    except Exception:
+                        pass
+        except Exception:
+            pass
+
+    def obtener_novedad(e_id, f_str):
+        if (e_id, f_str) in nov_map:
+            return nov_map[(e_id, f_str)]
+        if nov_mgr:
+            try:
+                return nov_mgr.evaluar_impacto_dia(e_id, f_str)
+            except Exception:
+                return None
+        return None
+
+    # Map de nombres biométricos como respaldo rápido
+    bio_names_map = {}
+    for row in df[['emp_id_clean', col_nombre]].drop_duplicates('emp_id_clean').to_dict('records'):
+        bio_names_map[row['emp_id_clean']] = str(row[col_nombre]).strip()
 
     registros = []
 
-    # 4. Iteración Módulo por Empleado y por Día Calendario
+    # 4. Iteración Optimizada por Empleado y Día
     for emp_id_str in todos_emp_ids:
-        emp_nombre = dict_nombres_master.get(emp_id_str)
-        if not emp_nombre:
-            match_bio = df[df[col_id].astype(str).str.strip() == emp_id_str]
-            emp_nombre = str(match_bio[col_nombre].iloc[0]) if not match_bio.empty else f"EMP-{emp_id_str}"
+        emp_nombre = dict_nombres_master.get(emp_id_str) or bio_names_map.get(emp_id_str) or f"EMP-{emp_id_str}"
 
         tipo_personal = dict_tipo_personal.get(emp_id_str, "Fijo").capitalize()
         turno_asignado = dict_turno_personal.get(emp_id_str, "Diurno").capitalize()
         es_turno_nocturno_fijo = "Nocturno" in turno_asignado
-
-        group_emp = df[df[col_id].astype(str).str.strip() == emp_id_str]
 
         for single_date in rango_dias:
             fecha_dt = single_date.date()
@@ -108,7 +139,7 @@ def process_attendance(df_bio, df_params=None, df_nov=None, df_emp=None, nov_mgr
             es_sabado = (dia_semana == 5)
             es_viernes = (dia_semana == 4)
 
-            punches_dia = group_emp[group_emp['dt_parsed'].dt.date == fecha_dt].to_dict('records')
+            punches_dia = bio_by_emp_date.get((emp_id_str, fecha_dt), [])
 
             # --- CASO A: EL EMPLEADO REGISTRÓ MARCACIÓN ---
             if punches_dia:
@@ -158,17 +189,16 @@ def process_attendance(df_bio, df_params=None, df_nov=None, df_emp=None, nov_mgr
                     exento_faltas = False
                     exento_atrasos = False
 
-                    if nov_mgr:
-                        nov_act = nov_mgr.evaluar_impacto_dia(emp_id_str, fecha_str)
-                        if nov_act:
-                            novedad_activa = nov_act["tipo_novedad"]
-                            if novedad_activa in ["BAJA_MEDICA", "PERMISO_CON_GOCE", "VACACIONES", "LICENCIA_MATERNIDAD", "LICENCIA_PATERNIDAD", "DUELO_FAMILIAR"]:
-                                exento_faltas = True
-                                exento_atrasos = True
-                                atraso_minutos = 0
-                            elif novedad_activa == "REDUCCION_LACTANCIA":
-                                exento_atrasos = True
-                                atraso_minutos = 0
+                    nov_act = obtener_novedad(emp_id_str, fecha_str)
+                    if nov_act:
+                        novedad_activa = nov_act["tipo_novedad"]
+                        if novedad_activa in ["BAJA_MEDICA", "PERMISO_CON_GOCE", "VACACIONES", "LICENCIA_MATERNIDAD", "LICENCIA_PATERNIDAD", "DUELO_FAMILIAR"]:
+                            exento_faltas = True
+                            exento_atrasos = True
+                            atraso_minutos = 0
+                        elif novedad_activa == "REDUCCION_LACTANCIA":
+                            exento_atrasos = True
+                            atraso_minutos = 0
 
                     turnos_computados = 1.0
                     horas_extras = 0.0
@@ -237,11 +267,8 @@ def process_attendance(df_bio, df_params=None, df_nov=None, df_emp=None, nov_mgr
 
             # --- CASO B: EL EMPLEADO NO REGISTRÓ MARCACIÓN ---
             else:
-                novedad_activa = None
-                if nov_mgr:
-                    nov_act = nov_mgr.evaluar_impacto_dia(emp_id_str, fecha_str)
-                    if nov_act:
-                        novedad_activa = nov_act["tipo_novedad"]
+                nov_act = obtener_novedad(emp_id_str, fecha_str)
+                novedad_activa = nov_act["tipo_novedad"] if nov_act else None
 
                 falta_injustificada = 0
                 falta_justificada = 0
