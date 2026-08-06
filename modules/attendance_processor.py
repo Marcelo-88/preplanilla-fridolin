@@ -91,13 +91,17 @@ def process_attendance(df_bio, df_params=None, df_nov=None, df_emp=None, _nov_mg
                 f_ini_str = str(n.get('fecha_inicio', ''))
                 f_fin_str = str(n.get('fecha_fin', ''))
                 t_nov = n.get('tipo_novedad', '')
+                just = n.get('justificacion', '')
                 if e_id and f_ini_str and f_fin_str:
                     try:
                         d_start = datetime.strptime(f_ini_str[:10], '%Y-%m-%d').date()
                         d_end = datetime.strptime(f_fin_str[:10], '%Y-%m-%d').date()
                         curr = d_start
                         while curr <= d_end:
-                            nov_map[(e_id, curr.strftime('%Y-%m-%d'))] = {"tipo_novedad": t_nov}
+                            nov_map[(e_id, curr.strftime('%Y-%m-%d'))] = {
+                                "tipo_novedad": t_nov,
+                                "justificacion": just
+                            }
                             curr += timedelta(days=1)
                     except Exception:
                         pass
@@ -124,10 +128,8 @@ def process_attendance(df_bio, df_params=None, df_nov=None, df_emp=None, _nov_mg
     # 4. Iteración Optimizada por Empleado y Día
     for emp_id_str in todos_emp_ids:
         emp_nombre = dict_nombres_master.get(emp_id_str) or bio_names_map.get(emp_id_str) or f"EMP-{emp_id_str}"
-
         tipo_personal = dict_tipo_personal.get(emp_id_str, "Fijo").capitalize()
-        turno_asignado = dict_turno_personal.get(emp_id_str, "Diurno").capitalize()
-        es_turno_nocturno_fijo = "Nocturno" in turno_asignado
+        turno_asignado_base = dict_turno_personal.get(emp_id_str, "Diurno").capitalize()
 
         for single_date in rango_dias:
             fecha_dt = single_date.date()
@@ -138,6 +140,21 @@ def process_attendance(df_bio, df_params=None, df_nov=None, df_emp=None, _nov_mg
             es_domingo = (dia_semana == 6)
             es_sabado = (dia_semana == 5)
             es_viernes = (dia_semana == 4)
+
+            # Evaluación dinámica de Turno por Novedad (Cambios de Turno temporales o permanentes a medio mes)
+            nov_act = obtener_novedad(emp_id_str, fecha_str)
+            turno_asignado_dia = turno_asignado_base
+
+            if nov_act:
+                t_nov_type = str(nov_act.get("tipo_novedad", "")).upper()
+                just_txt = str(nov_act.get("justificacion", "")).upper()
+
+                if t_nov_type == "CAMBIO_TURNO_NOCTURNO" or (t_nov_type == "CAMBIO_TURNO" and "NOCTURNO" in just_txt):
+                    turno_asignado_dia = "Nocturno"
+                elif t_nov_type == "CAMBIO_TURNO_DIURNO" or (t_nov_type == "CAMBIO_TURNO" and "DIURNO" in just_txt):
+                    turno_asignado_dia = "Diurno"
+
+            es_turno_nocturno_fijo = "Nocturno" in turno_asignado_dia
 
             punches_dia = bio_by_emp_date.get((emp_id_str, fecha_dt), [])
 
@@ -189,7 +206,6 @@ def process_attendance(df_bio, df_params=None, df_nov=None, df_emp=None, _nov_mg
                     exento_faltas = False
                     exento_atrasos = False
 
-                    nov_act = obtener_novedad(emp_id_str, fecha_str)
                     if nov_act:
                         novedad_activa = nov_act["tipo_novedad"]
                         if novedad_activa in ["BAJA_MEDICA", "PERMISO_CON_GOCE", "VACACIONES", "LICENCIA_MATERNIDAD", "LICENCIA_PATERNIDAD", "DUELO_FAMILIAR"]:
@@ -267,14 +283,18 @@ def process_attendance(df_bio, df_params=None, df_nov=None, df_emp=None, _nov_mg
 
             # --- CASO B: EL EMPLEADO NO REGISTRÓ MARCACIÓN ---
             else:
-                nov_act = obtener_novedad(emp_id_str, fecha_str)
                 novedad_activa = nov_act["tipo_novedad"] if nov_act else None
 
                 falta_injustificada = 0
                 falta_justificada = 0
                 estado_registro = 'OK'
 
-                if novedad_activa:
+                es_licencia_justificada = novedad_activa in [
+                    "BAJA_MEDICA", "PERMISO_CON_GOCE", "PERMISO_SIN_GOCE",
+                    "VACACIONES", "LICENCIA_MATERNIDAD", "LICENCIA_PATERNIDAD", "DUELO_FAMILIAR"
+                ]
+
+                if es_licencia_justificada:
                     falta_justificada = 1
                     estado_registro = 'Justificado por Licencia'
                 else:
@@ -307,7 +327,7 @@ def process_attendance(df_bio, df_params=None, df_nov=None, df_emp=None, _nov_mg
                     'Horas Extras': 0.0,
                     'Horas Nocturnas': 0.0,
                     'Turnos Computados': 0.0,
-                    'Turno Dominante': turno_asignado,
+                    'Turno Dominante': turno_asignado_dia,
                     'Novedad / Licencia': novedad_activa if novedad_activa else ('Descanso Semanal' if estado_registro == 'Descanso Semanal' else 'Ninguna'),
                     'Desfase Ingreso': False,
                     'Estado': estado_registro
