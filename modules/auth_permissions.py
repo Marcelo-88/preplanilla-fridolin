@@ -10,14 +10,12 @@ def render_user_selector(df_emp):
         st.sidebar.warning("⚠️ No se pudo cargar el Maestro de Empleados.")
         return None, "Admin", [], False
 
-    # Normalizar nombres de columnas
     cols = {str(c).strip().lower(): c for c in df_emp.columns}
     c_nombre = next((cols[k] for k in cols if 'nombre' in k), df_emp.columns[1])
     c_sup = next((cols[k] for k in cols if 'supervisor' in k), None)
     c_rol = next((cols[k] for k in cols if 'rol' in k), None)
     c_pin = next((cols[k] for k in cols if 'pin' in k), None)
 
-    # 1. Lista de Supervisores únicos
     supervisores = []
     if c_sup and c_sup in df_emp.columns:
         supervisores = [
@@ -25,7 +23,6 @@ def render_user_selector(df_emp):
             if str(s).strip().upper() not in ['N/A', 'NONE', '', 'NAN']
         ]
 
-    # 2. Lista de Jefaturas y Responsables de Operaciones
     jefes_admins = []
     if c_rol and c_rol in df_emp.columns:
         filtro_jefes = df_emp[c_rol].astype(str).str.contains(
@@ -41,16 +38,14 @@ def render_user_selector(df_emp):
     st.sidebar.subheader("👤 Credenciales de Supervisor")
     usuario_actual = st.sidebar.selectbox("Seleccione su Nombre:", lista_usuarios)
 
-    # Extraer el PIN configurado en Excel/Google Sheets para este usuario
     row_user = df_emp[df_emp[c_nombre].astype(str).str.strip().str.upper() == usuario_actual.strip().upper()]
     
-    pin_esperado = "1234" # Valor por defecto de respaldo
+    pin_esperado = "1234"
     if c_pin and not row_user.empty:
         val_pin = str(row_user[c_pin].values[0]).strip()
         if val_pin and val_pin.lower() != 'nan':
-            pin_esperado = val_pin.split('.')[0] # Limpia decimales si vienen formato número
+            pin_esperado = val_pin.split('.')[0]
 
-    # Campo para PIN de 4 dígitos
     pin_ingresado = st.sidebar.text_input("Ingrese su PIN (4 dígitos):", type="password", max_chars=4)
 
     pin_valido = False
@@ -60,7 +55,6 @@ def render_user_selector(df_emp):
     elif pin_ingresado != "":
         st.sidebar.error("❌ PIN Incorrecto")
 
-    # Identificar si el usuario tiene Rol de Acceso Total (Ever Medrano / Operaciones y Producción)
     rol_registrado = str(row_user[c_rol].values[0]).upper() if (c_rol and not row_user.empty) else ""
     es_responsable_operaciones = "MEDRANO" in usuario_actual.upper() or any(
         k in rol_registrado for k in ['OPERACIONES', 'PRODUCCION', 'PRODUCCIÓN', 'GERENTE']
@@ -68,7 +62,7 @@ def render_user_selector(df_emp):
 
     if es_responsable_operaciones:
         rol = "Jefe de Producción"
-        empleados_a_cargo = list(df_emp[c_nombre].unique()) # Acceso a todo el personal
+        empleados_a_cargo = list(df_emp[c_nombre].unique())
         st.sidebar.success("👑 Rol: Responsable de Operaciones y Producción (Acceso Total)")
     else:
         rol = "Supervisor"
@@ -83,10 +77,6 @@ def render_user_selector(df_emp):
 
 
 def filter_dataframe_by_supervisor(df, columna_nombre, empleados_a_cargo, rol):
-    """
-    Filtra cualquier DataFrame mostrando únicamente el personal asignado al supervisor.
-    Si el usuario es Responsable de Operaciones y Producción, retorna el 100% de la información.
-    """
     if df is None or df.empty:
         return df
 
