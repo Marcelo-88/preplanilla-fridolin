@@ -1,22 +1,24 @@
 import pandas as pd
 import numpy as np
 
-def aplicar_novedades_y_lactancia(df_resultado, df_novedades):
+def aplicar_novedades_y_licencias(df_resultado, df_novedades):
     """
-    Aplica licencias, vacaciones, bajas médicas y tolerancias especiales (Lactancia)
-    sobre el cálculo de tiempos con parsing robusto de fechas.
+    Aplica las reglas exactas a la planilla según la novedad registrada:
+    1. Baja Médica / Licencias / Permisos: Cancela Faltas y Atrasos.
+    2. Maternidad: Reduce la jornada a 7 horas y elimina atrasos/salidas tempranas.
     """
-    if df_resultado is None or df_resultado.empty:
+    if df_resultado is None or df_resultado.empty or df_novedades is None or df_novedades.empty:
         return df_resultado
 
-    if df_novedades is None or df_novedades.empty:
-        return df_resultado
+    # Convertir lista de sesión a DataFrame si es necesario
+    if isinstance(df_novedades, list):
+        df_novedades = pd.DataFrame(df_novedades)
 
     cols_nov = {str(c).strip().lower(): c for c in df_novedades.columns}
-    c_nom = next((cols_nov[k] for k in cols_nov if 'nombre' in k or 'empleado' in k), None)
+    c_nom = next((cols_nov[k] for k in cols_nov if 'empleado' in k or 'nombre' in k), None)
     c_tipo = next((cols_nov[k] for k in cols_nov if 'tipo' in k or 'novedad' in k), None)
-    c_inicio = next((cols_nov[k] for k in cols_nov if 'inicio' in k or 'desde' in k), None)
-    c_fin = next((cols_nov[k] for k in cols_nov if 'fin' in k or 'hasta' in k), None)
+    c_inicio = next((cols_nov[k] for k in cols_nov if 'inicio' in k or 'fecha' in k), None)
+    c_fin = next((cols_nov[k] for k in cols_nov if 'fin' in k), c_inicio)
 
     if not all([c_nom, c_tipo, c_inicio]):
         return df_resultado
@@ -26,44 +28,44 @@ def aplicar_novedades_y_lactancia(df_resultado, df_novedades):
         tipo = str(nov[c_tipo]).strip().upper()
         
         try:
-            f_ini = pd.to_datetime(nov[c_inicio], dayfirst=True, format='mixed', errors='coerce').date() if pd.notnull(nov[c_inicio]) else None
+            f_ini = pd.to_datetime(nov[c_inicio], dayfirst=True, format='mixed', errors='coerce').date()
+            f_fin = pd.to_datetime(nov[c_fin], dayfirst=True, format='mixed', errors='coerce').date() if c_fin else f_ini
         except Exception:
-            f_ini = None
-
-        try:
-            f_fin = pd.to_datetime(nov[c_fin], dayfirst=True, format='mixed', errors='coerce').date() if (c_fin and pd.notnull(nov[c_fin])) else f_ini
-        except Exception:
-            f_fin = f_ini
+            continue
 
         if not f_ini:
             continue
 
+        # Fechas del resultado
         fechas_res = pd.to_datetime(df_resultado['Fecha'], dayfirst=True, format='mixed', errors='coerce').dt.date
 
+        # Máscara para filtrar por empleado y rango de fechas
         mask = (df_resultado['Nombre'].astype(str).str.strip().str.upper() == emp) & \
                (fechas_res >= f_ini) & \
                (fechas_res <= f_fin)
 
-        if 'LACTANCIA' in tipo:
+        # Regla 1: Maternidad (Lactancia) -> 1 hora menos, sin atrasos ni faltas
+        if 'MATERNIDAD' in tipo or 'LACTANCIA' in tipo:
             if 'Jornada_Requerida_Hrs' in df_resultado.columns:
                 df_resultado.loc[mask, 'Jornada_Requerida_Hrs'] = 7.0
             df_resultado.loc[mask, 'Atraso (Minutos)'] = 0
-            df_resultado.loc[mask, 'Observaciones'] = 'Permiso de Lactancia Maternidad (Jornada 7h)'
+            df_resultado.loc[mask, 'Falta Injustificada'] = 0
+            df_resultado.loc[mask, 'Observaciones'] = 'Permiso Maternidad (Jornada 7h - Exenta Atrasos)'
 
-        elif any(k in tipo for k in ['VACACION', 'LICENCIA', 'BAJA', 'MATERNIDAD', 'LUTO', 'PATERNIDAD', 'PERMISO']):
+        # Regla 2: Baja Médica, Licencias, Permisos -> NO se toma como FALTA ni Atraso
+        elif any(k in tipo for k in ['BAJA', 'LICENCIA', 'PERMISO', 'VACACION']):
             df_resultado.loc[mask, 'Falta Justificada'] = 1
             df_resultado.loc[mask, 'Falta Injustificada'] = 0
             df_resultado.loc[mask, 'Atraso (Minutos)'] = 0
-            df_resultado.loc[mask, 'Observaciones'] = f'Novedad: {nov[c_tipo]}'
+            df_resultado.loc[mask, 'Turnos Computados'] = 1.0
+            df_resultado.loc[mask, 'Observaciones'] = f'Licencia / Permiso Aplicado: {nov[c_tipo]}'
 
     return df_resultado
 
 
 def process_attendance(df_bio, df_params, df_novedades=None, df_emp=None):
     """
-    Procesa las marcaciones del biométrico.
-    CORRECCIÓN APLICADA: Convierte Fecha_Hora con dayfirst=True y format='mixed'
-    para evitar errores entre DD/MM/YYYY y MM/DD/YYYY.
+    Procesa marcaciones integrando la validación estricta de licencias y fechas.
     """
     if df_bio is None or df_bio.empty:
         return pd.DataFrame()
@@ -80,11 +82,11 @@ def process_attendance(df_bio, df_params, df_novedades=None, df_emp=None):
     df['ID'] = df[c_id].astype(str)
     df['Nombre'] = df[c_nom].astype(str)
 
-    # CONVERSIÓN CORREGIDA DE FECHAS (FORMATO LATINO DD/MM/YYYY HH:MM)
+    # Conversión segura de fecha (Día/Mes/Año)
     fecha_dt = pd.to_datetime(df[c_fecha], dayfirst=True, format='mixed', errors='coerce')
     df['Fecha'] = fecha_dt.dt.strftime('%Y-%m-%d')
 
-    # Tolerancia estándar
+    # Tolerancia
     tolerancia_min = 10
     if df_params is not None and not df_params.empty:
         try:
@@ -110,7 +112,8 @@ def process_attendance(df_bio, df_params, df_novedades=None, df_emp=None):
     df['Turnos Computados'] = np.where(df['Falta Injustificada'] == 1, 0.0, 1.0)
     df['Observaciones'] = ""
 
-    df = aplicar_novedades_y_lactancia(df, df_novedades)
+    # Aplicar novedades sobre el resultado procesado
+    df = aplicar_novedades_y_licencias(df, df_novedades)
 
     columnas_finales = [
         'ID', 'Nombre', 'Fecha', 'Turno Dominante', 
@@ -128,7 +131,7 @@ def process_attendance(df_bio, df_params, df_novedades=None, df_emp=None):
 
 def detect_exceptions(df_resultado):
     """
-    Identifica faltas, horas extras y desvíos que requieren aprobación.
+    Identifica faltas reales que requieran revisión del supervisor (excluyendo faltas justificadas por permisos).
     """
     if df_resultado is None or df_resultado.empty:
         return pd.DataFrame()
@@ -146,7 +149,7 @@ def detect_exceptions(df_resultado):
                 'Valor a Revisar': '1 Día de Falta',
                 'Decisión Supervisor': 'Pendiente',
                 'Tipo Falta': 'Injustificada',
-                'Observaciones': ''
+                'Observaciones': row['Observaciones']
             })
 
         if row['Horas Extras'] > 0:
@@ -159,7 +162,7 @@ def detect_exceptions(df_resultado):
                 'Valor a Revisar': f"{row['Horas Extras']} hrs HE",
                 'Decisión Supervisor': 'Pendiente',
                 'Tipo Falta': 'N/A',
-                'Observaciones': ''
+                'Observaciones': row['Observaciones']
             })
 
         if row['Atraso (Minutos)'] > 30:
@@ -172,7 +175,7 @@ def detect_exceptions(df_resultado):
                 'Valor a Revisar': f"{row['Atraso (Minutos)']} min atraso",
                 'Decisión Supervisor': 'Pendiente',
                 'Tipo Falta': 'N/A',
-                'Observaciones': ''
+                'Observaciones': row['Observaciones']
             })
 
     return pd.DataFrame(excepciones)
@@ -180,7 +183,7 @@ def detect_exceptions(df_resultado):
 
 def get_canje_summary(df_resultado):
     """
-    Calcula el balance de Bolsa de Horas Extras vs. Faltas.
+    Resumen de Canje de Bolsa de Horas Extras.
     """
     if df_resultado is None or df_resultado.empty:
         return pd.DataFrame()
