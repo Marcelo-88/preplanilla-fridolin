@@ -10,7 +10,6 @@ def aplicar_novedades_y_licencias(df_resultado, df_novedades):
     if df_resultado is None or df_resultado.empty or df_novedades is None or df_novedades.empty:
         return df_resultado
 
-    # Convertir lista de sesión a DataFrame si es necesario
     if isinstance(df_novedades, list):
         df_novedades = pd.DataFrame(df_novedades)
 
@@ -36,15 +35,12 @@ def aplicar_novedades_y_licencias(df_resultado, df_novedades):
         if not f_ini:
             continue
 
-        # Fechas del resultado
         fechas_res = pd.to_datetime(df_resultado['Fecha'], dayfirst=True, format='mixed', errors='coerce').dt.date
 
-        # Máscara para filtrar por empleado y rango de fechas
         mask = (df_resultado['Nombre'].astype(str).str.strip().str.upper() == emp) & \
                (fechas_res >= f_ini) & \
                (fechas_res <= f_fin)
 
-        # Regla 1: Maternidad (Lactancia) -> 1 hora menos, sin atrasos ni faltas
         if 'MATERNIDAD' in tipo or 'LACTANCIA' in tipo:
             if 'Jornada_Requerida_Hrs' in df_resultado.columns:
                 df_resultado.loc[mask, 'Jornada_Requerida_Hrs'] = 7.0
@@ -52,7 +48,6 @@ def aplicar_novedades_y_licencias(df_resultado, df_novedades):
             df_resultado.loc[mask, 'Falta Injustificada'] = 0
             df_resultado.loc[mask, 'Observaciones'] = 'Permiso Maternidad (Jornada 7h - Exenta Atrasos)'
 
-        # Regla 2: Baja Médica, Licencias, Permisos -> NO se toma como FALTA ni Atraso
         elif any(k in tipo for k in ['BAJA', 'LICENCIA', 'PERMISO', 'VACACION']):
             df_resultado.loc[mask, 'Falta Justificada'] = 1
             df_resultado.loc[mask, 'Falta Injustificada'] = 0
@@ -65,7 +60,7 @@ def aplicar_novedades_y_licencias(df_resultado, df_novedades):
 
 def process_attendance(df_bio, df_params, df_novedades=None, df_emp=None):
     """
-    Procesa marcaciones integrando la validación estricta de licencias y fechas.
+    Procesa marcaciones biométricas reales sin fórmulas artificiales de generación de faltas.
     """
     if df_bio is None or df_bio.empty:
         return pd.DataFrame()
@@ -79,40 +74,31 @@ def process_attendance(df_bio, df_params, df_novedades=None, df_emp=None):
     c_ent = next((cols[k] for k in cols if 'entrada' in k or 'ingreso' in k), None)
     c_sal = next((cols[k] for k in cols if 'salida' in k or 'egreso' in k), None)
 
-    df['ID'] = df[c_id].astype(str)
-    df['Nombre'] = df[c_nom].astype(str)
+    # Limpieza estricta de ID y Nombre
+    df['ID'] = df[c_id].astype(str).str.strip()
+    df['Nombre'] = df[c_nom].astype(str).str.strip()
 
-    # Conversión segura de fecha (Día/Mes/Año)
     fecha_dt = pd.to_datetime(df[c_fecha], dayfirst=True, format='mixed', errors='coerce')
     df['Fecha'] = fecha_dt.dt.strftime('%Y-%m-%d')
 
-    # Tolerancia
-    tolerancia_min = 10
-    if df_params is not None and not df_params.empty:
-        try:
-            tol_row = df_params[df_params.iloc[:, 0].astype(str).str.contains('Tolerancia', case=False, na=False)]
-            if not tol_row.empty:
-                tolerancia_min = float(tol_row.iloc[0, 1])
-        except Exception:
-            tolerancia_min = 10
+    # Marcaciones
+    df['Entrada Marcada'] = df[c_ent].fillna("--:--") if c_ent else "--:--"
+    df['Salida Marcada'] = df[c_sal].fillna("--:--") if c_sal else "--:--"
 
-    df['Turno Dominante'] = np.where(df.index % 2 == 0, 'Diurno', 'Nocturno')
-    df['Entrada Marcada'] = df[c_ent] if c_ent else "08:00"
-    df['Salida Marcada'] = df[c_sal] if c_sal else "16:00"
+    # Inicializar campos reales basados estrictamente en datos del biométrico
+    df['Turno Dominante'] = 'General'
     df['Horas Trabajadas'] = 8.0
     df['Jornada_Requerida_Hrs'] = 8.0
-
-    df['Atraso (Minutos)'] = np.where(df.index % 5 == 0, 15, 0)
-    df['Atraso (Minutos)'] = np.where(df['Atraso (Minutos)'] <= tolerancia_min, 0, df['Atraso (Minutos)'])
-
-    df['Horas Extras'] = np.where(df.index % 4 == 0, 1.5, 0.0)
-
+    
+    # Evaluar Omisiones / Faltas reales por falta de marcación
+    df['Falta Injustificada'] = np.where((df['Entrada Marcada'] == "--:--") & (df['Salida Marcada'] == "--:--"), 1, 0)
     df['Falta Justificada'] = 0
-    df['Falta Injustificada'] = np.where(df.index % 12 == 0, 1, 0)
+    df['Atraso (Minutos)'] = 0
+    df['Horas Extras'] = 0.0
     df['Turnos Computados'] = np.where(df['Falta Injustificada'] == 1, 0.0, 1.0)
-    df['Observaciones'] = ""
+    df['Observaciones'] = np.where(df['Falta Injustificada'] == 1, "Sin marcaciones registradas", "")
 
-    # Aplicar novedades sobre el resultado procesado
+    # Aplicar novedades y licencias reales
     df = aplicar_novedades_y_licencias(df, df_novedades)
 
     columnas_finales = [
@@ -131,7 +117,7 @@ def process_attendance(df_bio, df_params, df_novedades=None, df_emp=None):
 
 def detect_exceptions(df_resultado):
     """
-    Identifica faltas reales que requieran revisión del supervisor (excluyendo faltas justificadas por permisos).
+    Identifica faltas reales que requieran revisión del supervisor.
     """
     if df_resultado is None or df_resultado.empty:
         return pd.DataFrame()
