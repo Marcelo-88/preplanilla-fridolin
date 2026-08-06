@@ -72,7 +72,6 @@ elif opcion == "✅ Aprobaciones Supervisores":
         "➕ Regularizar Olvido Marcación"
     ])
 
-    # Cargar y procesar datos base
     try:
         df_bio = load_sheet_data("02_Importacion_Biometrico")
         df_params = load_sheet_data("05_Parametros_y_Reglas")
@@ -91,15 +90,11 @@ elif opcion == "✅ Aprobaciones Supervisores":
         df_excepciones = pd.DataFrame()
         st.warning(f"No se pudieron cargar los datos biométricos para calcular excepciones: {e}")
 
-    # -------------------------------------------------------------------------
-    # TAB 1: EXCEPCIONES AUTOMÁTICAS DETECTADAS
-    # -------------------------------------------------------------------------
     with tab_excepciones:
         if df_excepciones is not None and not df_excepciones.empty:
             st.subheader("Excepciones Detectadas en el Periodo")
-            st.info("💡 Evalúa cada caso detectado. Puedes marcarlo como Aprobado, Rechazado o Justificado, y clasificar las Faltas.")
+            st.info("💡 Haz clic sobre las celdas de 'Decisión' o 'Tipo Falta' para cambiar su estado (Aprobado, Rechazado, Justificada, Injustificada).")
 
-            # Filtros dinámicos
             col_f1, col_f2 = st.columns(2)
             with col_f1:
                 tipo_exc = ["Todos"] + list(df_excepciones['Tipo Excepción'].unique())
@@ -114,14 +109,12 @@ elif opcion == "✅ Aprobaciones Supervisores":
             if sel_emp_exc != "Todos":
                 df_fil_exc = df_fil_exc[df_fil_exc['Nombre'] == sel_emp_exc]
 
-            # Muestreo de Métricas
             m1, m2, m3, m4 = st.columns(4)
             m1.metric("Excepciones Totales", len(df_fil_exc))
-            m2.metric("Faltas Detectadas", len(df_fil_exc[df_fil_exc['Tipo Excepción'] == 'Falta / Omisión Marcación']))
+            m2.metric("Faltas Totales (A Reportar)", len(df_fil_exc[df_fil_exc['Tipo Excepción'] == 'Falta / Omisión Marcación']))
             m3.metric("Sol. Horas Extras", len(df_fil_exc[df_fil_exc['Tipo Excepción'] == 'Horas Extras']))
             m4.metric("7º Día / Desfases", len(df_fil_exc[df_fil_exc['Tipo Excepción'].isin(['7º Día Laborado', 'Desfase Horario Ingreso'])]))
 
-            # Data Editor Interactivo
             df_edited_exc = st.data_editor(
                 df_fil_exc,
                 use_container_width=True,
@@ -133,7 +126,7 @@ elif opcion == "✅ Aprobaciones Supervisores":
                         required=True
                     ),
                     "Tipo Falta": st.column_config.SelectboxColumn(
-                        "Tipo Falta",
+                        "Tipo Falta (Para Contabilidad)",
                         options=["N/A", "Justificada", "Injustificada"],
                         required=True
                     ),
@@ -144,10 +137,9 @@ elif opcion == "✅ Aprobaciones Supervisores":
                 }
             )
 
-            # Exportador Copy-Paste Ready
             st.divider()
             st.subheader("📥 Exportación 'Copy-Paste Ready' para Google Drive")
-            st.caption("Descarga este Excel con la estructura exacta para copiar y pegar directamente en la pestaña del Google Sheet.")
+            st.caption("Descarga este Excel con las clasificaciones ajustadas para enviarlo a Contabilidad.")
 
             buffer_exc = io.BytesIO()
             with pd.ExcelWriter(buffer_exc, engine='openpyxl') as writer:
@@ -162,9 +154,6 @@ elif opcion == "✅ Aprobaciones Supervisores":
         else:
             st.success("🎉 No se detectaron excepciones pendientes de revisión.")
 
-    # -------------------------------------------------------------------------
-    # TAB 2: HERRAMIENTA DE CANJE DE HORAS EXTRAS POR FALTAS
-    # -------------------------------------------------------------------------
     with tab_canje:
         st.subheader("⚖️ Compensación y Canje de Bolsa de Horas Extras por Faltas")
         st.write("Permite cancelar 1 Falta utilizando la bolsa de Horas Extras acumuladas del empleado.")
@@ -196,13 +185,10 @@ elif opcion == "✅ Aprobaciones Supervisores":
                     if info_emp['Total_HE'] < he_a_canjear:
                         st.error(f"El empleado solo cuenta con {info_emp['Total_HE']:.2f} hrs extras. No alcanza para compensar {he_a_canjear} hrs.")
                     else:
-                        st.success(f"✅ Canje exitoso: Se descontarán {he_a_canjear} hrs HE para anular la falta del día {fecha_falta_canje}. Ambos contadores ajustados a 0.")
+                        st.success(f"✅ Canje exitoso: Se descontarán {he_a_canjear} hrs HE para la falta del día {fecha_falta_canje}.")
         else:
-            st.info("Cargue los datos biométricos para habiltar la calculadora de canjes.")
+            st.info("Cargue los datos biométricos para habilitar la calculadora de canjes.")
 
-    # -------------------------------------------------------------------------
-    # TAB 3: REGULARIZACIÓN MANUAL
-    # -------------------------------------------------------------------------
     with tab_regularizar:
         st.subheader("Regularizar Marcación Faltante u Olvido")
         st.write("Permite al supervisor completar horas de entrada o salida no marcadas en el biométrico.")
@@ -225,7 +211,7 @@ elif opcion == "✅ Aprobaciones Supervisores":
                 if not id_emp_reg or not nombre_emp_reg or not motivo_reg:
                     st.warning("Por favor complete todos los campos obligatorios (*).")
                 else:
-                    st.success(f"Regularización registrada para {nombre_emp_reg} el día {fecha_reg}. Se guardará en la planilla de consolidación.")
+                    st.success(f"Regularización registrada para {nombre_emp_reg} el día {fecha_reg}.")
 
 elif opcion == "📑 Pre-Planilla y Reportes":
     st.header("Reporte Consolidado de Asistencia para RRHH / Contabilidad")
@@ -267,13 +253,14 @@ elif opcion == "📑 Pre-Planilla y Reportes":
                 st.subheader("Planilla de Control de Tiempos")
                 st.dataframe(df_filtrado, use_container_width=True, hide_index=True)
                 
-                col1, col2, col3, col4, col5, col6 = st.columns(6)
-                col1.metric("Registros", len(df_filtrado))
-                col2.metric("Horas Trabajadas", f"{df_filtrado['Horas Trabajadas'].sum():.2f} hrs")
-                col3.metric("Total Atrasos", f"{df_filtrado['Atraso (Minutos)'].sum()} min")
-                col4.metric("Horas Extras", f"{df_filtrado['Horas Extras'].sum():.2f} hrs")
-                col5.metric("Turnos Computados", f"{df_filtrado['Turnos Computados'].sum():.1f}")
-                col6.metric("Horas Nocturnas", f"{df_filtrado['Horas Nocturnas'].sum():.2f} hrs")
+                c1, c2, c3, c4, c5, c6, c7 = st.columns(7)
+                c1.metric("Registros", len(df_filtrado))
+                c2.metric("Horas Trabajadas", f"{df_filtrado['Horas Trabajadas'].sum():.2f} hrs")
+                c3.metric("Total Atrasos", f"{df_filtrado['Atraso (Minutos)'].sum()} min")
+                c4.metric("Horas Extras", f"{df_filtrado['Horas Extras'].sum():.2f} hrs")
+                c5.metric("Faltas Justif.", int(df_filtrado['Falta Justificada'].sum()))
+                c6.metric("Faltas Injustif.", int(df_filtrado['Falta Injustificada'].sum()))
+                c7.metric("Turnos Comp.", f"{df_filtrado['Turnos Computados'].sum():.1f}")
                 
                 buffer = io.BytesIO()
                 with pd.ExcelWriter(buffer, engine='openpyxl') as writer:
