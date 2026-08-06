@@ -3,6 +3,7 @@ import pandas as pd
 import io
 from modules.data_loader import load_sheet_data
 from modules.attendance_processor import process_attendance, detect_exceptions, get_canje_summary
+from modules.auth_permissions import render_user_selector, filter_dataframe_by_supervisor
 
 st.set_page_config(
     page_title="Pre-Planilla Fridolin",
@@ -14,6 +15,18 @@ st.title("🏭 Control de Asistencia y Reportes - Fridolin")
 
 st.sidebar.image("https://em-content.zobj.net/source/apple/354/factory_1f3ed.png", width=80)
 st.sidebar.title("Menú Principal")
+
+# -----------------------------------------------------------------------------
+# CONTROL DE ACCESO Y SESIÓN DE USUARIO (SIDEBAR)
+# -----------------------------------------------------------------------------
+try:
+    df_emp_master = load_sheet_data("01_Maestro_Empleados")
+    usuario_actual, rol_actual, empleados_permitidos = render_user_selector(df_emp_master)
+except Exception as e:
+    usuario_actual, rol_actual, empleados_permitidos = "Invitado", "Jefe de Producción", []
+    st.sidebar.error(f"No se pudo inicializar la autenticación: {e}")
+
+st.sidebar.divider()
 
 opcion = st.sidebar.radio(
     "Seleccione una vista:",
@@ -30,6 +43,9 @@ opcion = st.sidebar.radio(
 st.sidebar.divider()
 st.sidebar.caption("Sistema de Control de Asistencia v1.0")
 
+# -----------------------------------------------------------------------------
+# 1. PARÁMETROS Y REGLAS
+# -----------------------------------------------------------------------------
 if opcion == "📊 Parámetros y Reglas":
     st.header("Parámetros y Reglas del Sistema")
     try:
@@ -38,14 +54,22 @@ if opcion == "📊 Parámetros y Reglas":
     except Exception as e:
         st.error(f"Error al cargar la pestaña: {e}")
 
+# -----------------------------------------------------------------------------
+# 2. MAESTRO DE EMPLEADOS
+# -----------------------------------------------------------------------------
 elif opcion == "👥 Maestro de Empleados":
     st.header("Maestro de Empleados")
     try:
         df_emp = load_sheet_data("01_Maestro_Empleados")
-        st.dataframe(df_emp, use_container_width=True, hide_index=True)
+        # Filtrar solo el personal a cargo del supervisor activo
+        df_emp_fil = filter_dataframe_by_supervisor(df_emp, 'Nombre_Completo', empleados_permitidos, rol_actual)
+        st.dataframe(df_emp_fil, use_container_width=True, hide_index=True)
     except Exception as e:
         st.error(f"Error al cargar la pestaña: {e}")
 
+# -----------------------------------------------------------------------------
+# 3. IMPORTACIÓN BIOMÉTRICO
+# -----------------------------------------------------------------------------
 elif opcion == "⏱️ Importación Biométrico":
     st.header("Registros del Biométrico")
     try:
@@ -54,14 +78,22 @@ elif opcion == "⏱️ Importación Biométrico":
     except Exception as e:
         st.error(f"Error al cargar la pestaña: {e}")
 
+# -----------------------------------------------------------------------------
+# 4. NOVEDADES Y PERMISOS
+# -----------------------------------------------------------------------------
 elif opcion == "📝 Novedades y Permisos":
     st.header("Novedades y Permisos")
     try:
         df_nov = load_sheet_data("04_Novedades_y_Permisos")
-        st.dataframe(df_nov, use_container_width=True, hide_index=True)
+        # Filtrar permisos por personal a cargo
+        df_nov_fil = filter_dataframe_by_supervisor(df_nov, 'Nombre_Completo', empleados_permitidos, rol_actual)
+        st.dataframe(df_nov_fil, use_container_width=True, hide_index=True)
     except Exception as e:
         st.error(f"Error al cargar la pestaña: {e}")
 
+# -----------------------------------------------------------------------------
+# 5. APROBACIONES SUPERVISORES
+# -----------------------------------------------------------------------------
 elif opcion == "✅ Aprobaciones Supervisores":
     st.header("✅ Centro de Aprobaciones y Excepciones")
     st.caption("Panel dinámico para revisión de faltas, horas extras, acumulación mensual y canje masivo de días.")
@@ -87,14 +119,17 @@ elif opcion == "✅ Aprobaciones Supervisores":
         df_res = process_attendance(df_bio, df_params, df_nov, df_emp)
         df_excepciones = detect_exceptions(df_res)
         df_canje_resumen = get_canje_summary(df_res)
+
+        # 🔒 Aplicar filtro estricto por Supervisor
+        df_excepciones = filter_dataframe_by_supervisor(df_excepciones, 'Nombre', empleados_permitidos, rol_actual)
+        df_canje_resumen = filter_dataframe_by_supervisor(df_canje_resumen, 'Nombre', empleados_permitidos, rol_actual)
+
     except Exception as e:
         df_excepciones = pd.DataFrame()
         df_canje_resumen = pd.DataFrame()
         st.warning(f"No se pudieron cargar los datos biométricos para calcular excepciones: {e}")
 
-    # -------------------------------------------------------------------------
     # TAB 1: EXCEPCIONES AUTOMÁTICAS
-    # -------------------------------------------------------------------------
     with tab_excepciones:
         if df_excepciones is not None and not df_excepciones.empty:
             st.subheader("Excepciones Detectadas en el Periodo")
@@ -164,18 +199,14 @@ elif opcion == "✅ Aprobaciones Supervisores":
                 mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
             )
         else:
-            st.success("🎉 No se detectaron excepciones pendientes de revisión.")
+            st.success("🎉 No se detectaron excepciones pendientes de revisión para su personal asignado.")
 
-    # -------------------------------------------------------------------------
-    # TAB 2: CANJE MASIVO EN TABLA (8h Diurno / 7h Nocturno = 1 Día Entero)
-    # -------------------------------------------------------------------------
+    # TAB 2: CANJE MASIVO EN TABLA
     with tab_canje_masivo:
         st.subheader("⚖️ Lista General para Canje Masivo de Horas Extras por Faltas")
         st.info("💡 **Regla Estricta:** 1 Día entero = **8 hrs** (Diurno) o **7 hrs** (Nocturno). Modifica directamente la columna **'Días a Canjear (Aplicar)'** en la tabla. Solo se permiten valores enteros (0, 1, 2, etc.).")
 
         if df_canje_resumen is not None and not df_canje_resumen.empty:
-            
-            # Editor masivo en formato tabla
             df_edited_canje = st.data_editor(
                 df_canje_resumen,
                 use_container_width=True,
@@ -203,7 +234,6 @@ elif opcion == "✅ Aprobaciones Supervisores":
                 }
             )
 
-            # Cálculo en tiempo real de los canjes aplicados
             dias_totales_canjeados = df_edited_canje['Días a Canjear (Aplicar)'].sum()
             
             c_m1, c_m2 = st.columns(2)
@@ -224,11 +254,9 @@ elif opcion == "✅ Aprobaciones Supervisores":
                 mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
             )
         else:
-            st.info("No hay empleados con saldo de horas extras o faltas para procesar canjes.")
+            st.info("No hay empleados a su cargo con saldo de horas extras o faltas para procesar canjes.")
 
-    # -------------------------------------------------------------------------
     # TAB 3: REGULARIZACIÓN MANUAL
-    # -------------------------------------------------------------------------
     with tab_regularizar:
         st.subheader("Regularizar Marcación Faltante u Olvido")
         st.write("Permite al supervisor completar horas de entrada o salida no marcadas en el biométrico.")
@@ -253,6 +281,9 @@ elif opcion == "✅ Aprobaciones Supervisores":
                 else:
                     st.success(f"Regularización registrada para {nombre_emp_reg} el día {fecha_reg}.")
 
+# -----------------------------------------------------------------------------
+# 6. PRE-PLANILLA Y REPORTES
+# -----------------------------------------------------------------------------
 elif opcion == "📑 Pre-Planilla y Reportes":
     st.header("Reporte Consolidado de Asistencia para RRHH / Contabilidad")
     
@@ -273,7 +304,10 @@ elif opcion == "📑 Pre-Planilla y Reportes":
                 
             df_resultado = process_attendance(df_bio, df_params, df_nov, df_emp)
             
-            if not df_resultado.empty:
+            # 🔒 Aplicar filtro estricto por Supervisor
+            df_resultado = filter_dataframe_by_supervisor(df_resultado, 'Nombre', empleados_permitidos, rol_actual)
+
+            if df_resultado is not None and not df_resultado.empty:
                 col_filtro1, col_filtro2 = st.columns(2)
                 
                 with col_filtro1:
@@ -313,6 +347,6 @@ elif opcion == "📑 Pre-Planilla y Reportes":
                     mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
                 )
             else:
-                st.warning("No hay datos disponibles para procesar.")
+                st.warning("No hay datos disponibles para procesar según el usuario seleccionado.")
         except Exception as e:
             st.error(f"Error durante el procesamiento: {e}")
