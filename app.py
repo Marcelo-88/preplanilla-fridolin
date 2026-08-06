@@ -308,7 +308,6 @@ elif opcion == "✅ Aprobaciones Supervisores":
         if df_excepciones is not None and not df_excepciones.empty:
             st.subheader(f"Resumen Ejecutivo de Excepciones ({periodo_sel})")
 
-            # BUSCADOR POR COLABORADOR
             filtro_persona_exc = st.text_input("🔍 Buscar colaborador por Nombre o CI (Excepciones):", placeholder="Ej: Lynn Soria o 8228265")
             
             df_exc_vista = df_excepciones.copy()
@@ -429,22 +428,37 @@ elif opcion == "📑 Pre-Planilla y Reportes":
 
             df_resultado = run_cached_attendance_processing(df_bio_rep, df_params, df_emp, nov_mgr)
 
-            # Impactar decisiones guardadas
+            # ASEGURAR QUE EL CI NUNCA SEA NULO NI VACÍO
+            if df_resultado is not None and not df_resultado.empty:
+                if 'Carnet_Identidad' in df_resultado.columns:
+                    df_resultado['Carnet_Identidad'] = df_resultado['Carnet_Identidad'].apply(clean_ci_str)
+
+                # Reordenar columnas para que Carnet_Identidad aparezca de primero
+                cols = list(df_resultado.columns)
+                if 'Carnet_Identidad' in cols:
+                    cols.remove('Carnet_Identidad')
+                    cols = ['Carnet_Identidad'] + cols
+                    df_resultado = df_resultado[cols]
+
+            # Impactar decisiones guardadas en la Pre-Planilla
             if df_resultado is not None and not df_resultado.empty and p_sel_rep != "Todos":
                 decisiones_guardadas = lock_mgr.obtener_decisiones_excepciones(p_sel_rep)
                 for idx, row in df_resultado.iterrows():
-                    ci_row = clean_ci_str(row['Carnet_Identidad'])
-                    f_row = str(row['Fecha']).strip()
+                    ci_row = clean_ci_str(row.get('Carnet_Identidad', ''))
+                    f_row = str(row.get('Fecha', '')).strip()
                     
                     for (d_ci, d_f, d_tipo), d_val in decisiones_guardadas.items():
                         if d_ci == ci_row and d_f == f_row:
                             dec = d_val['decision']
                             if dec == "Justificado":
-                                df_resultado.at[idx, 'Falta Justificada'] = 1
-                                df_resultado.at[idx, 'Falta Injustificada'] = 0
+                                if 'Falta Justificada' in df_resultado.columns:
+                                    df_resultado.at[idx, 'Falta Justificada'] = 1
+                                if 'Falta Injustificada' in df_resultado.columns:
+                                    df_resultado.at[idx, 'Falta Injustificada'] = 0
                                 df_resultado.at[idx, 'Estado'] = 'Justificado por Supervisor'
                             elif dec == "Rechazado":
-                                df_resultado.at[idx, 'Horas Extras'] = 0.0
+                                if 'Horas Extras' in df_resultado.columns:
+                                    df_resultado.at[idx, 'Horas Extras'] = 0.0
                                 df_resultado.at[idx, 'Estado'] = 'Rechazado por Supervisor'
 
             if df_resultado is not None and not df_resultado.empty:
