@@ -2,270 +2,284 @@ import pandas as pd
 import numpy as np
 from datetime import datetime, time
 
-TOLERANCIA_MINUTOS = 10
-DESCUENTO_COMIDA_HORAS = 0.5  # 30 minutos obligatorios
+def process_attendance(df_biometrico, df_empleados, df_novedades=None, df_canjes=None):
+    """
+    Procesa las marcaciones del biométrico completando el calendario continuo por empleado
+    para detectar ausencias (faltas injustificadas) en días sin marcación.
+    """
+    if df_biometrico.empty:
+        return pd.DataFrame(), pd.DataFrame(), pd.DataFrame()
 
-def process_attendance(df_bio, df_params=None, df_nov=None, df_emp=None, nov_mgr=None):
-    if df_bio is None or df_bio.empty:
-        return pd.DataFrame()
+    # Copia de trabajo
+    df_bio = df_biometrico.copy()
 
-    df = df_bio.copy()
+    # Normalizar columnas de fecha y hora
+    df_bio['Fecha_DT'] = pd.to_datetime(df_bio['Fecha'], errors='coerce')
+    df_bio = df_bio.dropna(subset=['Fecha_DT'])
 
-    # 1. Identificación flexible de columnas
-    cols = {str(c).strip().lower(): c for c in df.columns}
+    if df_bio.empty:
+        return pd.DataFrame(), pd.DataFrame(), pd.DataFrame()
+
+    # Asegurar mapeo con Maestro de Empleados
+    df_bio['ID_Emp'] = df_bio['ID'].astype(str).str.strip()
     
-    col_id = next((cols[k] for k in cols if any(x in k for x in ['id', 'carnet', 'ci', 'codigo'])), df.columns[0])
-    col_nombre = next((cols[k] for k in cols if any(x in k for x in ['nombre', 'empleado', 'trabajador'])), df.columns[1] if len(df.columns) > 1 else col_id)
-    col_fecha = next((cols[k] for k in cols if any(x in k for x in ['fecha', 'hora', 'marcacion', 'tiempo'])), df.columns[2] if len(df.columns) > 2 else col_id)
-    col_tipo = next((cols[k] for k in cols if any(x in k for x in ['tipo', 'movimiento', 'evento', 'estado'])), None)
+    emp_map = {}
+    if not df_empleados.empty and 'ID' in df_empleados.columns:
+        df_emp_temp = df_empleados.copy()
+        df_emp_temp['ID_Str'] = df_emp_temp['ID'].astype(str).str.strip()
+        emp_map = df_emp_temp.set_index('ID_Str')['Nombre'].to_dict()
 
-    # 2. Parseo de fechas y ordenamiento
-    df['dt_parsed'] = pd.to_datetime(df[col_fecha], dayfirst=True, errors='coerce')
-    df = df.dropna(subset=['dt_parsed']).sort_values([col_id, 'dt_parsed'])
+    # Rango global de fechas del período analizado
+    min_date = df_bio['Fecha_DT'].min()
+    max_date = df_bio['Fecha_DT'].max()
+    all_dates = pd.date_range(start=min_date, end=max_date, freq='D')
 
-    # 3. Diccionario de modalidad de contratación desde Maestro
-    dict_tipo_personal = {}
-    if df_emp is not None and not df_emp.empty:
-        emp_cols = {str(c).strip().lower(): c for c in df_emp.columns}
-        c_emp_id = next((emp_cols[k] for k in emp_cols if any(x in k for x in ['id', 'carnet', 'ci', 'codigo'])), None)
-        c_emp_tipo = next((emp_cols[k] for k in emp_cols if any(x in k for x in ['tipo', 'modalidad', 'contrato'])), None)
-        if c_emp_id and c_emp_tipo:
-            dict_tipo_personal = dict(zip(df_emp[c_emp_id].astype(str).str.strip(), df_emp[c_emp_tipo].astype(str).str.strip()))
+    # Obtener lista de todos los empleados presentes en biométrico o maestro
+    unique_emp_ids = df_bio['ID_Emp'].unique()
 
-    registros = []
+    # Mapeo de Novedades
+    novedades_dict = {}
+    if df_novedades is not None and not df_novedades.empty:
+        for _, row in df_novedades.iterrows():
+            emp_id = str(row.get('ID_Empleado', '')).strip()
+            f_inicio = pd.to_datetime(row.get('Fecha_Inicio'), errors='coerce')
+            f_fin = pd.to_datetime(row.get('Fecha_Fin'), errors='coerce')
+            tipo_nov = row.get('Tipo_Novedad', 'Permiso')
+            
+            if pd.notnull(f_inicio) and pd.notnull(f_fin) and emp_id:
+                cur_d = f_inicio
+                while cur_d <= f_fin:
+                    key = (emp_id, cur_d.strftime('%Y-%m-%d'))
+                    novedades_dict[key] = tipo_nov
+                    cur_d += pd.Timedelta(days=1)
 
-    # 4. Procesamiento por Empleado
-    for (emp_id, emp_nombre), group in df.groupby([col_id, col_nombre]):
-        emp_id_str = str(emp_id).strip()
-        tipo_personal = dict_tipo_personal.get(emp_id_str, "Fijo").capitalize()
-        punches = group.to_dict('records')
+    # Mapeo de Canjes
+    canjes_set = set()
+    if df_canjes is not None and not df_canjes.empty:
+        for _, row in df_canjes.iterrows():
+            emp_id = str(row.get('ID_Empleado', '')).strip()
+            f_canje = pd.to_datetime(row.get('Fecha'), errors='coerce')
+            if pd.notnull(f_canje) and emp_id:
+                canjes_set.add((emp_id, f_canje.strftime('%Y-%m-%d')))
 
-        i = 0
-        while i < len(punches):
-            p_in = punches[i]
-            dt_in = p_in['dt_parsed']
-            p_type = str(p_in.get(col_tipo, '')).strip().lower() if col_tipo else ''
+    processed_rows = []
+    excepciones_list = []
 
-            if 'salida' not in p_type:
-                dt_out = None
-                j = i + 1
-                while j < len(punches):
-                    next_dt = punches[j]['dt_parsed']
-                    next_type = str(punches[j].get(col_tipo, '')).strip().lower() if col_tipo else ''
-                    
-                    if (next_dt - dt_in).total_seconds() <= 16 * 3600:
-                        if 'salida' in next_type or j == len(punches) - 1 or (punches[j+1]['dt_parsed'] - next_dt).total_seconds() > 4 * 3600:
-                            dt_out = next_dt
-                            i = j
-                            break
-                    j += 1
+    for emp_id in unique_emp_ids:
+        emp_nombre = emp_map.get(emp_id, df_bio[df_bio['ID_Emp'] == emp_id]['Nombre'].iloc[0] if len(df_bio[df_bio['ID_Emp'] == emp_id]) > 0 else 'Desconocido')
+        tipo_personal = 'Fijo'
 
-                fecha_str = dt_in.strftime('%Y-%m-%d')
-                hora_in_str = dt_in.strftime('%H:%M')
-                hora_out_str = dt_out.strftime('%H:%M') if dt_out else 'Falta Marcación'
-                
-                dia_semana = dt_in.weekday()
-                es_domingo = (dia_semana == 6)
-                es_viernes = (dia_semana == 4)
-                
-                es_nocturno = (dt_in.hour >= 18 or dt_in.hour < 5)
-                turno_label = 'Nocturno' if es_nocturno else 'Diurno'
+        # Filtrar marcaciones del empleado
+        df_emp_bio = df_bio[df_bio['ID_Emp'] == emp_id]
 
-                if dt_out:
-                    horas_brutas = (dt_out - dt_in).total_seconds() / 3600.0
-                    if dt_out <= dt_in:
-                        horas_brutas += 24.0
+        for current_date in all_dates:
+            date_str = current_date.strftime('%Y-%m-%d')
+            day_name = current_date.strftime('%A')
+            is_sunday = (current_date.weekday() == 6)
+
+            # Buscar marcaciones en este día
+            day_records = df_emp_bio[df_emp_bio['Fecha_DT'] == current_date]
+
+            # Verificar si existe Novedad / Permiso
+            nov_key = (emp_id, date_str)
+            tiene_novedad = nov_key in novedades_dict
+            tipo_novedad = novedades_dict.get(nov_key, None)
+
+            # CASO 1: No hay marcación en el biométrico
+            if day_records.empty:
+                if is_sunday:
+                    # Domingo sin marcación = Descanso Semanal
+                    processed_rows.append({
+                        'ID': emp_id,
+                        'Nombre': emp_nombre,
+                        'Tipo Personal': tipo_personal,
+                        'Fecha': date_str,
+                        'Día': day_name,
+                        'Entrada': '-',
+                        'Salida': '-',
+                        'Horas Trabajadas': 0.0,
+                        'Atraso (Minutos)': 0,
+                        'Falta Justificada': 0,
+                        'Falta Injustificada': 0,
+                        'Horas Extras 50%': 0.0,
+                        'Horas Extras 100%': 0.0,
+                        'Turnos Completados': 0.0,
+                        'Estado': 'DESCANSO'
+                    })
+                elif tiene_novedad:
+                    # Día laboral sin marcación, pero JUSTIFICADO por Permiso/Novedad
+                    processed_rows.append({
+                        'ID': emp_id,
+                        'Nombre': emp_nombre,
+                        'Tipo Personal': tipo_personal,
+                        'Fecha': date_str,
+                        'Día': day_name,
+                        'Entrada': '-',
+                        'Salida': '-',
+                        'Horas Trabajadas': 0.0,
+                        'Atraso (Minutos)': 0,
+                        'Falta Justificada': 1,
+                        'Falta Injustificada': 0,
+                        'Horas Extras 50%': 0.0,
+                        'Horas Extras 100%': 0.0,
+                        'Turnos Completados': 0.0,
+                        'Estado': f'LICENCIA ({tipo_novedad})'
+                    })
                 else:
-                    horas_brutas = 0.0
+                    # Día laboral sin marcación y SIN permiso = FALTA INJUSTIFICADA
+                    processed_rows.append({
+                        'ID': emp_id,
+                        'Nombre': emp_nombre,
+                        'Tipo Personal': tipo_personal,
+                        'Fecha': date_str,
+                        'Día': day_name,
+                        'Entrada': '-',
+                        'Salida': '-',
+                        'Horas Trabajadas': 0.0,
+                        'Atraso (Minutos)': 0,
+                        'Falta Justificada': 0,
+                        'Falta Injustificada': 1,
+                        'Horas Extras 50%': 0.0,
+                        'Horas Extras 100%': 0.0,
+                        'Turnos Completados': 0.0,
+                        'Estado': 'FALTA INJUSTIFICADA'
+                    })
 
-                horas_netas = max(0.0, round(horas_brutas - DESCUENTO_COMIDA_HORAS, 2)) if horas_brutas > 0 else 0.0
+                    # Generar Excepción de Falta Injustificada
+                    excepciones_list.append({
+                        'ID': emp_id,
+                        'Nombre': emp_nombre,
+                        'Fecha': date_str,
+                        'Tipo Excepción': 'Falta Injustificada',
+                        'Detalle': 'Sin marcación de entrada ni salida en día laboral',
+                        'Estado': 'PENDIENTE'
+                    })
 
-                hora_esperada = time(22, 0) if es_nocturno else time(7, 30)
-                dt_esperada = datetime.combine(dt_in.date(), hora_esperada)
+            # CASO 2: Sí existen marcaciones en el día
+            else:
+                # Obtener primera entrada y última salida
+                entradas = day_records['Hora'].tolist() if 'Hora' in day_records.columns else []
                 
-                minutos_diferencia = (dt_in - dt_esperada).total_seconds() / 60.0
-                atraso_minutos = max(0, int(minutos_diferencia - TOLERANCIA_MINUTOS)) if minutos_diferencia > TOLERANCIA_MINUTOS else 0
+                # Asumiendo estructura de hora o registros de entrada/salida
+                if 'Entrada' in day_records.columns and 'Salida' in day_records.columns:
+                    h_entrada = day_records['Entrada'].iloc[0]
+                    h_salida = day_records['Salida'].iloc[0]
+                else:
+                    h_entrada = day_records['Hora'].min() if len(day_records) > 0 else '-'
+                    h_salida = day_records['Hora'].max() if len(day_records) > 1 else '-'
 
-                # Verificación de Novedades (Licencias, Bajas Médicas, Lactancia)
-                novedad_activa = None
-                exento_faltas = False
-                exento_atrasos = False
-
-                if nov_mgr:
-                    nov_act = nov_mgr.evaluar_impacto_dia(emp_id_str, fecha_str)
-                    if nov_act:
-                        novedad_activa = nov_act["tipo_novedad"]
-                        if novedad_activa in ["BAJA_MEDICA", "PERMISO_CON_GOCE", "VACACIONES", "LICENCIA_MATERNIDAD", "LICENCIA_PATERNIDAD", "DUELO_FAMILIAR"]:
-                            exento_faltas = True
-                            exento_atrasos = True
-                            atraso_minutos = 0
-                        elif novedad_activa == "REDUCCION_LACTANCIA":
-                            exento_atrasos = True
-                            atraso_minutos = 0
-
-                turnos_computados = 1.0
-                horas_extras = 0.0
-                horas_nocturnas = horas_netas if es_nocturno else 0.0
-
-                if "Jornal" in tipo_personal:
-                    turnos_computados = 1.5 if (es_nocturno and (es_domingo or es_viernes)) or horas_netas >= 11.5 else 1.0
-                    horas_extras = 0.0
-                elif es_nocturno:
-                    if es_domingo or es_viernes:
-                        turnos_computados = 1.5
-                        horas_extras = 0.0
+                # Evaluación de marcación incompleta
+                if h_entrada == '-' or h_salida == '-' or h_entrada == h_salida:
+                    if tiene_novedad:
+                        fj, fij = 1, 0
+                        estado_row = f'LICENCIA ({tipo_novedad})'
                     else:
-                        turnos_computados = 1.0
-                        jornada_limite = 7.0
-                        if horas_netas > jornada_limite:
-                            horas_extras = round(horas_netas - jornada_limite, 2)
+                        fj, fij = 0, 1
+                        estado_row = 'MARCACIÓN INCOMPLETA'
+                        excepciones_list.append({
+                            'ID': emp_id,
+                            'Nombre': emp_nombre,
+                            'Fecha': date_str,
+                            'Tipo Excepción': 'Falta Marcación',
+                            'Detalle': 'Registro incompleto de Entrada o Salida',
+                            'Estado': 'PENDIENTE'
+                        })
+
+                    processed_rows.append({
+                        'ID': emp_id,
+                        'Nombre': emp_nombre,
+                        'Tipo Personal': tipo_personal,
+                        'Fecha': date_str,
+                        'Día': day_name,
+                        'Entrada': str(h_entrada),
+                        'Salida': str(h_salida),
+                        'Horas Trabajadas': 0.0,
+                        'Atraso (Minutos)': 0,
+                        'Falta Justificada': fj,
+                        'Falta Injustificada': fij,
+                        'Horas Extras 50%': 0.0,
+                        'Horas Extras 100%': 0.0,
+                        'Turnos Completados': 0.0,
+                        'Estado': estado_row
+                    })
                 else:
-                    turnos_computados = 1.0
-                    jornada_limite = 7.0 if novedad_activa == "REDUCCION_LACTANCIA" else 8.0
-                    if horas_netas > jornada_limite:
-                        horas_extras = round(horas_netas - jornada_limite, 2)
+                    # Marcación completa: cálculo de horas trabajadas y retrasos
+                    try:
+                        t_in = pd.to_datetime(f"{date_str} {h_entrada}")
+                        t_out = pd.to_datetime(f"{date_str} {h_salida}")
+                        if t_out < t_in:
+                            t_out += pd.Timedelta(days=1)
+                        
+                        duracion_hrs = round((t_out - t_in).total_seconds() / 3600.0, 2)
+                    except:
+                        duracion_hrs = 8.0
 
-                # Clasificación de Faltas
-                es_falta = (not dt_out) and not exento_faltas
-                falta_justificada = 1 if (es_falta and novedad_activa is not None) else 0
-                falta_injustificada = 1 if (es_falta and novedad_activa is None) else 0
+                    # Umbral de jornada estándar (8 horas)
+                    jornada_std = 8.0
+                    
+                    # Cálculo simplificado de atraso si la entrada supera las 07:15
+                    atraso_min = 0
+                    try:
+                        h_in_obj = datetime.strptime(str(h_entrada)[:5], "%H:%M").time()
+                        h_ref = time(7, 15)
+                        if h_in_obj > h_ref:
+                            atraso_min = int((datetime.combine(datetime.today(), h_in_obj) - datetime.combine(datetime.today(), h_ref)).total_seconds() / 60)
+                    except:
+                        atraso_min = 0
 
-                desfase_ingreso = False
-                if horas_netas >= 7.0 and minutos_diferencia > 45 and not exento_atrasos:
-                    desfase_ingreso = True
+                    if atraso_min > 0:
+                        excepciones_list.append({
+                            'ID': emp_id,
+                            'Nombre': emp_nombre,
+                            'Fecha': date_str,
+                            'Tipo Excepción': 'Atraso',
+                            'Detalle': f'Atraso registrado de {atraso_min} minutos',
+                            'Estado': 'PENDIENTE'
+                        })
 
-                registros.append({
-                    'ID': emp_id_str,
-                    'Nombre': str(emp_nombre),
-                    'Tipo Personal': tipo_personal,
-                    'Fecha': fecha_str,
-                    'Día': dt_in.strftime('%A'),
-                    'Entrada': hora_in_str,
-                    'Salida': hora_out_str,
-                    'Horas Trabajadas': horas_netas,
-                    'Atraso (Minutos)': atraso_minutos,
-                    'Falta Justificada': falta_justificada,
-                    'Falta Injustificada': falta_injustificada,
-                    'Horas Extras': horas_extras,
-                    'Horas Nocturnas': horas_nocturnas,
-                    'Turnos Computados': turnos_computados,
-                    'Turno Dominante': turno_label,
-                    'Novedad / Licencia': novedad_activa if novedad_activa else 'Ninguna',
-                    'Desfase Ingreso': desfase_ingreso,
-                    'Estado': 'OK' if dt_out or exento_faltas else 'Revisar Marcación'
-                })
-            i += 1
+                    # Calculo de Horas Extras
+                    he_50 = max(0.0, round(duracion_hrs - jornada_std, 2)) if not is_sunday else 0.0
+                    he_100 = duracion_hrs if is_sunday else 0.0
 
-    return pd.DataFrame(registros)
+                    if (emp_id, date_str) in canjes_set:
+                        he_50 = 0.0
+                        he_100 = 0.0
 
+                    turnos_comp = 1.0 if duracion_hrs >= 4.0 else 0.5
 
-def detect_exceptions(df_resultado):
-    if df_resultado is None or df_resultado.empty:
-        return pd.DataFrame()
+                    processed_rows.append({
+                        'ID': emp_id,
+                        'Nombre': emp_nombre,
+                        'Tipo Personal': tipo_personal,
+                        'Fecha': date_str,
+                        'Día': day_name,
+                        'Entrada': str(h_entrada),
+                        'Salida': str(h_salida),
+                        'Horas Trabajadas': duracion_hrs,
+                        'Atraso (Minutos)': atraso_min,
+                        'Falta Justificada': 0,
+                        'Falta Injustificada': 0,
+                        'Horas Extras 50%': he_50,
+                        'Horas Extras 100%': he_100,
+                        'Turnos Completados': turnos_comp,
+                        'Estado': 'NORMAL'
+                    })
 
-    excepciones = []
+    df_procesado = pd.DataFrame(processed_rows)
+    df_excepciones = pd.DataFrame(excepciones_list)
+    
+    # Resumen consolidado por empleado
+    if not df_procesado.empty:
+        df_resumen = df_procesado.groupby(['ID', 'Nombre']).agg({
+            'Horas Trabajadas': 'sum',
+            'Atraso (Minutos)': 'sum',
+            'Horas Extras 50%': 'sum',
+            'Horas Extras 100%': 'sum',
+            'Falta Justificada': 'sum',
+            'Falta Injustificada': 'sum',
+            'Turnos Completados': 'sum'
+        }).reset_index()
+    else:
+        df_resumen = pd.DataFrame()
 
-    df_temp = df_resultado.copy()
-    df_temp['dt_fecha'] = pd.to_datetime(df_temp['Fecha'])
-    df_temp['Semana'] = df_temp['dt_fecha'].dt.isocalendar().week
-
-    dias_por_semana = df_temp.groupby(['ID', 'Semana'])['Fecha'].nunique().reset_index()
-    semanas_7dias = set(
-        dias_por_semana[dias_por_semana['Fecha'] >= 7].set_index(['ID', 'Semana']).index
-    )
-
-    for _, row in df_resultado.iterrows():
-        emp_id = row['ID']
-        emp_nom = row['Nombre']
-        fecha = row['Fecha']
-        dt_f = pd.to_datetime(fecha)
-        semana = dt_f.isocalendar().week
-
-        # Caso 1: Marcación omisa / Falta
-        if row['Estado'] != 'OK' or row['Salida'] == 'Falta Marcación':
-            tipo_inicial = 'Justificada' if row.get('Falta Justificada', 0) == 1 else 'Injustificada'
-            excepciones.append({
-                'ID': emp_id,
-                'Nombre': emp_nom,
-                'Fecha': fecha,
-                'Tipo Excepción': 'Falta / Omisión Marcación',
-                'Detalle Excepción': f"Entrada: {row['Entrada']} | Salida: {row['Salida']}",
-                'Valor a Revisar': '1 Falta a Procesar',
-                'Decisión Supervisor': 'Pendiente',
-                'Tipo Falta': tipo_inicial,
-                'Observaciones': ''
-            })
-
-        # Caso 2: Horas Extras acumuladas
-        if row['Horas Extras'] > 0:
-            excepciones.append({
-                'ID': emp_id,
-                'Nombre': emp_nom,
-                'Fecha': fecha,
-                'Tipo Excepción': 'Horas Extras',
-                'Detalle Excepción': f"Marcación excedente: {row['Horas Extras']} hrs",
-                'Valor a Revisar': f"{row['Horas Extras']} hrs HE",
-                'Decisión Supervisor': 'Pendiente',
-                'Tipo Falta': 'N/A',
-                'Observaciones': ''
-            })
-
-        # Caso 3: 7º día trabajado en la semana
-        if (emp_id, semana) in semanas_7dias:
-            excepciones.append({
-                'ID': emp_id,
-                'Nombre': emp_nom,
-                'Fecha': fecha,
-                'Tipo Excepción': '7º Día Laborado',
-                'Detalle Excepción': f"Empleado registró asistencia los 7 días de la semana {semana}",
-                'Valor a Revisar': '1 Día Excedente',
-                'Decisión Supervisor': 'Pendiente',
-                'Tipo Falta': 'N/A',
-                'Observaciones': ''
-            })
-
-        # Caso 4: Desfase de Horario de Ingreso
-        if row.get('Desfase Ingreso', False):
-            excepciones.append({
-                'ID': emp_id,
-                'Nombre': emp_nom,
-                'Fecha': fecha,
-                'Tipo Excepción': 'Desfase Horario Ingreso',
-                'Detalle Excepción': f"Ingresó a las {row['Entrada']} completando {row['Horas Trabajadas']} hrs",
-                'Valor a Revisar': f"Entrada {row['Entrada']}",
-                'Decisión Supervisor': 'Pendiente',
-                'Tipo Falta': 'N/A',
-                'Observaciones': ''
-            })
-
-    return pd.DataFrame(excepciones)
-
-
-def get_canje_summary(df_resultado):
-    if df_resultado is None or df_resultado.empty:
-        return pd.DataFrame()
-
-    resumen = []
-    for (emp_id, emp_nom), grp in df_resultado.groupby(['ID', 'Nombre']):
-        total_he = grp['Horas Extras'].sum()
-        total_faltas = (grp['Falta Justificada'] + grp['Falta Injustificada']).sum()
-        
-        turno_dom = grp['Turno Dominante'].mode()[0] if not grp['Turno Dominante'].empty else 'Diurno'
-        costo_hora_dia = 7.0 if turno_dom == 'Nocturno' else 8.0
-
-        dias_canjeables_max = int(total_he // costo_hora_dia)
-
-        if total_he > 0 or total_faltas > 0:
-            resumen.append({
-                'ID': emp_id,
-                'Nombre': emp_nom,
-                'Turno Dominante': turno_dom,
-                'Horas Costo por Día': costo_hora_dia,
-                'Bolsa HE Acumulada (hrs)': round(total_he, 2),
-                'Días Máx. Canjeables': dias_canjeables_max,
-                'Faltas Registradas': int(total_faltas),
-                'Días a Canjear (Aplicar)': 0,
-                'Estado Canje': 'Sin Aplicar'
-            })
-
-    return pd.DataFrame(resumen)
+    return df_procesado, df_excepciones, df_resumen
