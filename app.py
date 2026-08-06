@@ -3,7 +3,7 @@ import pandas as pd
 import io
 from datetime import datetime
 
-from modules.data_loader import load_sheet_data
+from modules.data_loader import load_sheet_data, clean_ci_str
 from modules.attendance_processor import process_attendance, detect_exceptions, get_canje_summary
 from modules.auth_permissions import render_user_selector, filter_dataframe_by_supervisor
 from modules.audit_logger import AuditLogger
@@ -149,7 +149,7 @@ elif opcion == "📝 Novedades y Permisos":
                 
                 dict_opciones_emp = {}
                 for _, r in df_emp_fil.iterrows():
-                    ci = str(r.get('Carnet_Identidad', '')).strip()
+                    ci = clean_ci_str(r.get('Carnet_Identidad', ''))
                     nom = str(r.get('Nombre_Completo', r.get('Nombre', ''))).strip()
                     if ci and nom:
                         dict_opciones_emp[f"{nom} - (CI: {ci})"] = (ci, nom)
@@ -158,10 +158,8 @@ elif opcion == "📝 Novedades y Permisos":
 
             with st.form("form_nueva_novedad"):
                 label_emp = st.selectbox("Seleccione Empleado (Nombre - CI):*", options=sorted(dict_opciones_emp.keys()))
-                
                 tipo_nov = st.selectbox("Tipo de Novedad / Licencia:*", options=NovedadesManager.TIPOS_NOVEDAD)
                 
-                # Campos dinámicos para CAMBIO_TURNO
                 hora_in_proyectada = None
                 hora_out_proyectada = None
                 if "CAMBIO_TURNO" in tipo_nov:
@@ -240,19 +238,20 @@ elif opcion == "✅ Aprobaciones Supervisores":
         periodo_sel = st.selectbox("🗓️ Seleccionar Período de Revisión:", options=periodos_disponibles)
 
     estado_periodo = lock_mgr.obtener_estado_periodo(periodo_sel)
+    es_superusuario = ("Acceso Total" in rol_actual or rol_actual in LockManager.ROLES_SUPERUSUARIO)
     es_editable = lock_mgr.es_editable(periodo_sel, rol_actual)
 
     with col_p2:
         st.subheader(f"Estado Período: **{estado_periodo}**")
-        if estado_periodo == "FINALIZADO" and not es_editable:
-            st.error("🔒 Este período está CERRADO. Solo el Responsable de Operaciones puede desbloquearlo.")
+        if estado_periodo == "FINALIZADO" and not es_superusuario:
+            st.error("🔒 Este período está CERRADO. Contacte al Responsable de Operaciones para reaperturas.")
 
     col_rev1, col_rev2, col_rev3 = st.columns(3)
     with col_rev1:
-        if st.button("▶️ Marcar EN PROCESO"):
+        if st.button("▶️ INICIAR APROBACIONES"):
             res_c = lock_mgr.cambiar_estado(periodo_sel, lock_mgr.ESTADO_EN_PROCESO, usuario_actual, rol_actual)
             if res_c["exito"]:
-                audit_log.registrar_evento(usuario_actual, usuario_actual, "CAMBIO_ESTADO_PERIODO", "Aprobaciones", {"periodo": periodo_sel, "nuevo_estado": "EN_PROCESO"})
+                audit_log.registrar_evento(usuario_actual, usuario_actual, "CAMBIO_ESTADO_PERIODO", "Aprobaciones", {"periodo": periodo_sel, "nuevo_estado": lock_mgr.ESTADO_EN_PROCESO})
                 st.success(res_c["mensaje"])
                 st.rerun()
             else:
@@ -269,13 +268,36 @@ elif opcion == "✅ Aprobaciones Supervisores":
                 st.error(res_c["mensaje"])
 
     with col_rev3:
-        if estado_periodo == "FINALIZADO" and (rol_actual == "Jefe de Producción"):
-            if st.button("🔓 Desbloquear Período (Superusuario)"):
-                res_c = lock_mgr.cambiar_estado(periodo_sel, lock_mgr.ESTADO_PENDIENTE, usuario_actual, rol_actual, motivo="Desbloqueo por Jefatura")
+        if estado_periodo == "FINALIZADO" and es_superusuario:
+            if st.button("🔓 Desbloquear Período Global"):
+                res_c = lock_mgr.cambiar_estado(periodo_sel, lock_mgr.ESTADO_PENDIENTE, usuario_actual, rol_actual, motivo="Desbloqueo Global")
                 if res_c["exito"]:
                     audit_log.registrar_evento(usuario_actual, usuario_actual, "DESBLOQUEO_PERIODO", "Aprobaciones", {"periodo": periodo_sel})
                     st.success(res_c["mensaje"])
                     st.rerun()
+
+    # --- REVERSIÓN INDIVIDUAL PARA ACCESO TOTAL (Ever Medrano) ---
+    if es_superusuario:
+        with st.expander("🛠️ Panel de Reversión / Desbloqueo Individual por Colaborador (Exclusivo Acceso Total)"):
+            c_rev_ci, c_rev_mot, c_rev_btn = st.columns([2, 3, 2])
+            with c_rev_ci:
+                try:
+                    df_emp_tot = cached_load_sheet_data("01_Maestro_Empleados")
+                    dict_rev = {f"{r.get('Nombre_Completo', r.get('Nombre'))} (CI: {clean_ci_str(r.get('Carnet_Identidad'))})": clean_ci_str(r.get('Carnet_Identidad')) for _, r in df_emp_tot.iterrows()}
+                    emp_rev_sel = st.selectbox("Seleccionar Empleado a Revertir:", options=sorted(dict_rev.keys()))
+                    ci_rev_target = dict_rev.get(emp_rev_sel)
+                except Exception:
+                    ci_rev_target = st.text_input("CI de Colaborador a Revertir:")
+            with c_rev_mot:
+                motivo_rev = st.text_input("Motivo de la Reversión Individual:", placeholder="Ej: Error en registro de horas por el supervisor")
+            with c_rev_btn:
+                st.write("")
+                st.write("")
+                if st.button("🔄 Revertir Decisiones / Reabrir Empleado"):
+                    if ci_rev_target:
+                        res_r = lock_mgr.cambiar_estado_empleado(periodo_sel, ci_rev_target, lock_mgr.ESTADO_PENDIENTE, usuario_actual, motivo=motivo_rev)
+                        st.success(f"Se reabrió el período individualmente para CI: {ci_rev_target}")
+                        st.rerun()
 
     st.divider()
 
@@ -301,17 +323,26 @@ elif opcion == "✅ Aprobaciones Supervisores":
         df_excepciones = filter_dataframe_by_supervisor(df_excepciones, 'Carnet_Identidad', empleados_permitidos, rol_actual)
         df_canje_resumen = filter_dataframe_by_supervisor(df_canje_resumen, 'Carnet_Identidad', empleados_permitidos, rol_actual)
 
+        # Cargar decisiones previas guardadas en SQLite
+        decisiones_previas = lock_mgr.obtener_decisiones_excepciones(periodo_sel)
+        if df_excepciones is not None and not df_excepciones.empty:
+            for idx, r in df_excepciones.iterrows():
+                key = (clean_ci_str(r['Carnet_Identidad']), str(r['Fecha']), str(r['Tipo Excepción']))
+                if key in decisiones_previas:
+                    df_excepciones.at[idx, 'Decisión Supervisor'] = decisiones_previas[key]['decision']
+                    df_excepciones.at[idx, 'Tipo Falta'] = decisiones_previas[key]['tipo_falta']
+                    df_excepciones.at[idx, 'Observaciones'] = decisiones_previas[key]['observaciones']
+
     except Exception as e:
         df_excepciones = pd.DataFrame()
         df_canje_resumen = pd.DataFrame()
         st.warning(f"No se pudieron procesar las excepciones para el período {periodo_sel}: {e}")
 
-    # TAB 1: EXCEPCIONES AUTOMÁTICAS REDISEÑADAS (st.expander + st.metric)
+    # TAB 1: EXCEPCIONES AUTOMÁTICAS
     with tab_excepciones:
         if df_excepciones is not None and not df_excepciones.empty:
             st.subheader(f"Resumen Ejecutivo de Excepciones ({periodo_sel})")
 
-            # Bloque de métricas globales
             m1, m2, m3, m4 = st.columns(4)
             m1.metric("Total Excepciones", len(df_excepciones))
             m2.metric("Faltas / Omisiones", len(df_excepciones[df_excepciones['Tipo Excepción'] == 'Falta / Omisión Marcación']))
@@ -319,20 +350,35 @@ elif opcion == "✅ Aprobaciones Supervisores":
             m4.metric("Desfases Horario", len(df_excepciones[df_excepciones['Tipo Excepción'] == 'Desfase Horario Ingreso']))
 
             st.markdown("---")
-            st.caption("🔍 Seleccione un colaborador para revisar y tomar decisiones por tarjeta:")
+            
+            # --- BUSCADOR POR COLABORADOR ---
+            c_busq1, c_busq2 = st.columns([3, 1])
+            with c_busq1:
+                filtro_persona_exc = st.text_input("🔍 Buscar colaborador por Nombre o CI (Excepciones):", placeholder="Ej: Lynn Soria o 8228265")
+            
+            df_exc_vista = df_excepciones.copy()
+            if filtro_persona_exc:
+                q = filtro_persona_exc.lower().strip()
+                df_exc_vista = df_exc_vista[
+                    df_exc_vista['Nombre'].str.lower().str.contains(q) | 
+                    df_exc_vista['Carnet_Identidad'].str.contains(q)
+                ]
 
-            # Agrupamiento por empleado con st.expander
-            grupos_emp = df_excepciones.groupby(['Carnet_Identidad', 'Nombre'])
+            st.caption("Seleccione un colaborador para revisar y tomar decisiones por tarjeta:")
+
+            grupos_emp = df_exc_vista.groupby(['Carnet_Identidad', 'Nombre'])
+            registros_editados_totales = []
 
             for (ci_k, nom_k), grp_emp in grupos_emp:
                 cant_exc = len(grp_emp)
+                emp_editable = lock_mgr.es_editable(periodo_sel, rol_actual, ci_k)
+                
                 with st.expander(f"👤 **{nom_k}** — CI: `{ci_k}` ({cant_exc} excepción(es) pendiente(s))", expanded=False):
-                    
                     df_edit_sub = st.data_editor(
                         grp_emp,
                         use_container_width=True,
                         hide_index=True,
-                        disabled=["Carnet_Identidad", "Nombre", "Fecha", "Tipo Excepción", "Detalle Excepción", "Valor a Revisar"] if not es_editable else [],
+                        disabled=["Carnet_Identidad", "Nombre", "Fecha", "Tipo Excepción", "Detalle Excepción", "Valor a Revisar"] if not emp_editable else [],
                         column_config={
                             "Carnet_Identidad": st.column_config.Column("CI", disabled=True),
                             "Decisión Supervisor": st.column_config.SelectboxColumn(
@@ -349,12 +395,25 @@ elif opcion == "✅ Aprobaciones Supervisores":
                         },
                         key=f"editor_exc_{ci_k}"
                     )
+                    registros_editados_totales.extend(df_edit_sub.to_dict('records'))
+
+            if st.button("💾 Guardar Decisiones de Excepciones", type="primary"):
+                if registros_editados_totales:
+                    lock_mgr.guardar_decisiones_excepciones(periodo_sel, registros_editados_totales, usuario_actual)
+                    st.cache_data.clear()
+                    st.success("✅ Decisiones guardadas correctamente en la base de datos.")
+                    st.rerun()
 
             st.divider()
             st.subheader("📥 Exportación Consolidada")
             
             archivo_path = f"Aprobaciones_{periodo_sel}.xlsx"
-            ExcelExporter.exportar_aprobaciones(df_excepciones.to_dict('records'), periodo_sel, archivo_path)
+            ExcelExporter.exportar_aprobaciones(
+                df_excepciones.to_dict('records'), 
+                df_canje_resumen.to_dict('records') if df_canje_resumen is not None else [], 
+                periodo_sel, 
+                archivo_path
+            )
             
             with open(archivo_path, "rb") as f:
                 st.download_button(
@@ -370,8 +429,19 @@ elif opcion == "✅ Aprobaciones Supervisores":
     with tab_canje_masivo:
         st.subheader("⚖️ Canje Masivo de Horas Extras por Faltas")
         if df_canje_resumen is not None and not df_canje_resumen.empty:
+            
+            # --- BUSCADOR EN CANJE ---
+            filtro_persona_canje = st.text_input("🔍 Buscar colaborador por Nombre o CI (Canje):", placeholder="Ej: Ever Medrano")
+            df_canje_vista = df_canje_resumen.copy()
+            if filtro_persona_canje:
+                q_c = filtro_persona_canje.lower().strip()
+                df_canje_vista = df_canje_vista[
+                    df_canje_vista['Nombre'].str.lower().str.contains(q_c) | 
+                    df_canje_vista['Carnet_Identidad'].str.contains(q_c)
+                ]
+
             df_edited_canje = st.data_editor(
-                df_canje_resumen,
+                df_canje_vista,
                 use_container_width=True,
                 hide_index=True,
                 disabled=[] if es_editable else ["Días a Canjear (Aplicar)", "Estado Canje"],
@@ -421,7 +491,7 @@ elif opcion == "✅ Aprobaciones Supervisores":
                         usuario_nombre=usuario_actual,
                         accion="REGULARIZACION_OMISION",
                         modulo="Aprobaciones",
-                        detalles={"ci": id_emp_reg, "empleado": nombre_emp_reg, "fecha": str(fecha_reg), "tipo": tipo_marcacion, "motivo": motivo_reg}
+                        detalles={"ci": clean_ci_str(id_emp_reg), "empleado": nombre_emp_reg, "fecha": str(fecha_reg), "tipo": tipo_marcacion, "motivo": motivo_reg}
                     )
                     st.success(f"Regularización registrada para {nombre_emp_reg} (CI: {id_emp_reg}) el día {fecha_reg}.")
 
@@ -448,6 +518,25 @@ elif opcion == "📑 Pre-Planilla y Reportes":
                 df_bio_rep = df_bio
 
             df_resultado = run_cached_attendance_processing(df_bio_rep, df_params, df_emp, nov_mgr)
+
+            # Impactar decisiones de excepciones en el DataFrame final
+            if df_resultado is not None and not df_resultado.empty and p_sel_rep != "Todos":
+                decisiones_guardadas = lock_mgr.obtener_decisiones_excepciones(p_sel_rep)
+                for idx, row in df_resultado.iterrows():
+                    ci_row = clean_ci_str(row['Carnet_Identidad'])
+                    f_row = str(row['Fecha'])
+                    
+                    # Verificar si existe alguna decisión para este colaborador en esta fecha
+                    for (d_ci, d_f, d_tipo), d_val in decisiones_guardadas.items():
+                        if d_ci == ci_row and d_f == f_row:
+                            dec = d_val['decision']
+                            if dec == "Justificado":
+                                df_resultado.at[idx, 'Falta Justificada'] = 1
+                                df_resultado.at[idx, 'Falta Injustificada'] = 0
+                                df_resultado.at[idx, 'Estado'] = 'Justificado por Supervisor'
+                            elif dec == "Rechazado":
+                                df_resultado.at[idx, 'Horas Extras'] = 0.0
+                                df_resultado.at[idx, 'Estado'] = 'Rechazado por Supervisor'
 
             if df_resultado is not None and not df_resultado.empty:
                 col_filtro1, col_filtro2 = st.columns(2)
