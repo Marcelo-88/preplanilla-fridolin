@@ -105,11 +105,12 @@ class LockManager:
         return {"exito": True, "mensaje": f"Período {periodo} actualizado a estado '{nuevo_estado}'."}
 
     def obtener_estado_empleado(self, periodo: str, carnet_identidad: str) -> str:
+        ci_clean = str(carnet_identidad).strip()
         with sqlite3.connect(self.db_path) as conn:
             cursor = conn.cursor()
             res = cursor.execute(
                 "SELECT estado FROM employee_period_locks WHERE periodo = ? AND carnet_identidad = ?",
-                (periodo, str(carnet_identidad).strip())
+                (periodo, ci_clean)
             ).fetchone()
             if res:
                 return res[0]
@@ -167,7 +168,7 @@ class LockManager:
 
     def obtener_decisiones_excepciones(self, periodo: str) -> Dict[tuple, Dict[str, str]]:
         """
-        Devuelve el diccionario de decisiones tomadas para un período determinado.
+        Obtiene las decisiones tomadas previamente para vincularlas con la Pre-Planilla.
         """
         decisiones = {}
         with sqlite3.connect(self.db_path) as conn:
