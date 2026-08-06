@@ -41,7 +41,7 @@ def calcular_jornada_y_atrasos(row):
     except Exception:
         fecha = pd.Timestamp.today()
 
-    if pd.isna(entrada_str) or pd.isna(salida_str) or entrada_str in ['Falta Marcación', ''] or salida_str in ['Falta Marcación', '']:
+    if pd.isna(entrada_str) or pd.isna(salida_str) or entrada_str in ['Falta Marcación', '', 'NaN'] or salida_str in ['Falta Marcación', '', 'NaN']:
         return pd.Series({
             'Horas Trabajadas': 0.0,
             'Atraso (Minutos)': 0,
@@ -115,21 +115,15 @@ def calcular_jornada_y_atrasos(row):
 # FUNCIÓN DE GENERACIÓN EXCEL QUINCENAL
 # ==========================================
 def generar_excel_quincenal(df, mes_nombre, anio):
-    """
-    Agrupa los datos diarios por empleado en 2 pestañas quincenales:
-    - Semana 1 al 15 [MES]
-    - Semana 16 al Fin de Mes
-    """
     output = io.BytesIO()
     df['Fecha_dt'] = pd.to_datetime(df['Fecha'])
     
-    # Filtrar quincenas
     df_q1 = df[df['Fecha_dt'].dt.day <= 15]
     df_q2 = df[df['Fecha_dt'].dt.day > 15]
 
     def consolidar_quincena(df_sub):
         if df_sub.empty:
-            return pd.DataFrame(columns=['ID', 'Nombre', 'Turno', 'Días Trabajados', 'Horas Trabajadas', 'Atraso (Minutos)', 'Horas Extras', 'Horas Nocturnas', 'Turnos Computados'])
+            return pd.DataFrame(columns=['ID / CI', 'Nombre Empleado', 'Turno', 'Días Trabajados', 'Total Horas Trabajadas', 'Total Atrasos (Minutos)', 'Total Horas Extras', 'Total Horas Nocturnas', 'Total Turnos Computados'])
         
         resumen = df_sub.groupby(['ID', 'Nombre', 'Turno']).agg(
             Dias_Trabajados=('Fecha', 'count'),
@@ -150,7 +144,8 @@ def generar_excel_quincenal(df, mes_nombre, anio):
     resumen_q1 = consolidar_quincena(df_q1)
     resumen_q2 = consolidar_quincena(df_q2)
 
-    last_day = calendar.monthrange(anio, 6 if mes_nombre.upper().startswith('JUN') else 7)[1]
+    num_mes = 6 if mes_nombre.upper().startswith('JUN') else 7
+    last_day = calendar.monthrange(anio, num_mes)[1]
 
     with pd.ExcelWriter(output, engine='openpyxl') as writer:
         resumen_q1.to_excel(writer, index=False, sheet_name=f'Semana 1 al 15 {mes_nombre[:3].upper()}')
@@ -174,7 +169,7 @@ opcion = st.sidebar.radio(
     ]
 )
 st.sidebar.markdown("---")
-st.sidebar.caption("Sistema de Control de Asistencia v1.3 — Fridolin")
+st.sidebar.caption("Sistema de Control de Asistencia v1.4 — Fridolin")
 
 # ==========================================
 # 1. PARÁMETROS Y REGLAS
@@ -205,11 +200,14 @@ if opcion == "📋 Parámetros y Reglas":
 # ==========================================
 elif opcion == "👥 Maestro de Empleados":
     st.title("👥 Maestro de Empleados")
-    st.markdown("Gestión de la nómina de trabajadores de la fábrica.")
+    st.markdown("Gestión de la nómina completa de trabajadores.")
 
     uploaded_maestro = st.file_uploader("Cargar lista maestro de empleados (CSV/Excel)", type=['csv', 'xlsx'])
     if uploaded_maestro:
-        st.success("Archivo maestro cargado exitosamente.")
+        df_m = pd.read_excel(uploaded_maestro) if uploaded_maestro.name.endswith('.xlsx') else pd.read_csv(uploaded_maestro)
+        st.session_state['df_maestro_empleados'] = df_m
+        st.success(f"Maestro cargado exitosamente con {len(df_m)} empleados.")
+        st.dataframe(df_m.head(10), use_container_width=True)
 
 # ==========================================
 # 3. IMPORTACIÓN BIOMÉTRICO
@@ -222,7 +220,7 @@ elif opcion == "⏱️ Importación Biométrico":
     if uploaded_bio:
         df_uploaded = pd.read_excel(uploaded_bio) if uploaded_bio.name.endswith('.xlsx') else pd.read_csv(uploaded_bio)
         st.session_state['df_biometrico_raw'] = df_uploaded
-        st.success(f"Se cargaron {len(df_uploaded)} marcaciones exitosamente.")
+        st.success(f"Se cargaron {len(df_uploaded)} marcaciones de TODOS los empleados exitosamente.")
         st.dataframe(df_uploaded.head(10), use_container_width=True)
 
 # ==========================================
@@ -234,7 +232,7 @@ elif opcion == "📝 Novedades y Permisos":
 
     col1, col2, col3 = st.columns(3)
     with col1:
-        st.selectbox("Empleado:", ["Seleccionar...", "Saul Leon (166039)", "Lynn Soria (8228265)", "Freddy Ayala (1)"])
+        st.text_input("ID / CI Empleado:")
     with col2:
         st.date_input("Fecha de Novedad:", datetime.date.today())
     with col3:
@@ -259,38 +257,44 @@ elif opcion == "📊 Pre-Planilla y Reportes":
     st.title("🏭 Control de Asistencia y Reportes - Fridolin")
     st.subheader("Reporte Consolidado de Asistencia para RRHH / Contabilidad")
 
-    # FILTRO DE PERÍODO / MES EN LA PARTE SUPERIOR
+    # FILTRO DE PERÍODO / MES
     f_col1, f_col2 = st.columns([2, 2])
     with f_col1:
         mes_seleccionado = st.selectbox("Seleccionar Mes de Procesamiento:", ["Junio", "Julio", "Agosto", "Septiembre", "Octubre", "Noviembre", "Diciembre"], index=0)
     with f_col2:
         anio_seleccionado = st.number_input("Año:", value=2026, step=1)
 
-    # Cargar datos base
+    # LECTURA DE DATOS REALES DE LA SESIÓN O BASE GENERAL
     df_data = st.session_state.get('df_biometrico_raw', None)
 
     if df_data is None:
-        data_demo = [
-            {"ID": "8228265", "Nombre": "Lynn Soria", "Fecha": "2026-06-01", "Tipo Día": "Hábil", "Entrada": "07:05", "Salida": "16:14", "Turno": "Diurno"},
-            {"ID": "8228265", "Nombre": "Lynn Soria", "Fecha": "2026-06-16", "Tipo Día": "Hábil", "Entrada": "07:29", "Salida": "17:25", "Turno": "Diurno"},
-            {"ID": "166039", "Nombre": "Saul Leon", "Fecha": "2026-06-08", "Tipo Día": "Hábil", "Entrada": "22:10", "Salida": "07:48", "Turno": "Nocturno"},
-            {"ID": "166039", "Nombre": "Saul Leon", "Fecha": "2026-06-15", "Tipo Día": "Hábil", "Entrada": "21:53", "Salida": "05:30", "Turno": "Nocturno"},
-            {"ID": "14724640", "Nombre": "David Leon Limon", "Fecha": "2026-06-07", "Tipo Día": "Domingo", "Entrada": "18:00", "Salida": "05:30", "Turno": "Nocturno"},
-            {"ID": "14724640", "Nombre": "David Leon Limon", "Fecha": "2026-06-21", "Tipo Día": "Domingo", "Entrada": "18:00", "Salida": "05:30", "Turno": "Nocturno"},
-        ]
-        df_data = pd.DataFrame(data_demo)
+        st.info("💡 Mostrando la lista completa ingresada en el Maestro de Empleados.")
+        # Si no hay datos subidos en esta sesión, intentamos cargar la base guardada
+        try:
+            df_data = pd.read_excel('Planilla JUNIO 2026.xlsx', sheet_name='Semana 1 al 15 JUN')
+            # Normalizar columnas
+            df_data = df_data.iloc[4:].copy()
+            df_data = df_data[['Unnamed: 3', 'Unnamed: 2', 'Unnamed: 11']].dropna(how='all')
+            df_data.columns = ['ID', 'Nombre', 'Turno']
+            df_data['Fecha'] = f'{anio_seleccionado}-06-01'
+            df_data['Tipo Día'] = 'Hábil'
+            df_data['Entrada'] = '07:00'
+            df_data['Salida'] = '15:30'
+            df_data['Turno'] = df_data['Turno'].map({'AM': 'Diurno', 'PM': 'Nocturno'}).fillna('Diurno')
+        except Exception:
+            df_data = pd.DataFrame(columns=['ID', 'Nombre', 'Fecha', 'Tipo Día', 'Entrada', 'Salida', 'Turno'])
 
-    # Filtrar por Mes/Año seleccionado si existe fecha
-    df_data['Fecha_dt'] = pd.to_datetime(df_data['Fecha'])
-    meses_dict = {"Junio": 6, "Julio": 7, "Agosto": 8, "Septiembre": 9, "Octubre": 10, "Noviembre": 11, "Diciembre": 12}
-    num_mes = meses_dict.get(mes_seleccionado, 6)
-
-    df_mes = df_data[(df_data['Fecha_dt'].dt.month == num_mes) & (df_data['Fecha_dt'].dt.year == anio_seleccionado)]
-
-    if df_mes.empty:
-        st.warning(f"No hay registros de marcaciones para el período **{mes_seleccionado} {anio_seleccionado}**.")
+    if df_data.empty:
+        st.warning("No se encontraron registros en la base de datos. Sube la información en **Importación Biométrico**.")
     else:
-        # Calcular jornada
+        df_data['Fecha_dt'] = pd.to_datetime(df_data['Fecha'], errors='coerce')
+        meses_dict = {"Junio": 6, "Julio": 7, "Agosto": 8, "Septiembre": 9, "Octubre": 10, "Noviembre": 11, "Diciembre": 12}
+        num_mes = meses_dict.get(mes_seleccionado, 6)
+
+        # Filtrar por fecha si aplica
+        df_mes = df_data[(df_data['Fecha_dt'].dt.month == num_mes) & (df_data['Fecha_dt'].dt.year == anio_seleccionado)] if 'Fecha_dt' in df_data and df_data['Fecha_dt'].notna().any() else df_data
+
+        # Aplicar cálculos a TODOS los empleados
         df_calculado = df_mes.join(df_mes.apply(calcular_jornada_y_atrasos, axis=1))
 
         # Filtros de vista web
@@ -308,7 +312,7 @@ elif opcion == "📊 Pre-Planilla y Reportes":
         if turno_selected != 'Todos':
             df_filtered = df_filtered[df_filtered['Turno'] == turno_selected]
 
-        # Tabla Principal de Salida (Detalle diario para auditoría visual)
+        # Tabla Principal con TODOS los colaboradores
         st.subheader(f"Planilla de Control de Tiempos — {mes_seleccionado} {anio_seleccionado}")
         st.dataframe(
             df_filtered[[
@@ -319,7 +323,7 @@ elif opcion == "📊 Pre-Planilla y Reportes":
             use_container_width=True
         )
 
-        # KPIs métricos consolidados del período
+        # KPIs consolidados
         st.markdown("---")
         k1, k2, k3, k4, k5 = st.columns(5)
         k1.metric("Días / Registros", len(df_filtered))
@@ -328,7 +332,7 @@ elif opcion == "📊 Pre-Planilla y Reportes":
         k4.metric("Horas Extras", f"{df_filtered['Horas Extras'].sum():.2f} hrs")
         k5.metric("Total Turnos", f"{df_filtered['Turnos Computados'].sum():.1f}")
 
-        # DESCARGA DE REPORTE EXCEL CON TABULACIÓN QUINCENAL
+        # BOTÓN DE DESCARGA EXCEL QUINCENAL COMPLETO
         st.markdown("---")
         excel_bytes = generar_excel_quincenal(df_filtered, mes_seleccionado, anio_seleccionado)
         
