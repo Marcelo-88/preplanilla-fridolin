@@ -258,9 +258,8 @@ elif opcion == "✅ Aprobaciones Supervisores":
         except Exception:
             df_emp = None
 
-        df_bio_periodo = df_bio[df_bio['dt_temp'].dt.strftime('%Y-%m') == periodo_sel].copy() if 'dt_temp' in df_bio.columns else df_bio
-
-        df_res = process_attendance(df_bio_periodo, df_params, None, df_emp, nov_mgr)
+        # --- CÁLCULO OPTIMIZADO FILTRADO DESDE EL MOTOR ---
+        df_res = process_attendance(df_bio, df_params, None, df_emp, nov_mgr, periodo_filtro=periodo_sel, emp_id_filtro="Todos")
         df_excepciones = detect_exceptions(df_res)
         df_canje_resumen = get_canje_summary(df_res)
 
@@ -398,62 +397,78 @@ elif opcion == "✅ Aprobaciones Supervisores":
 elif opcion == "📑 Pre-Planilla y Reportes":
     st.header("Reporte Consolidado de Asistencia para RRHH / Contabilidad")
     
-    with st.spinner("Procesando marcaciones, novedades y tiempos..."):
-        try:
-            df_bio = load_sheet_data("02_Importacion_Biometrico")
-            df_params = load_sheet_data("05_Parametros_y_Reglas")
-            df_emp = load_sheet_data("01_Maestro_Empleados")
-                
-            df_bio['dt_temp'] = pd.to_datetime(df_bio.iloc[:, 2], dayfirst=True, errors='coerce')
-            periodos_rep = sorted(df_bio['dt_temp'].dt.strftime('%Y-%m').dropna().unique().tolist(), reverse=True)
+    try:
+        df_bio = load_sheet_data("02_Importacion_Biometrico")
+        df_params = load_sheet_data("05_Parametros_y_Reglas")
+        df_emp = load_sheet_data("01_Maestro_Empleados")
             
-            p_sel_rep = st.selectbox("🗓️ Filtrar Período de Reporte:", options=["Todos"] + periodos_rep)
+        df_bio['dt_temp'] = pd.to_datetime(df_bio.iloc[:, 2], dayfirst=True, errors='coerce')
+        periodos_rep = sorted(df_bio['dt_temp'].dt.strftime('%Y-%m').dropna().unique().tolist(), reverse=True)
+        
+        # 1. FILTROS PREVIOS (Aparecen antes del procesamiento para máxima velocidad)
+        col_filtro1, col_filtro2, col_filtro3 = st.columns(3)
+        
+        with col_filtro1:
+            p_sel_rep = st.selectbox("🗓️ 1. Filtrar Período (Mes):", options=periodos_rep if periodos_rep else ["Todos"])
+        
+        # Mapeo de nombres para selector
+        dict_nombres_id = {}
+        if df_emp is not None and not df_emp.empty:
+            c_id = next((c for c in df_emp.columns if any(x in str(c).lower() for x in ['id', 'carnet', 'ci'])), df_emp.columns[0])
+            c_nom = next((c for c in df_emp.columns if any(x in str(c).lower() for x in ['nombre', 'empleado'])), df_emp.columns[1])
+            for _, r in df_emp.iterrows():
+                dict_nombres_id[str(r[c_nom]).strip()] = str(r[c_id]).strip()
 
-            if p_sel_rep != "Todos":
-                df_bio_rep = df_bio[df_bio['dt_temp'].dt.strftime('%Y-%m') == p_sel_rep].copy()
-            else:
-                df_bio_rep = df_bio
+        lista_nombres_disp = ["Todos"] + sorted(list(dict_nombres_id.keys()))
+        
+        with col_filtro2:
+            emp_nom_sel = st.selectbox("👤 2. Filtrar Empleado:", options=lista_nombres_disp)
+        
+        emp_id_target = dict_nombres_id.get(emp_nom_sel, "Todos") if emp_nom_sel != "Todos" else "Todos"
 
-            df_resultado = process_attendance(df_bio_rep, df_params, None, df_emp, nov_mgr)
+        with col_filtro3:
+            turno_sel = st.selectbox("🌙 3. Filtrar Turno:", options=["Todos", "Diurno", "Nocturno"])
 
-            if df_resultado is not None and not df_resultado.empty:
-                col_filtro1, col_filtro2 = st.columns(2)
-                
-                with col_filtro1:
-                    empleados = ["Todos"] + list(df_resultado['Nombre'].unique())
-                    emp_sel = st.selectbox("Filtrar por Empleado:", empleados)
-                
-                with col_filtro2:
-                    turnos = ["Todos", "Diurno", "Nocturno"]
-                    turno_sel = st.selectbox("Filtrar por Turno:", turnos)
-                
-                df_filtrado = df_resultado.copy()
-                if emp_sel != "Todos":
-                    df_filtrado = df_filtrado[df_filtrado['Nombre'] == emp_sel]
-                if turno_sel != "Todos":
-                    df_filtrado = df_filtrado[df_filtrado['Turno Dominante'] == turno_sel]
-                
-                st.subheader("Planilla de Control de Tiempos")
-                st.dataframe(df_filtrado, use_container_width=True, hide_index=True)
-                
-                c1, c2, c3, c4, c5, c6, c7 = st.columns(7)
-                c1.metric("Registros", len(df_filtrado))
-                c2.metric("Horas Trabajadas", f"{df_filtrado['Horas Trabajadas'].sum():.2f} hrs")
-                c3.metric("Total Atrasos", f"{df_filtrado['Atraso (Minutos)'].sum()} min")
-                c4.metric("Horas Extras", f"{df_filtrado['Horas Extras'].sum():.2f} hrs")
-                c5.metric("Faltas Justif.", int(df_filtrado['Falta Justificada'].sum()))
-                c6.metric("Faltas Injustif.", int(df_filtrado['Falta Injustificada'].sum()))
-                c7.metric("Turnos Comp.", f"{df_filtrado['Turnos Computados'].sum():.1f}")
-                
-                archivo_rep = f"PrePlanilla_{p_sel_rep}.xlsx"
-                ExcelExporter.exportar_preplanilla(df_filtrado.to_dict('records'), p_sel_rep, archivo_rep)
+        # 2. EJECUCIÓN OPTIMIZADA Y FILTRADA
+        with st.spinner("⚡ Cargando reporte seleccionado..."):
+            df_resultado = process_attendance(
+                df_bio=df_bio, 
+                df_params=df_params, 
+                df_nov=None, 
+                df_emp=df_emp, 
+                nov_mgr=nov_mgr, 
+                periodo_filtro=p_sel_rep, 
+                emp_id_filtro=emp_id_target
+            )
 
-                with open(archivo_rep, "rb") as f:
-                    st.download_button(
-                        label="📥 Descargar Reporte Consolidado (Excel)",
-                        data=f,
-                        file_name=f"Reporte_PrePlanilla_Fridolin_{p_sel_rep}.xlsx",
-                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-                    )
-        except Exception as e:
-            st.error(f"Error durante el procesamiento del reporte: {e}")
+        if df_resultado is not None and not df_resultado.empty:
+            df_filtrado = df_resultado.copy()
+            if turno_sel != "Todos":
+                df_filtrado = df_filtrado[df_filtrado['Turno Dominante'] == turno_sel]
+
+            st.subheader("Planilla de Control de Tiempos")
+            st.dataframe(df_filtrado, use_container_width=True, hide_index=True)
+            
+            c1, c2, c3, c4, c5, c6, c7 = st.columns(7)
+            c1.metric("Registros", len(df_filtrado))
+            c2.metric("Horas Trabajadas", f"{df_filtrado['Horas Trabajadas'].sum():.2f} hrs")
+            c3.metric("Total Atrasos", f"{df_filtrado['Atraso (Minutos)'].sum()} min")
+            c4.metric("Horas Extras", f"{df_filtrado['Horas Extras'].sum():.2f} hrs")
+            c5.metric("Faltas Justif.", int(df_filtrado['Falta Justificada'].sum()))
+            c6.metric("Faltas Injustif.", int(df_filtrado['Falta Injustificada'].sum()))
+            c7.metric("Turnos Comp.", f"{df_filtrado['Turnos Computados'].sum():.1f}")
+            
+            archivo_rep = f"PrePlanilla_{p_sel_rep}.xlsx"
+            ExcelExporter.exportar_preplanilla(df_filtrado.to_dict('records'), p_sel_rep, archivo_rep)
+
+            with open(archivo_rep, "rb") as f:
+                st.download_button(
+                    label="📥 Descargar Reporte Consolidado (Excel)",
+                    data=f,
+                    file_name=f"Reporte_PrePlanilla_Fridolin_{p_sel_rep}.xlsx",
+                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+                )
+        else:
+            st.info("No existen registros para los filtros seleccionados.")
+    except Exception as e:
+        st.error(f"Error durante el procesamiento del reporte: {e}")
