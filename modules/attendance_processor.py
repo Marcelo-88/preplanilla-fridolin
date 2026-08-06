@@ -1,5 +1,6 @@
 import pandas as pd
 import numpy as np
+import re
 from datetime import datetime, time, timedelta
 
 TOLERANCIA_MINUTOS = 10
@@ -14,6 +15,14 @@ DIAS_ESPANOL = {
     5: 'Sábado',
     6: 'Domingo'
 }
+
+def clean_ci_str(val) -> str:
+    """Limpia y normaliza el Carnet de Identidad eliminando ceros flotantes y espacios."""
+    if val is None or pd.isna(val):
+        return ""
+    s = str(val).strip()
+    s = re.sub(r"\.0+$", "", s)
+    return s
 
 def process_attendance(df_bio, df_params=None, df_nov=None, df_emp=None, _nov_mgr=None):
     if df_bio is None or df_bio.empty:
@@ -31,7 +40,7 @@ def process_attendance(df_bio, df_params=None, df_nov=None, df_emp=None, _nov_mg
 
     # 2. Parseo de fechas y normalización del CI
     df['dt_parsed'] = pd.to_datetime(df[col_fecha], dayfirst=True, errors='coerce')
-    df['emp_ci_clean'] = df[col_ci].astype(str).str.strip().str.replace(".0", "", regex=False)
+    df['emp_ci_clean'] = df[col_ci].apply(clean_ci_str)
     df = df.dropna(subset=['dt_parsed']).sort_values(['emp_ci_clean', 'dt_parsed'])
 
     if df.empty:
@@ -66,7 +75,7 @@ def process_attendance(df_bio, df_params=None, df_nov=None, df_emp=None, _nov_mg
 
         for _, row in df_emp.iterrows():
             if c_emp_ci:
-                ci_val = str(row[c_emp_ci]).strip().replace(".0", "")
+                ci_val = clean_ci_str(row[c_emp_ci])
                 if c_emp_nom:
                     dict_nombres_master[ci_val] = str(row[c_emp_nom]).strip()
                 if c_emp_tipo:
@@ -92,7 +101,7 @@ def process_attendance(df_bio, df_params=None, df_nov=None, df_emp=None, _nov_mg
             if isinstance(todas_nov, pd.DataFrame):
                 todas_nov = todas_nov.to_dict('records')
             for n in todas_nov:
-                e_ci = str(n.get('carnet_identidad', n.get('empleado_id', ''))).strip().replace(".0", "")
+                e_ci = clean_ci_str(n.get('carnet_identidad', n.get('empleado_id', '')))
                 f_ini_str = str(n.get('fecha_inicio', ''))
                 f_fin_str = str(n.get('fecha_fin', ''))
                 if e_ci and f_ini_str and f_fin_str:
