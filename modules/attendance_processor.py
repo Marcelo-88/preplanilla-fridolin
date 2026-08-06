@@ -1,151 +1,152 @@
 import pandas as pd
+import numpy as np
 from datetime import datetime, time
 
-def calcular_horas_nocturnas(entrada, salida):
-    """Calcula la cantidad de horas trabajadas dentro del rango nocturno (20:00 a 06:00)."""
-    if pd.isnull(entrada) or pd.isnull(salida):
-        return 0.0
-    
-    inicio_noche = datetime.combine(entrada.date(), time(20, 0))
-    fin_noche = datetime.combine(entrada.date() + pd.Timedelta(days=1), time(6, 0))
-    inicio_noche_prev = datetime.combine(entrada.date() - pd.Timedelta(days=1), time(20, 0))
-    fin_noche_prev = datetime.combine(entrada.date(), time(6, 0))
-    
-    horas_nocturnas = 0.0
-    
-    # Tramo 00:00 - 06:00
-    overlap_inicio = max(entrada, inicio_noche_prev)
-    overlap_fin = min(salida, fin_noche_prev)
-    if overlap_fin > overlap_inicio:
-        horas_nocturnas += (overlap_fin - overlap_inicio).total_seconds() / 3600.0
-        
-    # Tramo 20:00 - 06:00 siguiente
-    overlap_inicio = max(entrada, inicio_noche)
-    overlap_fin = min(salida, fin_noche)
-    if overlap_fin > overlap_inicio:
-        horas_nocturnas += (overlap_fin - overlap_inicio).total_seconds() / 3600.0
+TOLERANCIA_MINUTOS = 10
+DESCUENTO_COMIDA_HORAS = 0.5  # 30 minutos obligatorios
 
-    return round(horas_nocturnas, 2)
-
-def process_attendance(df_bio, df_params, df_novedades=None, df_empleados=None):
-    """
-    Procesa marcaciones integrando el tipo de contrato (Fijo vs Jornalero).
-    """
+def process_attendance(df_bio, df_params=None, df_nov=None, df_emp=None):
     if df_bio is None or df_bio.empty:
         return pd.DataFrame()
-    
+
     df = df_bio.copy()
-    
-    col_id = [c for c in df.columns if str(c).strip().upper() in ['ID', 'ID_EMPLEADO', 'CODIGO', 'CI']][0] if any(str(c).strip().upper() in ['ID', 'ID_EMPLEADO', 'CODIGO', 'CI'] for c in df.columns) else df.columns[0]
-    col_nombre = [c for c in df.columns if str(c).strip().upper() in ['NOMBRE', 'EMPLEADO', 'NOMBRES']][0] if any(str(c).strip().upper() in ['NOMBRE', 'EMPLEADO', 'NOMBRES'] for c in df.columns) else df.columns[1]
-    col_fecha_hora = [c for c in df.columns if 'FECHA' in str(c).strip().upper() or 'HORA' in str(c).strip().upper()][0] if any('FECHA' in str(c).strip().upper() or 'HORA' in str(c).strip().upper() for c in df.columns) else df.columns[2]
-    col_estado = [c for c in df.columns if str(c).strip().upper() in ['ESTADO', 'TIPO', 'TIPO_REGISTRO', 'EVENTO']][0] if any(str(c).strip().upper() in ['ESTADO', 'TIPO', 'TIPO_REGISTRO', 'EVENTO'] for c in df.columns) else df.columns[3]
 
-    df['Fecha_Hora_Parsed'] = pd.to_datetime(df[col_fecha_hora], format='%d/%m/%Y %H:%M', errors='coerce')
-    df = df.dropna(subset=['Fecha_Hora_Parsed'])
-    df['Fecha'] = df['Fecha_Hora_Parsed'].dt.date
+    # 1. Identificación flexible de columnas
+    cols = {str(c).strip().lower(): c for c in df.columns}
     
-    tolerancia_min = 10
-    jornada_diurna = 8.5
-    
-    if df_params is not None and not df_params.empty:
-        try:
-            param_col = df_params.columns[0]
-            val_col = df_params.columns[1]
-            tol_row = df_params[df_params[param_col].astype(str).str.strip() == 'Tolerancia_Retraso_Min']
-            if not tol_row.empty:
-                tolerancia_min = int(tol_row[val_col].values[0])
-            jornada_row = df_params[df_params[param_col].astype(str).str.strip() == 'Horas_Jornada_Diurna']
-            if not jornada_row.empty:
-                jornada_diurna = float(str(jornada_row[val_col].values[0]).replace(',', '.'))
-        except Exception:
-            pass
+    col_id = next((cols[k] for k in cols if any(x in k for x in ['id', 'carnet', 'ci', 'codigo'])), df.columns[0])
+    col_nombre = next((cols[k] for k in cols if any(x in k for x in ['nombre', 'empleado', 'trabajador'])), df.columns[1] if len(df.columns) > 1 else col_id)
+    col_fecha = next((cols[k] for k in cols if any(x in k for x in ['fecha', 'hora', 'marcacion', 'tiempo'])), df.columns[2] if len(df.columns) > 2 else col_id)
+    col_tipo = next((cols[k] for k in cols if any(x in k for x in ['tipo', 'movimiento', 'evento', 'estado'])), None)
 
-    records = []
-    
-    for (emp_id, nombre, fecha), group in df.groupby([col_id, col_nombre, 'Fecha']):
-        entradas = group[group[col_estado].astype(str).str.strip().str.capitalize() == 'Entrada']
-        salidas = group[group[col_estado].astype(str).str.strip().str.capitalize() == 'Salida']
-        
-        hora_entrada = entradas['Fecha_Hora_Parsed'].min() if not entradas.empty else None
-        hora_salida = salidas['Fecha_Hora_Parsed'].max() if not salidas.empty else None
-        
-        horas_trabajadas = 0.0
-        atraso_min = 0
-        horas_extras = 0.0
-        horas_nocturnas = 0.0
-        es_domingo = fecha.weekday() == 6
-        
-        # Determinar si el empleado es Jornalero desde df_empleados
-        es_jornalero = False
-        if df_empleados is not None and not df_empleados.empty:
-            try:
-                emp_match = df_empleados[df_empleados['ID'].astype(str) == str(emp_id)]
-                if not emp_match.empty and 'Tipo_Contrato' in emp_match.columns:
-                    tipo_contrato = str(emp_match['Tipo_Contrato'].values[0]).strip().lower()
-                    if 'jornal' in tipo_contrato:
-                        es_jornalero = True
-            except Exception:
-                pass
-        
-        if pd.notnull(hora_entrada) and pd.notnull(hora_salida):
-            duracion = (hora_salida - hora_entrada).total_seconds() / 3600.0
-            horas_trabajadas = round(duracion, 2)
-            
-            # Evaluación de Atraso
-            hora_esperada = hora_entrada.replace(hour=8, minute=0, second=0)
-            hora_limite = hora_entrada.replace(hour=8, minute=tolerancia_min, second=0)
-            
-            if hora_entrada > hora_limite:
-                atraso_min = int((hora_entrada - hora_esperada).total_seconds() / 60)
+    # 2. Parseo de fechas y ordenamiento
+    df['dt_parsed'] = pd.to_datetime(df[col_fecha], dayfirst=True, errors='coerce')
+    df = df.dropna(subset=['dt_parsed']).sort_values([col_id, 'dt_parsed'])
+
+    # 3. Diccionario de modalidad de contratación desde Maestro
+    dict_tipo_personal = {}
+    if df_emp is not None and not df_emp.empty:
+        emp_cols = {str(c).strip().lower(): c for c in df_emp.columns}
+        c_emp_id = next((emp_cols[k] for k in emp_cols if any(x in k for x in ['id', 'carnet', 'ci', 'codigo'])), None)
+        c_emp_tipo = next((emp_cols[k] for k in emp_cols if any(x in k for x in ['tipo', 'modalidad', 'contrato'])), None)
+        if c_emp_id and c_emp_tipo:
+            dict_tipo_personal = dict(zip(df_emp[c_emp_id].astype(str).str.strip(), df_emp[c_emp_tipo].astype(str).str.strip()))
+
+    registros = []
+
+    # 4. Procesamiento por Empleado
+    for (emp_id, emp_nombre), group in df.groupby([col_id, col_nombre]):
+        emp_id_str = str(emp_id).strip()
+        tipo_personal = dict_tipo_personal.get(emp_id_str, "Fijo").capitalize()
+        punches = group.to_dict('records')
+
+        i = 0
+        while i < len(punches):
+            p_in = punches[i]
+            dt_in = p_in['dt_parsed']
+            p_type = str(p_in.get(col_tipo, '')).strip().lower() if col_tipo else ''
+
+            if 'salida' not in p_type:
+                dt_out = None
+                j = i + 1
+                while j < len(punches):
+                    next_dt = punches[j]['dt_parsed']
+                    next_type = str(punches[j].get(col_tipo, '')).strip().lower() if col_tipo else ''
+                    
+                    if (next_dt - dt_in).total_seconds() <= 16 * 3600:
+                        if 'salida' in next_type or j == len(punches) - 1 or (punches[j+1]['dt_parsed'] - next_dt).total_seconds() > 4 * 3600:
+                            dt_out = next_dt
+                            i = j
+                            break
+                    j += 1
+
+                fecha_str = dt_in.strftime('%Y-%m-%d')
+                hora_in_str = dt_in.strftime('%H:%M')
+                hora_out_str = dt_out.strftime('%H:%M') if dt_out else 'Falta Marcación'
                 
-            # Permisos/Novedades
-            if df_novedades is not None and not df_novedades.empty:
-                try:
-                    nov_id_col = [c for c in df_novedades.columns if str(c).strip().upper() in ['ID', 'ID_EMPLEADO', 'CODIGO']][0]
-                    nov_f_col = [c for c in df_novedades.columns if 'FECHA' in str(c).strip().upper()][0]
-                    permiso = df_novedades[
-                        (df_novedades[nov_id_col].astype(str) == str(emp_id)) & 
-                        (df_novedades[nov_f_col].astype(str) == fecha.strftime('%d/%m/%Y'))
-                    ]
-                    if not permiso.empty:
-                        atraso_min = 0
-                except Exception:
-                    pass
-            
-            # Horas extras
-            if horas_trabajadas > jornada_diurna:
-                horas_extras = round(horas_trabajadas - jornada_diurna, 2)
+                dia_semana = dt_in.weekday()  # 0: Lun, 4: Vie, 6: Dom
+                es_domingo = (dia_semana == 6)
+                es_viernes = (dia_semana == 4)
                 
-            # Recargo nocturno
-            horas_nocturnas = calcular_horas_nocturnas(hora_entrada, hora_salida)
+                # Turno Nocturno: Ingreso a partir de las 18:00
+                es_nocturno = (dt_in.hour >= 18 or dt_in.hour < 5)
+                turno_label = 'Nocturno' if es_nocturno else 'Diurno'
 
-        tipo_turno = "Nocturno" if horas_nocturnas > (horas_trabajadas / 2) and horas_trabajadas > 0 else "Diurno"
+                # Horas brutas en planta
+                if dt_out:
+                    horas_brutas = (dt_out - dt_in).total_seconds() / 3600.0
+                    if dt_out <= dt_in:
+                        horas_brutas += 24.0
+                else:
+                    horas_brutas = 0.0
 
-        # Asignar cómputo solo si es Jornalero
-        if es_jornalero:
-            if horas_trabajadas >= 12:
-                computo_jornal = "1.5 Turnos"
-            elif horas_trabajadas > 0:
-                computo_jornal = "1 Turno"
-            else:
-                computo_jornal = "0 Turnos"
-        else:
-            computo_jornal = "N/A (Fijo)"
+                # Descuento obligatorio de 0.5 hrs (comida)
+                horas_netas = max(0.0, round(horas_brutas - DESCUENTO_COMIDA_HORAS, 2)) if horas_brutas > 0 else 0.0
 
-        records.append({
-            'ID': emp_id,
-            'Nombre': nombre,
-            'Fecha': fecha.strftime('%d/%m/%Y'),
-            'Tipo Día': 'Domingo' if es_domingo else 'Hábil',
-            'Entrada': hora_entrada.strftime('%H:%M') if pd.notnull(hora_entrada) else 'Falta Marcación',
-            'Salida': hora_salida.strftime('%H:%M') if pd.notnull(hora_salida) else 'Falta Marcación',
-            'Horas Trabajadas': horas_trabajadas,
-            'Atraso (Minutos)': atraso_min,
-            'Horas Extras': horas_extras,
-            'Horas Nocturnas': horas_nocturnas,
-            'Turno Dominante': tipo_turno,
-            'Cómputo Jornalero': computo_jornal
-        })
-        
-    return pd.DataFrame(records)
+                # Cálculo de Atrasos (Tolerancia 10 minutos)
+                hora_esperada = time(22, 0) if es_nocturno else time(7, 0)
+                dt_esperada = datetime.combine(dt_in.date(), hora_esperada)
+                
+                minutos_diferencia = (dt_in - dt_esperada).total_seconds() / 60.0
+                atraso_minutos = max(0, int(minutos_diferencia - TOLERANCIA_MINUTOS)) if minutos_diferencia > TOLERANCIA_MINUTOS else 0
+
+                # Anulación de atraso si existe permiso registrado
+                if df_nov is not None and not df_nov.empty and atraso_minutos > 0:
+                    try:
+                        nov_cols = {str(c).strip().lower(): c for c in df_nov.columns}
+                        c_nov_id = next((nov_cols[k] for k in nov_cols if any(x in k for x in ['id', 'carnet', 'ci', 'codigo'])), None)
+                        c_nov_f = next((nov_cols[k] for k in nov_cols if 'fecha' in k), None)
+                        if c_nov_id and c_nov_f:
+                            match_permiso = df_nov[
+                                (df_nov[c_nov_id].astype(str).str.strip() == emp_id_str) &
+                                (df_nov[c_nov_f].astype(str).str.contains(fecha_str))
+                            ]
+                            if not match_permiso.empty:
+                                atraso_minutos = 0
+                    except Exception:
+                        pass
+
+                # Cómputo de Turnos y Horas Extras
+                turnos_computados = 1.0
+                horas_extras = 0.0
+                horas_nocturnas = horas_netas if es_nocturno else 0.0
+
+                if "Jornal" in tipo_personal:
+                    # Jornaleros: Sin horas extras. Cómputo 1.0 o 1.5
+                    turnos_computados = 1.5 if (es_nocturno and (es_domingo or es_viernes)) or horas_netas >= 11.5 else 1.0
+                    horas_extras = 0.0
+                elif es_nocturno:
+                    if es_domingo or es_viernes:
+                        # Turno nocturno especial: 1.5 turnos SIN horas extras
+                        turnos_computados = 1.5
+                        horas_extras = 0.0
+                    else:
+                        # Turno nocturno regular (Lun a Jue): 1.0 turno + HE sobre 7.0 hrs netas
+                        turnos_computados = 1.0
+                        if horas_netas > 7.0:
+                            horas_extras = round(horas_netas - 7.0, 2)
+                else:
+                    # Turno diurno regular: 1.0 turno + HE sobre 8.0 hrs netas
+                    turnos_computados = 1.0
+                    if horas_netas > 8.0:
+                        horas_extras = round(horas_netas - 8.0, 2)
+
+                registros.append({
+                    'ID': emp_id_str,
+                    'Nombre': str(emp_nombre),
+                    'Tipo Personal': tipo_personal,
+                    'Fecha': fecha_str,
+                    'Día': dt_in.strftime('%A'),
+                    'Entrada': hora_in_str,
+                    'Salida': hora_out_str,
+                    'Horas Trabajadas': horas_netas,
+                    'Atraso (Minutos)': atraso_minutos,
+                    'Horas Extras': horas_extras,
+                    'Horas Nocturnas': horas_nocturnas,
+                    'Turnos Computados': turnos_computados,
+                    'Turno Dominante': turno_label,
+                    'Estado': 'OK' if dt_out else 'Revisar Marcación'
+                })
+            i += 1
+
+    return pd.DataFrame(registros)
