@@ -81,9 +81,9 @@ def process_attendance(df_bio, df_params=None, df_nov=None, df_emp=None, nov_mgr
 
     # OPTIMIZACIÓN CRÍTICA: Pre-cargar Novedades en mapa O(1)
     nov_map = {}
-    if _nov_mgr:
+    if nov_mgr:
         try:
-            todas_nov = _nov_mgr.obtener_todas_novedades()
+            todas_nov = nov_mgr.obtener_todas_novedades()
             if isinstance(todas_nov, pd.DataFrame):
                 todas_nov = todas_nov.to_dict('records')
             for n in todas_nov:
