@@ -64,15 +64,13 @@ def process_attendance(df_bio, df_params=None, df_nov=None, df_emp=None):
                 hora_in_str = dt_in.strftime('%H:%M')
                 hora_out_str = dt_out.strftime('%H:%M') if dt_out else 'Falta Marcación'
                 
-                dia_semana = dt_in.weekday()  # 0: Lun, 4: Vie, 6: Dom
+                dia_semana = dt_in.weekday()
                 es_domingo = (dia_semana == 6)
                 es_viernes = (dia_semana == 4)
                 
-                # Turno Nocturno: Ingreso a partir de las 18:00
                 es_nocturno = (dt_in.hour >= 18 or dt_in.hour < 5)
                 turno_label = 'Nocturno' if es_nocturno else 'Diurno'
 
-                # Horas brutas en planta
                 if dt_out:
                     horas_brutas = (dt_out - dt_in).total_seconds() / 3600.0
                     if dt_out <= dt_in:
@@ -80,18 +78,17 @@ def process_attendance(df_bio, df_params=None, df_nov=None, df_emp=None):
                 else:
                     horas_brutas = 0.0
 
-                # Descuento obligatorio de 0.5 hrs (comida)
                 horas_netas = max(0.0, round(horas_brutas - DESCUENTO_COMIDA_HORAS, 2)) if horas_brutas > 0 else 0.0
 
-                # Cálculo de Atrasos (Tolerancia 10 minutos)
                 hora_esperada = time(22, 0) if es_nocturno else time(7, 30)
                 dt_esperada = datetime.combine(dt_in.date(), hora_esperada)
                 
                 minutos_diferencia = (dt_in - dt_esperada).total_seconds() / 60.0
                 atraso_minutos = max(0, int(minutos_diferencia - TOLERANCIA_MINUTOS)) if minutos_diferencia > TOLERANCIA_MINUTOS else 0
 
-                # Anulación de atraso si existe permiso registrado
-                if df_nov is not None and not df_nov.empty and atraso_minutos > 0:
+                # Verificación de permisos registrados en novedades
+                tiene_permiso = False
+                if df_nov is not None and not df_nov.empty:
                     try:
                         nov_cols = {str(c).strip().lower(): c for c in df_nov.columns}
                         c_nov_id = next((nov_cols[k] for k in nov_cols if any(x in k for x in ['id', 'carnet', 'ci', 'codigo'])), None)
@@ -102,17 +99,16 @@ def process_attendance(df_bio, df_params=None, df_nov=None, df_emp=None):
                                 (df_nov[c_nov_f].astype(str).str.contains(fecha_str))
                             ]
                             if not match_permiso.empty:
+                                tiene_permiso = True
                                 atraso_minutos = 0
                     except Exception:
                         pass
 
-                # Cómputo de Turnos y Horas Extras
                 turnos_computados = 1.0
                 horas_extras = 0.0
                 horas_nocturnas = horas_netas if es_nocturno else 0.0
 
                 if "Jornal" in tipo_personal:
-                    # Jornaleros: Sin horas extras. Cómputo 1.0 o 1.5
                     turnos_computados = 1.5 if (es_nocturno and (es_domingo or es_viernes)) or horas_netas >= 11.5 else 1.0
                     horas_extras = 0.0
                 elif es_nocturno:
@@ -128,7 +124,11 @@ def process_attendance(df_bio, df_params=None, df_nov=None, df_emp=None):
                     if horas_netas > 8.0:
                         horas_extras = round(horas_netas - 8.0, 2)
 
-                # Clasificación de Excepción de Ingreso Tardío (Desfase de Horario)
+                # Clasificación de Faltas (Ambas se contabilizan)
+                es_falta = (not dt_out)
+                falta_justificada = 1 if (es_falta and tiene_permiso) else 0
+                falta_injustificada = 1 if (es_falta and not tiene_permiso) else 0
+
                 desfase_ingreso = False
                 if horas_netas >= 7.0 and minutos_diferencia > 45:
                     desfase_ingreso = True
@@ -143,6 +143,8 @@ def process_attendance(df_bio, df_params=None, df_nov=None, df_emp=None):
                     'Salida': hora_out_str,
                     'Horas Trabajadas': horas_netas,
                     'Atraso (Minutos)': atraso_minutos,
+                    'Falta Justificada': falta_justificada,
+                    'Falta Injustificada': falta_injustificada,
                     'Horas Extras': horas_extras,
                     'Horas Nocturnas': horas_nocturnas,
                     'Turnos Computados': turnos_computados,
@@ -156,19 +158,11 @@ def process_attendance(df_bio, df_params=None, df_nov=None, df_emp=None):
 
 
 def detect_exceptions(df_resultado):
-    """
-    Genera automáticamente la lista de casos que requieren decisión del Supervisor:
-    1. Faltas / Marcaciones Omisas.
-    2. Horas Extras por autorizar.
-    3. Exceso de días laborados (7º día en la semana).
-    4. Desfase de Horario de Ingreso (Entrada tardía completando jornada).
-    """
     if df_resultado is None or df_resultado.empty:
         return pd.DataFrame()
 
     excepciones = []
 
-    # 1. Agrupamiento semanal para detectar 7º día laborado
     df_temp = df_resultado.copy()
     df_temp['dt_fecha'] = pd.to_datetime(df_temp['Fecha'])
     df_temp['Semana'] = df_temp['dt_fecha'].dt.isocalendar().week
@@ -185,17 +179,18 @@ def detect_exceptions(df_resultado):
         dt_f = pd.to_datetime(fecha)
         semana = dt_f.isocalendar().week
 
-        # Caso 1: Marcación omisa o falta
+        # Caso 1: Marcación omisa / Falta
         if row['Estado'] != 'OK' or row['Salida'] == 'Falta Marcación':
+            tipo_inicial = 'Justificada' if row.get('Falta Justificada', 0) == 1 else 'Injustificada'
             excepciones.append({
                 'ID': emp_id,
                 'Nombre': emp_nom,
                 'Fecha': fecha,
                 'Tipo Excepción': 'Falta / Omisión Marcación',
                 'Detalle Excepción': f"Entrada: {row['Entrada']} | Salida: {row['Salida']}",
-                'Valor a Revisar': '1 Falta Potencial',
+                'Valor a Revisar': '1 Falta a Procesar',
                 'Decisión Supervisor': 'Pendiente',
-                'Tipo Falta': 'Injustificada',
+                'Tipo Falta': tipo_inicial,
                 'Observaciones': ''
             })
 
@@ -234,7 +229,7 @@ def detect_exceptions(df_resultado):
                 'Nombre': emp_nom,
                 'Fecha': fecha,
                 'Tipo Excepción': 'Desfase Horario Ingreso',
-                'Detalle Excepción': f"Ingresó a las {row['Entrada']} (Retraso significativo) pero completó {row['Horas Trabajadas']} hrs",
+                'Detalle Excepción': f"Ingresó a las {row['Entrada']} completando {row['Horas Trabajadas']} hrs",
                 'Valor a Revisar': f"Entrada {row['Entrada']}",
                 'Decisión Supervisor': 'Pendiente',
                 'Tipo Falta': 'N/A',
