@@ -9,7 +9,7 @@ def get_sheet_id(url: str) -> str:
         return match.group(1)
     raise ValueError("URL de Google Sheet inválida")
 
-@st.cache_data(ttl=300)  # Reutiliza datos durante 5 minutos
+@st.cache_data(ttl=300)
 def load_sheet_data(sheet_name: str) -> pd.DataFrame:
     """Carga una pestaña de Google Sheets mediante exportación CSV."""
     sheet_url = st.secrets["gsheets"]["spreadsheet_url"]
