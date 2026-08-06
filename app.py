@@ -2,7 +2,7 @@ import streamlit as st
 import pandas as pd
 import io
 from modules.data_loader import load_sheet_data
-from modules.attendance_processor import process_attendance
+from modules.attendance_processor import process_attendance, detect_exceptions
 
 st.set_page_config(
     page_title="Pre-Planilla Fridolin",
@@ -63,90 +63,151 @@ elif opcion == "📝 Novedades y Permisos":
         st.error(f"Error al cargar la pestaña: {e}")
 
 elif opcion == "✅ Aprobaciones Supervisores":
-    st.header("✅ Centro de Aprobaciones y Regularizaciones")
-    st.caption("Gestión interactiva de excepciones, olvidos de marcación y permisos para Supervisores.")
+    st.header("✅ Centro de Aprobaciones y Excepciones")
+    st.caption("Panel dinámico para revisión de faltas, horas extras, 7º día y canje de compensaciones.")
 
-    tab_aprobaciones, tab_regularizar = st.tabs(["📋 Gestor de Solicitudes", "➕ Regularizar Olvido de Marcación"])
+    tab_excepciones, tab_canje, tab_regularizar = st.tabs([
+        "🚨 Excepciones Automáticas", 
+        "⚖️ Canje HE por Faltas", 
+        "➕ Regularizar Olvido Marcación"
+    ])
 
+    # Cargar y procesar datos base
     try:
-        df_aprob = load_sheet_data("03_Aprobaciones_Supervisores")
+        df_bio = load_sheet_data("02_Importacion_Biometrico")
+        df_params = load_sheet_data("05_Parametros_y_Reglas")
+        try:
+            df_emp = load_sheet_data("01_Maestro_Empleados")
+        except Exception:
+            df_emp = None
+        try:
+            df_nov = load_sheet_data("04_Novedades_y_Permisos")
+        except Exception:
+            df_nov = None
+
+        df_res = process_attendance(df_bio, df_params, df_nov, df_emp)
+        df_excepciones = detect_exceptions(df_res)
     except Exception as e:
-        df_aprob = pd.DataFrame()
-        st.warning(f"No se pudo cargar la pestaña de aprobaciones: {e}")
+        df_excepciones = pd.DataFrame()
+        st.warning(f"No se pudieron cargar los datos biométricos para calcular excepciones: {e}")
 
-    # TAB 1: GESTOR INTERACTIVO DE SOLICITUDES
-    with tab_aprobaciones:
-        if df_aprob is not None and not df_aprob.empty:
-            cols_map = {str(c).strip().lower(): c for c in df_aprob.columns}
-            
-            c_sup = next((cols_map[k] for k in cols_map if any(x in k for x in ['supervisor', 'jefe'])), None)
-            c_emp = next((cols_map[k] for k in cols_map if any(x in k for x in ['empleado', 'nombre', 'id', 'carnet'])), None)
-            c_estado = next((cols_map[k] for k in cols_map if 'estado' in k or 'aprob' in k), None)
+    # -------------------------------------------------------------------------
+    # TAB 1: EXCEPCIONES AUTOMÁTICAS DETECTADAS
+    # -------------------------------------------------------------------------
+    with tab_excepciones:
+        if df_excepciones is not None and not df_excepciones.empty:
+            st.subheader("Excepciones Detectadas en el Periodo")
+            st.info("💡 Evalúa cada caso detectado. Puedes marcarlo como Aprobado, Rechazado o Justificado, y clasificar las Faltas.")
 
-            f_col1, f_col2, f_col3 = st.columns(3)
-            with f_col1:
-                opts_estado = ["Todos"] + list(df_aprob[c_estado].astype(str).unique()) if c_estado else ["Todos"]
-                sel_estado = st.selectbox("Estado de Solicitud:", opts_estado)
-            with f_col2:
-                opts_sup = ["Todos"] + list(df_aprob[c_sup].astype(str).unique()) if c_sup else ["Todos"]
-                sel_sup = st.selectbox("Filtrar Supervisor:", opts_sup)
-            with f_col3:
-                opts_emp = ["Todos"] + list(df_aprob[c_emp].astype(str).unique()) if c_emp else ["Todos"]
-                sel_emp = st.selectbox("Filtrar Empleado:", opts_emp)
+            # Filtros dinámicos
+            col_f1, col_f2 = st.columns(2)
+            with col_f1:
+                tipo_exc = ["Todos"] + list(df_excepciones['Tipo Excepción'].unique())
+                sel_tipo = st.selectbox("Filtrar por Tipo de Excepción:", tipo_exc)
+            with col_f2:
+                emps = ["Todos"] + list(df_excepciones['Nombre'].unique())
+                sel_emp_exc = st.selectbox("Filtrar por Empleado:", emps)
 
-            df_fil = df_aprob.copy()
-            if sel_estado != "Todos" and c_estado:
-                df_fil = df_fil[df_fil[c_estado].astype(str) == sel_estado]
-            if sel_sup != "Todos" and c_sup:
-                df_fil = df_fil[df_fil[c_sup].astype(str) == sel_sup]
-            if sel_emp != "Todos" and c_emp:
-                df_fil = df_fil[df_fil[c_emp].astype(str) == sel_emp]
+            df_fil_exc = df_excepciones.copy()
+            if sel_tipo != "Todos":
+                df_fil_exc = df_fil_exc[df_fil_exc['Tipo Excepción'] == sel_tipo]
+            if sel_emp_exc != "Todos":
+                df_fil_exc = df_fil_exc[df_fil_exc['Nombre'] == sel_emp_exc]
 
+            # Muestreo de Métricas
             m1, m2, m3, m4 = st.columns(4)
-            m1.metric("Total Solicitudes", len(df_fil))
-            if c_estado:
-                pend = len(df_fil[df_fil[c_estado].astype(str).str.upper().str.contains("PENDIENTE")])
-                aprob = len(df_fil[df_fil[c_estado].astype(str).str.upper().str.contains("APROBADO")])
-                rech = len(df_fil[df_fil[c_estado].astype(str).str.upper().str.contains("RECHAZADO")])
-                m2.metric("⏳ Pendientes", pend)
-                m3.metric("🟢 Aprobados", aprob)
-                m4.metric("🔴 Rechazados", rech)
+            m1.metric("Excepciones Totales", len(df_fil_exc))
+            m2.metric("Faltas Detectadas", len(df_fil_exc[df_fil_exc['Tipo Excepción'] == 'Falta / Omisión Marcación']))
+            m3.metric("Sol. Horas Extras", len(df_fil_exc[df_fil_exc['Tipo Excepción'] == 'Horas Extras']))
+            m4.metric("7º Día / Desfases", len(df_fil_exc[df_fil_exc['Tipo Excepción'].isin(['7º Día Laborado', 'Desfase Horario Ingreso'])]))
 
-            st.subheader("Edición Interactiva de Aprobaciones")
-            st.info("💡 Puedes cambiar el estado de las solicitudes o editar observaciones directamente en la tabla.")
-
-            df_edited = st.data_editor(
-                df_fil,
+            # Data Editor Interactivo
+            df_edited_exc = st.data_editor(
+                df_fil_exc,
                 use_container_width=True,
                 hide_index=True,
                 column_config={
-                    c_estado: st.column_config.SelectboxColumn(
-                        "Estado Aprobación",
-                        options=["Pendiente", "Aprobado", "Rechazado"],
+                    "Decisión Supervisor": st.column_config.SelectboxColumn(
+                        "Decisión",
+                        options=["Pendiente", "Aprobado", "Rechazado", "Justificado", "Canjeado"],
                         required=True
+                    ),
+                    "Tipo Falta": st.column_config.SelectboxColumn(
+                        "Tipo Falta",
+                        options=["N/A", "Justificada", "Injustificada"],
+                        required=True
+                    ),
+                    "Observaciones": st.column_config.TextColumn(
+                        "Observaciones / Motivo",
+                        width="medium"
                     )
-                } if c_estado else {}
+                }
             )
 
-            buffer = io.BytesIO()
-            with pd.ExcelWriter(buffer, engine='openpyxl') as writer:
-                df_edited.to_excel(writer, index=False, sheet_name='Aprobaciones_Supervisores')
-            
+            # Exportador Copy-Paste Ready
+            st.divider()
+            st.subheader("📥 Exportación 'Copy-Paste Ready' para Google Drive")
+            st.caption("Descarga este Excel con la estructura exacta para copiar y pegar directamente en la pestaña del Google Sheet.")
+
+            buffer_exc = io.BytesIO()
+            with pd.ExcelWriter(buffer_exc, engine='openpyxl') as writer:
+                df_edited_exc.to_excel(writer, index=False, sheet_name='03_Aprobaciones_Supervisores')
+
             st.download_button(
-                label="📥 Descargar Aprobaciones Actualizadas (Excel)",
-                data=buffer.getvalue(),
-                file_name="Aprobaciones_Supervisores_Fridolin.xlsx",
+                label="📥 Descargar Aprobaciones Procesadas (Excel)",
+                data=buffer_exc.getvalue(),
+                file_name="03_Aprobaciones_Supervisores_CopyPaste.xlsx",
                 mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
             )
         else:
-            st.info("No se registraron solicitudes pendientes en el sistema.")
+            st.success("🎉 No se detectaron excepciones pendientes de revisión.")
 
-    # TAB 2: REGULARIZACIÓN MANUAL DE MARCACIONES FALTANTES
+    # -------------------------------------------------------------------------
+    # TAB 2: HERRAMIENTA DE CANJE DE HORAS EXTRAS POR FALTAS
+    # -------------------------------------------------------------------------
+    with tab_canje:
+        st.subheader("⚖️ Compensación y Canje de Bolsa de Horas Extras por Faltas")
+        st.write("Permite cancelar 1 Falta utilizando la bolsa de Horas Extras acumuladas del empleado.")
+
+        if df_res is not None and not df_res.empty:
+            df_canje_summary = df_res.groupby(['ID', 'Nombre']).agg(
+                Total_HE=('Horas Extras', 'sum'),
+                Horas_Trabajadas=('Horas Trabajadas', 'sum')
+            ).reset_index()
+
+            col_c1, col_c2 = st.columns(2)
+            with col_c1:
+                emp_canje_sel = st.selectbox("Seleccione Empleado para Canje:", df_canje_summary['Nombre'].unique())
+            
+            info_emp = df_canje_summary[df_canje_summary['Nombre'] == emp_canje_sel].iloc[0]
+            
+            with col_c2:
+                st.metric("Bolsa HE Disponibles", f"{info_emp['Total_HE']:.2f} hrs")
+
+            with st.form("form_canje_he"):
+                st.write(f"**Empleado:** {info_emp['Nombre']} (ID: {info_emp['ID']})")
+                fecha_falta_canje = st.date_input("Fecha de la Falta a Compensar:")
+                he_a_canjear = st.number_input("Horas Extras a Descontar (Ej: 8.0 hrs por 1 día de falta):", min_value=1.0, max_value=24.0, value=8.0, step=0.5)
+                obs_canje = st.text_area("Justificación del Canje / Autorización:")
+
+                submit_canje = st.form_submit_button("🔄 Aplicar Canje de Horas Extras")
+
+                if submit_canje:
+                    if info_emp['Total_HE'] < he_a_canjear:
+                        st.error(f"El empleado solo cuenta con {info_emp['Total_HE']:.2f} hrs extras. No alcanza para compensar {he_a_canjear} hrs.")
+                    else:
+                        st.success(f"✅ Canje exitoso: Se descontarán {he_a_canjear} hrs HE para anular la falta del día {fecha_falta_canje}. Ambos contadores ajustados a 0.")
+        else:
+            st.info("Cargue los datos biométricos para habiltar la calculadora de canjes.")
+
+    # -------------------------------------------------------------------------
+    # TAB 3: REGULARIZACIÓN MANUAL
+    # -------------------------------------------------------------------------
     with tab_regularizar:
         st.subheader("Regularizar Marcación Faltante u Olvido")
         st.write("Permite al supervisor completar horas de entrada o salida no marcadas en el biométrico.")
 
-        with st.form("form_regularizacion"):
+        with st.form("form_regularizacion_panel"):
             r_col1, r_col2 = st.columns(2)
             with r_col1:
                 id_emp_reg = st.text_input("ID / Carnet Empleado:*")
@@ -164,7 +225,7 @@ elif opcion == "✅ Aprobaciones Supervisores":
                 if not id_emp_reg or not nombre_emp_reg or not motivo_reg:
                     st.warning("Por favor complete todos los campos obligatorios (*).")
                 else:
-                    st.success(f"Regularización registrada para {nombre_emp_reg} el día {fecha_reg}. Se incluirá en la consolidación de la Pre-Planilla.")
+                    st.success(f"Regularización registrada para {nombre_emp_reg} el día {fecha_reg}. Se guardará en la planilla de consolidación.")
 
 elif opcion == "📑 Pre-Planilla y Reportes":
     st.header("Reporte Consolidado de Asistencia para RRHH / Contabilidad")
