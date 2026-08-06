@@ -124,7 +124,7 @@ def process_attendance(df_bio, df_params=None, df_nov=None, df_emp=None):
                     if horas_netas > 8.0:
                         horas_extras = round(horas_netas - 8.0, 2)
 
-                # Clasificación de Faltas (Ambas se contabilizan)
+                # Clasificación de Faltas
                 es_falta = (not dt_out)
                 falta_justificada = 1 if (es_falta and tiene_permiso) else 0
                 falta_injustificada = 1 if (es_falta and not tiene_permiso) else 0
@@ -194,7 +194,7 @@ def detect_exceptions(df_resultado):
                 'Observaciones': ''
             })
 
-        # Caso 2: Horas Extras acumuladas
+        # Caso 2: Horas Extras acumuladas (Opción de pago o acumular próx. mes)
         if row['Horas Extras'] > 0:
             excepciones.append({
                 'ID': emp_id,
@@ -237,3 +237,41 @@ def detect_exceptions(df_resultado):
             })
 
     return pd.DataFrame(excepciones)
+
+
+def get_canje_summary(df_resultado):
+    """
+    Genera un resumen masivo por empleado para el Canje de Bolsa de Horas Extras por Faltas.
+    Calcula exactamente cuántos días completos (enteros) se pueden canjear según la jornada:
+    - Diurno: 8 hrs = 1 día
+    - Nocturno: 7 hrs = 1 día
+    """
+    if df_resultado is None or df_resultado.empty:
+        return pd.DataFrame()
+
+    resumen = []
+    for (emp_id, emp_nom), grp in df_resultado.groupby(['ID', 'Nombre']):
+        total_he = grp['Horas Extras'].sum()
+        total_faltas = (grp['Falta Justificada'] + grp['Falta Injustificada']).sum()
+        
+        # Determinar turno dominante
+        turno_dom = grp['Turno Dominante'].mode()[0] if not grp['Turno Dominante'].empty else 'Diurno'
+        costo_hora_dia = 7.0 if turno_dom == 'Nocturno' else 8.0
+
+        # Cálculo de días máximos canjeables (Entero estricto, sin decimales)
+        dias_canjeables_max = int(total_he // costo_hora_dia)
+
+        if total_he > 0 or total_faltas > 0:
+            resumen.append({
+                'ID': emp_id,
+                'Nombre': emp_nom,
+                'Turno Dominante': turno_dom,
+                'Horas Costo por Día': costo_hora_dia,
+                'Bolsa HE Acumulada (hrs)': round(total_he, 2),
+                'Días Máx. Canjeables': dias_canjeables_max,
+                'Faltas Registradas': int(total_faltas),
+                'Días a Canjear (Aplicar)': 0,
+                'Estado Canje': 'Sin Aplicar'
+            })
+
+    return pd.DataFrame(resumen)
