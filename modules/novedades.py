@@ -2,26 +2,30 @@ import sqlite3
 from datetime import datetime, date
 from typing import List, Dict, Any, Optional
 
+# Lista global a nivel de módulo para importaciones directas en Streamlit
+TIPOS_NOVEDAD = [
+    "BAJA_MEDICA",
+    "PERMISO_CON_GOCE",
+    "PERMISO_SIN_GOCE",
+    "LICENCIA_MATERNIDAD",
+    "REDUCCION_LACTANCIA",
+    "VACACIONES",
+    "LICENCIA_PATERNIDAD",
+    "DUELO_FAMILIAR",
+    "CAMBIO_TURNO",
+    "CAMBIO_TURNO_NOCTURNO",
+    "CAMBIO_TURNO_DIURNO"
+]
+
 class NovedadesManager:
     """
     Administración de Permisos, Bajas Médicas, Licencias, Reducción de Lactancia y Cambios de Turno.
     """
-    TIPOS_NOVEDAD = [
-        "BAJA_MEDICA",
-        "PERMISO_CON_GOCE",
-        "PERMISO_SIN_GOCE",
-        "LICENCIA_MATERNIDAD",
-        "REDUCCION_LACTANCIA",
-        "VACACIONES",
-        "LICENCIA_PATERNIDAD",
-        "DUELO_FAMILIAR",
-        "CAMBIO_TURNO",
-        "CAMBIO_TURNO_NOCTURNO",
-        "CAMBIO_TURNO_DIURNO"
-    ]
+    TIPOS_NOVEDAD = TIPOS_NOVEDAD
 
     def __init__(self, db_path: str = "novedades.db"):
         self.db_path = db_path
+        self.TIPOS_NOVEDAD = TIPOS_NOVEDAD
         self._init_db()
 
     def _init_db(self):
@@ -42,6 +46,10 @@ class NovedadesManager:
                 )
             """)
             conn.commit()
+
+    def obtener_tipos_novedad(self) -> List[str]:
+        """Retorna la lista oficial de tipos de novedad para popular el selectbox de Streamlit."""
+        return self.TIPOS_NOVEDAD
 
     def registrar_novedad(
         self,
