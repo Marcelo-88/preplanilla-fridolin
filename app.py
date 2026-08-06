@@ -16,15 +16,13 @@ st.title("🏭 Control de Asistencia y Reportes - Fridolin")
 st.sidebar.image("https://em-content.zobj.net/source/apple/354/factory_1f3ed.png", width=80)
 st.sidebar.title("Menú Principal")
 
-# -----------------------------------------------------------------------------
-# CONTROL DE ACCESO Y SESIÓN DE USUARIO (SIDEBAR)
-# -----------------------------------------------------------------------------
+# Cargar Maestro de Empleados para autenticación y PIN
 try:
     df_emp_master = load_sheet_data("01_Maestro_Empleados")
-    usuario_actual, rol_actual, empleados_permitidos = render_user_selector(df_emp_master)
+    usuario_actual, rol_actual, empleados_permitidos, pin_ok = render_user_selector(df_emp_master)
 except Exception as e:
-    usuario_actual, rol_actual, empleados_permitidos = "Invitado", "Jefe de Producción", []
-    st.sidebar.error(f"No se pudo inicializar la autenticación: {e}")
+    usuario_actual, rol_actual, empleados_permitidos, pin_ok = "Invitado", "Jefe de Producción", [], True
+    st.sidebar.error(f"Error cargando credenciales: {e}")
 
 st.sidebar.divider()
 
@@ -44,7 +42,7 @@ st.sidebar.divider()
 st.sidebar.caption("Sistema de Control de Asistencia v1.0")
 
 # -----------------------------------------------------------------------------
-# 1. PARÁMETROS Y REGLAS
+# 1. PARÁMETROS Y REGLAS (PÚBLICO)
 # -----------------------------------------------------------------------------
 if opcion == "📊 Parámetros y Reglas":
     st.header("Parámetros y Reglas del Sistema")
@@ -55,20 +53,18 @@ if opcion == "📊 Parámetros y Reglas":
         st.error(f"Error al cargar la pestaña: {e}")
 
 # -----------------------------------------------------------------------------
-# 2. MAESTRO DE EMPLEADOS
+# 2. MAESTRO DE EMPLEADOS (PÚBLICO)
 # -----------------------------------------------------------------------------
 elif opcion == "👥 Maestro de Empleados":
     st.header("Maestro de Empleados")
     try:
         df_emp = load_sheet_data("01_Maestro_Empleados")
-        # Filtrar solo el personal a cargo del supervisor activo
-        df_emp_fil = filter_dataframe_by_supervisor(df_emp, 'Nombre_Completo', empleados_permitidos, rol_actual)
-        st.dataframe(df_emp_fil, use_container_width=True, hide_index=True)
+        st.dataframe(df_emp, use_container_width=True, hide_index=True)
     except Exception as e:
         st.error(f"Error al cargar la pestaña: {e}")
 
 # -----------------------------------------------------------------------------
-# 3. IMPORTACIÓN BIOMÉTRICO
+# 3. IMPORTACIÓN BIOMÉTRICO (PÚBLICO)
 # -----------------------------------------------------------------------------
 elif opcion == "⏱️ Importación Biométrico":
     st.header("Registros del Biométrico")
@@ -79,24 +75,45 @@ elif opcion == "⏱️ Importación Biométrico":
         st.error(f"Error al cargar la pestaña: {e}")
 
 # -----------------------------------------------------------------------------
-# 4. NOVEDADES Y PERMISOS
+# 4. NOVEDADES Y PERMISOS (PÚBLICO)
 # -----------------------------------------------------------------------------
 elif opcion == "📝 Novedades y Permisos":
-    st.header("Novedades y Permisos")
+    st.header("Novedades, Licencias y Permisos Especiales")
+    st.info("💡 Incluye licencias legales, vacaciones y regla especial de Permiso de Lactancia Maternidad.")
     try:
         df_nov = load_sheet_data("04_Novedades_y_Permisos")
-        # Filtrar permisos por personal a cargo
-        df_nov_fil = filter_dataframe_by_supervisor(df_nov, 'Nombre_Completo', empleados_permitidos, rol_actual)
-        st.dataframe(df_nov_fil, use_container_width=True, hide_index=True)
+        st.dataframe(df_nov, use_container_width=True, hide_index=True)
     except Exception as e:
         st.error(f"Error al cargar la pestaña: {e}")
 
 # -----------------------------------------------------------------------------
-# 5. APROBACIONES SUPERVISORES
+# 5. APROBACIONES SUPERVISORES (🔒 CONTROLADO POR PIN Y SUPERVISOR)
 # -----------------------------------------------------------------------------
 elif opcion == "✅ Aprobaciones Supervisores":
     st.header("✅ Centro de Aprobaciones y Excepciones")
-    st.caption("Panel dinámico para revisión de faltas, horas extras, acumulación mensual y canje masivo de días.")
+
+    # VALIDACIÓN DE PIN EXCLUSIVA PARA ESTA PESTAÑA
+    if not pin_ok:
+        st.warning("🔒 Ingrese su PIN de 4 dígitos en la barra lateral para desbloquear el módulo de Aprobaciones.")
+        st.stop()
+
+    # CONTROL DE ESTADO DE REVISIÓN
+    if 'estado_revision' not in st.session_state:
+        st.session_state['estado_revision'] = 'Pendiente / En Proceso'
+
+    col_rev1, col_rev2, col_rev3 = st.columns([2, 1, 1])
+    with col_rev1:
+        st.subheader(f"Estado de Revisión: **{st.session_state['estado_revision']}**")
+    with col_rev2:
+        if st.button("▶️ INICIAR Revisión"):
+            st.session_state['estado_revision'] = "En Proceso"
+            st.success("Revisión habilitada.")
+    with col_rev3:
+        if st.button("🔒 FINALIZAR Revisión"):
+            st.session_state['estado_revision'] = "Finalizada / Cerrada"
+            st.success("Revisión finalizada y bloqueada.")
+
+    st.divider()
 
     tab_excepciones, tab_canje_masivo, tab_regularizar = st.tabs([
         "🚨 Excepciones Automáticas", 
@@ -120,20 +137,20 @@ elif opcion == "✅ Aprobaciones Supervisores":
         df_excepciones = detect_exceptions(df_res)
         df_canje_resumen = get_canje_summary(df_res)
 
-        # 🔒 Aplicar filtro estricto por Supervisor
+        # FILTRADO EXCLUSIVO POR SUPERVISOR A CARGO
         df_excepciones = filter_dataframe_by_supervisor(df_excepciones, 'Nombre', empleados_permitidos, rol_actual)
         df_canje_resumen = filter_dataframe_by_supervisor(df_canje_resumen, 'Nombre', empleados_permitidos, rol_actual)
 
     except Exception as e:
         df_excepciones = pd.DataFrame()
         df_canje_resumen = pd.DataFrame()
-        st.warning(f"No se pudieron cargar los datos biométricos para calcular excepciones: {e}")
+        st.warning(f"No se pudieron cargar los datos biométricos: {e}")
 
     # TAB 1: EXCEPCIONES AUTOMÁTICAS
     with tab_excepciones:
         if df_excepciones is not None and not df_excepciones.empty:
             st.subheader("Excepciones Detectadas en el Periodo")
-            st.info("💡 Marca las Horas Extras como 'Aprobado (Pago)' o 'Acumular (Próx. Mes)' si pasan al siguiente periodo.")
+            st.info("💡 Puedes revertir o modificar cualquier decisión seleccionándola en la columna 'Decisión'.")
 
             col_f1, col_f2 = st.columns(2)
             with col_f1:
@@ -153,12 +170,13 @@ elif opcion == "✅ Aprobaciones Supervisores":
             m1.metric("Excepciones Totales", len(df_fil_exc))
             m2.metric("Faltas Totales", len(df_fil_exc[df_fil_exc['Tipo Excepción'] == 'Falta / Omisión Marcación']))
             m3.metric("Sol. Horas Extras", len(df_fil_exc[df_fil_exc['Tipo Excepción'] == 'Horas Extras']))
-            m4.metric("7º Día / Desfases", len(df_fil_exc[df_fil_exc['Tipo Excepción'].isin(['7º Día Laborado', 'Desfase Horario Ingreso'])]))
+            m4.metric("Desfases Ingreso", len(df_fil_exc[df_fil_exc['Tipo Excepción'] == 'Desfase Horario Ingreso']))
 
             df_edited_exc = st.data_editor(
                 df_fil_exc,
                 use_container_width=True,
                 hide_index=True,
+                disabled=["ID", "Nombre", "Fecha", "Tipo Excepción", "Detalle Excepción", "Valor a Revisar"] if st.session_state['estado_revision'] == "Finalizada / Cerrada" else [],
                 column_config={
                     "Decisión Supervisor": st.column_config.SelectboxColumn(
                         "Decisión",
@@ -185,9 +203,7 @@ elif opcion == "✅ Aprobaciones Supervisores":
             )
 
             st.divider()
-            st.subheader("📥 Exportación 'Copy-Paste Ready' para Google Drive")
-            st.caption("Descarga este Excel con los estados actualizados para copiar y pegar en la pestaña `03_Aprobaciones_Supervisores`.")
-
+            st.subheader("📥 Exportación de Aprobaciones")
             buffer_exc = io.BytesIO()
             with pd.ExcelWriter(buffer_exc, engine='openpyxl') as writer:
                 df_edited_exc.to_excel(writer, index=False, sheet_name='03_Aprobaciones_Supervisores')
@@ -199,13 +215,11 @@ elif opcion == "✅ Aprobaciones Supervisores":
                 mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
             )
         else:
-            st.success("🎉 No se detectaron excepciones pendientes de revisión para su personal asignado.")
+            st.success("🎉 No se detectaron excepciones pendientes para su personal asignado.")
 
-    # TAB 2: CANJE MASIVO EN TABLA
+    # TAB 2: CANJE MASIVO
     with tab_canje_masivo:
-        st.subheader("⚖️ Lista General para Canje Masivo de Horas Extras por Faltas")
-        st.info("💡 **Regla Estricta:** 1 Día entero = **8 hrs** (Diurno) o **7 hrs** (Nocturno). Modifica directamente la columna **'Días a Canjear (Aplicar)'** en la tabla. Solo se permiten valores enteros (0, 1, 2, etc.).")
-
+        st.subheader("⚖️ Canje Masivo de Horas Extras por Faltas")
         if df_canje_resumen is not None and not df_canje_resumen.empty:
             df_edited_canje = st.data_editor(
                 df_canje_resumen,
@@ -223,8 +237,7 @@ elif opcion == "✅ Aprobaciones Supervisores":
                         "Días a Canjear",
                         min_value=0,
                         max_value=10,
-                        step=1,
-                        help="Número exacto de días enteros a cancelar usando las horas extras acumuladas"
+                        step=1
                     ),
                     "Estado Canje": st.column_config.SelectboxColumn(
                         "Estado Canje",
@@ -235,46 +248,27 @@ elif opcion == "✅ Aprobaciones Supervisores":
             )
 
             dias_totales_canjeados = df_edited_canje['Días a Canjear (Aplicar)'].sum()
-            
             c_m1, c_m2 = st.columns(2)
             c_m1.metric("Personal con Bolsa HE / Faltas", len(df_edited_canje))
-            c_m2.metric("Total Días Canjeados en Tabla", f"{int(dias_totales_canjeados)} días")
-
-            st.divider()
-            st.subheader("📥 Exportación del Resumen de Canjes")
-            
-            buffer_canje = io.BytesIO()
-            with pd.ExcelWriter(buffer_canje, engine='openpyxl') as writer:
-                df_edited_canje.to_excel(writer, index=False, sheet_name='Resumen_Canjes')
-
-            st.download_button(
-                label="📥 Descargar Registro de Canjes (Excel)",
-                data=buffer_canje.getvalue(),
-                file_name="Resumen_Canjes_Fridolin.xlsx",
-                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-            )
+            c_m2.metric("Total Días Canjeados", f"{int(dias_totales_canjeados)} días")
         else:
-            st.info("No hay empleados a su cargo con saldo de horas extras o faltas para procesar canjes.")
+            st.info("No hay empleados a su cargo con saldo de horas extras o faltas.")
 
     # TAB 3: REGULARIZACIÓN MANUAL
     with tab_regularizar:
         st.subheader("Regularizar Marcación Faltante u Olvido")
-        st.write("Permite al supervisor completar horas de entrada o salida no marcadas en el biométrico.")
-
         with st.form("form_regularizacion_panel"):
             r_col1, r_col2 = st.columns(2)
             with r_col1:
                 id_emp_reg = st.text_input("ID / Carnet Empleado:*")
                 nombre_emp_reg = st.text_input("Nombre Completo Empleado:*")
                 fecha_reg = st.date_input("Fecha de la Marcación Omisa:")
-            
             with r_col2:
                 tipo_marcacion = st.selectbox("Tipo de Marcación Faltante:", ["Entrada Omisa", "Salida Omisa", "Jornada Completa Omisa"])
                 hora_reg = st.time_input("Hora Aprobada de Marcación:")
                 motivo_reg = st.text_area("Motivo / Justificación del Supervisor:*")
 
             submitted = st.form_submit_button("✅ Registrar Regularización")
-
             if submitted:
                 if not id_emp_reg or not nombre_emp_reg or not motivo_reg:
                     st.warning("Por favor complete todos los campos obligatorios (*).")
@@ -282,30 +276,19 @@ elif opcion == "✅ Aprobaciones Supervisores":
                     st.success(f"Regularización registrada para {nombre_emp_reg} el día {fecha_reg}.")
 
 # -----------------------------------------------------------------------------
-# 6. PRE-PLANILLA Y REPORTES
+# 6. PRE-PLANILLA Y REPORTES (PÚBLICO)
 # -----------------------------------------------------------------------------
 elif opcion == "📑 Pre-Planilla y Reportes":
     st.header("Reporte Consolidado de Asistencia para RRHH / Contabilidad")
     
-    with st.spinner("Procesando marcaciones y tiempos..."):
+    with st.spinner("Procesando marcaciones, novedades y tiempos..."):
         try:
             df_bio = load_sheet_data("02_Importacion_Biometrico")
             df_params = load_sheet_data("05_Parametros_y_Reglas")
-            
-            try:
-                df_emp = load_sheet_data("01_Maestro_Empleados")
-            except Exception:
-                df_emp = None
-                
-            try:
-                df_nov = load_sheet_data("04_Novedades_y_Permisos")
-            except Exception:
-                df_nov = None
+            df_emp = load_sheet_data("01_Maestro_Empleados")
+            df_nov = load_sheet_data("04_Novedades_y_Permisos")
                 
             df_resultado = process_attendance(df_bio, df_params, df_nov, df_emp)
-            
-            # 🔒 Aplicar filtro estricto por Supervisor
-            df_resultado = filter_dataframe_by_supervisor(df_resultado, 'Nombre', empleados_permitidos, rol_actual)
 
             if df_resultado is not None and not df_resultado.empty:
                 col_filtro1, col_filtro2 = st.columns(2)
@@ -346,7 +329,5 @@ elif opcion == "📑 Pre-Planilla y Reportes":
                     file_name="Reporte_Asistencia_Fridolin.xlsx",
                     mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
                 )
-            else:
-                st.warning("No hay datos disponibles para procesar según el usuario seleccionado.")
         except Exception as e:
             st.error(f"Error durante el procesamiento: {e}")
