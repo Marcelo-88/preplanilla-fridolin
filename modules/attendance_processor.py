@@ -247,6 +247,9 @@ def process_attendance(df_bio, df_params=None, df_nov=None, df_emp=None, _nov_mg
                             exento_faltas = True
                             exento_atrasos = True
                             atraso_minutos = 0
+                        elif novedad_activa in ["PERMISO_SIN_GOCE", "FALTA_JUSTIFICADA"]:
+                            exento_atrasos = True
+                            atraso_minutos = 0
                         elif novedad_activa == "REDUCCION_LACTANCIA":
                             exento_atrasos = True
                             atraso_minutos = 0
@@ -287,8 +290,16 @@ def process_attendance(df_bio, df_params=None, df_nov=None, df_emp=None, _nov_mg
                                 horas_extras = round(horas_netas - jornada_limite, 2)
 
                     es_falta = (not dt_out) and not exento_faltas
-                    falta_justificada = 1 if (es_falta and novedad_activa is not None) else 0
-                    falta_injustificada = 1 if (es_falta and novedad_activa is None) else 0
+                    
+                    # Clasificación estricta de Falta con Marcación Incompleta
+                    falta_justificada = 0
+                    falta_injustificada = 0
+
+                    if es_falta:
+                        if novedad_activa in ["PERMISO_SIN_GOCE", "FALTA_JUSTIFICADA"]:
+                            falta_justificada = 1
+                        elif novedad_activa is None:
+                            falta_injustificada = 1
 
                     desfase_ingreso = False
                     if horas_netas >= 7.0 and minutos_diferencia > 45 and not exento_atrasos:
@@ -324,14 +335,25 @@ def process_attendance(df_bio, df_params=None, df_nov=None, df_emp=None, _nov_mg
                 falta_justificada = 0
                 estado_registro = 'OK'
 
-                es_licencia_justificada = novedad_activa in [
-                    "BAJA_MEDICA", "PERMISO_CON_GOCE", "PERMISO_SIN_GOCE",
-                    "VACACIONES", "LICENCIA_MATERNIDAD", "LICENCIA_PATERNIDAD", "DUELO_FAMILIAR"
+                # Licencias con Goce de Haber (Cobran 100% | No implican descuento | No son falta)
+                es_licencia_pagada = novedad_activa in [
+                    "BAJA_MEDICA", "PERMISO_CON_GOCE", "VACACIONES",
+                    "LICENCIA_MATERNIDAD", "LICENCIA_PATERNIDAD", "DUELO_FAMILIAR"
                 ]
 
-                if es_licencia_justificada:
+                # Licencias Sin Goce de Haber (Descuento pero CANJEABLE)
+                es_licencia_canjeable = novedad_activa in [
+                    "PERMISO_SIN_GOCE", "FALTA_JUSTIFICADA"
+                ]
+
+                if es_licencia_pagada:
+                    falta_justificada = 0
+                    falta_injustificada = 0
+                    estado_registro = f'Justificado ({novedad_activa})'
+                elif es_licencia_canjeable:
                     falta_justificada = 1
-                    estado_registro = 'Justificado por Licencia'
+                    falta_injustificada = 0
+                    estado_registro = 'Permiso/Falta Justificada'
                 else:
                     if es_domingo:
                         if es_turno_nocturno_fijo:
@@ -461,14 +483,17 @@ def get_canje_summary(df_resultado):
     
     for (emp_id, emp_nom), grp in df_resultado.groupby([col_id_key, 'Nombre']):
         total_he = grp['Horas Extras'].sum()
-        total_faltas = (grp['Falta Justificada'] + grp['Falta Injustificada']).sum()
+        
+        # REGLA CLAVE: Solo las Faltas Justificadas son canjeables
+        # Las Faltas Injustificadas no entran a la bolsa de canje (se excluyen)
+        total_faltas_canjeables = grp['Falta Justificada'].sum()
         
         turno_dom = grp['Turno Dominante'].mode()[0] if not grp['Turno Dominante'].empty else 'Diurno'
         costo_hora_dia = 7.0 if turno_dom == 'Nocturno' else 8.0
 
         dias_canjeables_max = int(total_he // costo_hora_dia)
 
-        if total_he > 0 or total_faltas > 0:
+        if total_he > 0 or total_faltas_canjeables > 0:
             resumen.append({
                 'Carnet_Identidad': emp_id,
                 'Nombre': emp_nom,
@@ -476,7 +501,7 @@ def get_canje_summary(df_resultado):
                 'Horas Costo por Día': costo_hora_dia,
                 'Bolsa HE Acumulada (hrs)': round(total_he, 2),
                 'Días Máx. Canjeables': dias_canjeables_max,
-                'Faltas Registradas': int(total_faltas),
+                'Faltas Registradas': int(total_faltas_canjeables),
                 'Días a Canjear (Aplicar)': 0,
                 'Estado Canje': 'Sin Aplicar'
             })
