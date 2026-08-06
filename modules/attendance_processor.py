@@ -15,7 +15,7 @@ DIAS_ESPANOL = {
     6: 'Domingo'
 }
 
-def process_attendance(df_bio, df_params=None, df_nov=None, df_emp=None, nov_mgr=None):
+def process_attendance(df_bio, df_params=None, df_nov=None, df_emp=None, _nov_mgr=None):
     if df_bio is None or df_bio.empty:
         return pd.DataFrame()
 
@@ -81,9 +81,9 @@ def process_attendance(df_bio, df_params=None, df_nov=None, df_emp=None, nov_mgr
 
     # OPTIMIZACIÓN CRÍTICA: Pre-cargar Novedades en mapa O(1)
     nov_map = {}
-    if nov_mgr:
+    if _nov_mgr:
         try:
-            todas_nov = nov_mgr.obtener_todas_novedades()
+            todas_nov = _nov_mgr.obtener_todas_novedades()
             if isinstance(todas_nov, pd.DataFrame):
                 todas_nov = todas_nov.to_dict('records')
             for n in todas_nov:
@@ -107,9 +107,9 @@ def process_attendance(df_bio, df_params=None, df_nov=None, df_emp=None, nov_mgr
     def obtener_novedad(e_id, f_str):
         if (e_id, f_str) in nov_map:
             return nov_map[(e_id, f_str)]
-        if nov_mgr:
+        if _nov_mgr:
             try:
-                return nov_mgr.evaluar_impacto_dia(e_id, f_str)
+                return _nov_mgr.evaluar_impacto_dia(e_id, f_str)
             except Exception:
                 return None
         return None
