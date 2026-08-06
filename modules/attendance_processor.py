@@ -1,6 +1,7 @@
 import pandas as pd
 import numpy as np
 from datetime import datetime, time, timedelta
+import streamlit as st
 
 TOLERANCIA_MINUTOS = 10
 DESCUENTO_COMIDA_HORAS = 0.5  # 30 minutos obligatorios
@@ -15,7 +16,8 @@ DIAS_ESPANOL = {
     6: 'Domingo'
 }
 
-def process_attendance(df_bio, df_params=None, df_nov=None, df_emp=None, nov_mgr=None):
+@st.cache_data(ttl=300, show_spinner=False)
+def process_attendance(df_bio, df_params=None, df_nov=None, df_emp=None, nov_mgr=None, periodo_filtro=None, emp_id_filtro=None):
     if df_bio is None or df_bio.empty:
         return pd.DataFrame()
 
@@ -31,12 +33,22 @@ def process_attendance(df_bio, df_params=None, df_nov=None, df_emp=None, nov_mgr
 
     # 2. Parseo de fechas y ordenamiento
     df['dt_parsed'] = pd.to_datetime(df[col_fecha], dayfirst=True, errors='coerce')
-    df = df.dropna(subset=['dt_parsed']).sort_values([col_id, 'dt_parsed'])
+    df = df.dropna(subset=['dt_parsed'])
+
+    # --- FILTRADO DE RENDIMIENTO PREVIO AL CÁLCULO ---
+    if periodo_filtro and periodo_filtro != "Todos":
+        df['periodo_str'] = df['dt_parsed'].dt.strftime('%Y-%m')
+        df = df[df['periodo_str'] == periodo_filtro]
+
+    if emp_id_filtro and emp_id_filtro != "Todos":
+        df = df[df[col_id].astype(str).str.strip() == str(emp_id_filtro).strip()]
 
     if df.empty:
         return pd.DataFrame()
 
-    # Determine el rango global de fechas a evaluar en el reporte
+    df = df.sort_values([col_id, 'dt_parsed'])
+
+    # Determine el rango de fechas evaluado
     min_date = df['dt_parsed'].min().date()
     max_date = df['dt_parsed'].max().date()
     rango_dias = pd.date_range(min_date, max_date)
@@ -63,10 +75,13 @@ def process_attendance(df_bio, df_params=None, df_nov=None, df_emp=None, nov_mgr
                 if c_emp_turno:
                     dict_turno_personal[eid] = str(row[c_emp_turno]).strip()
 
-    # Identificar lista total de empleados (Unión Maestro + Biométrico)
+    # Identificar lista total de empleados filtrados
     emp_ids_bio = df[col_id].astype(str).str.strip().unique().tolist()
-    emp_ids_master = list(dict_nombres_master.keys())
-    todos_emp_ids = sorted(list(set(emp_ids_bio + emp_ids_master)))
+    
+    if emp_id_filtro and emp_id_filtro != "Todos":
+        todos_emp_ids = [str(emp_id_filtro).strip()]
+    else:
+        todos_emp_ids = sorted(list(set(emp_ids_bio)))
 
     registros = []
 
@@ -161,13 +176,11 @@ def process_attendance(df_bio, df_params=None, df_nov=None, df_emp=None, nov_mgr
 
                     if es_domingo:
                         if es_nocturno and dt_in.hour >= 18:
-                            # Ingreso normal de semana nocturna (equivale a su inicio laboral)
                             turnos_computados = 1.0
                             horas_extras = 0.0
                             if not novedad_activa:
                                 novedad_activa = 'Inicio Semana Nocturna'
                         else:
-                            # Trabajo en Día de Descanso (7º Día / Temporada Alta)
                             turnos_computados = 1.5
                             if "Jornal" not in tipo_personal:
                                 horas_extras = horas_netas
@@ -240,19 +253,15 @@ def process_attendance(df_bio, df_params=None, df_nov=None, df_emp=None, nov_mgr
                 else:
                     if es_domingo:
                         if es_turno_nocturno_fijo:
-                            # Para nocturnos, el domingo noche es inicio obligatorio de jornada
                             falta_injustificada = 1
                             estado_registro = 'Falta / Omisión Marcación'
                         else:
-                            # Para diurnos, el domingo es Descanso Semanal (NO suma falta)
                             falta_injustificada = 0
                             estado_registro = 'Descanso Semanal'
                     elif es_sabado and es_turno_nocturno_fijo:
-                        # Para nocturnos, el sábado es su día regular de descanso
                         falta_injustificada = 0
                         estado_registro = 'Descanso Semanal'
                     else:
-                        # Lunes a Sábado (Diurno) o Lunes a Viernes (Nocturno)
                         falta_injustificada = 1
                         estado_registro = 'Falta / Omisión Marcación'
 
@@ -303,7 +312,6 @@ def detect_exceptions(df_resultado):
         dt_f = pd.to_datetime(fecha)
         semana = dt_f.isocalendar().week
 
-        # Solo registrar falta si efectivamente es Injustificada o con revisión omisa
         if row['Estado'] in ['Revisar Marcación', 'Falta / Omisión Marcación'] and row['Falta Injustificada'] == 1:
             excepciones.append({
                 'ID': emp_id,
