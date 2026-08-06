@@ -69,12 +69,14 @@ elif opcion == "✅ Aprobaciones Supervisores":
         df_aprob = load_sheet_data("03_Aprobaciones_Supervisores")
         
         if df_aprob is not None and not df_aprob.empty:
-            # Detectar columnas dinámicamente
-            col_estado = [c for c in df_aprob.columns if 'ESTADO' in str(c).upper() or 'APROB' in str(c).upper()]
-            col_sup = [c for c in df_aprob.columns if 'SUPERVISOR' in str(c).upper() or 'JEFE' in str(c).upper()]
-            col_emp = [c for c in df_aprob.columns if 'EMPLEADO' in str(c).upper() or 'NOMBRE' in str(c).upper() or 'ID' in str(c).upper()]
+            # Excluir 'Estado_Retraso' y 'Estado_Falta' para buscar la columna de aprobación global
+            cols_cand = [c for c in df_aprob.columns if 'ESTADO' in str(c).upper() or 'APROB' in str(c).upper()]
+            col_estado_list = [c for c in cols_cand if 'RETRASO' not in str(c).upper() and 'FALTA' not in str(c).upper()]
+            col_estado = col_estado_list if col_estado_list else cols_cand
             
-            # Filtros superiores
+            col_sup = [c for c in df_aprob.columns if 'SUPERVISOR' in str(c).upper() or 'JEFE' in str(c).upper()]
+            col_emp = [c for c in df_aprob.columns if 'EMPLEADO' in str(c).upper() or 'NOMBRE' in str(c).upper() or 'ID' in str(c).upper() or 'CARNET' in str(c).upper()]
+            
             col_f1, col_f2, col_f3 = st.columns(3)
             
             with col_f1:
@@ -95,7 +97,6 @@ elif opcion == "✅ Aprobaciones Supervisores":
                     opciones_emp += list(df_aprob[col_emp[0]].astype(str).unique())
                 emp_sel = st.selectbox("Filtrar por Empleado:", opciones_emp)
             
-            # Aplicar filtros
             df_fil = df_aprob.copy()
             if estado_sel != "Todos" and col_estado:
                 df_fil = df_fil[df_fil[col_estado[0]].astype(str) == estado_sel]
@@ -104,14 +105,14 @@ elif opcion == "✅ Aprobaciones Supervisores":
             if emp_sel != "Todos" and col_emp:
                 df_fil = df_fil[df_fil[col_emp[0]].astype(str) == emp_sel]
                 
-            # Métricas de estado
             m1, m2, m3, m4 = st.columns(4)
             m1.metric("Total Registros", len(df_fil))
             
             if col_estado:
-                pendientes = len(df_fil[df_fil[col_estado[0]].astype(str).str.upper().str.contains("PENDIENTE")])
-                aprobados = len(df_fil[df_fil[col_estado[0]].astype(str).str.upper().str.contains("APROBADO")])
-                rechazados = len(df_fil[df_fil[col_estado[0]].astype(str).str.upper().str.contains("RECHAZADO")])
+                col_target = col_estado[0]
+                pendientes = len(df_fil[df_fil[col_target].astype(str).str.upper().str.contains("PENDIENTE")])
+                aprobados = len(df_fil[df_fil[col_target].astype(str).str.upper().str.contains("APROBADO")])
+                rechazados = len(df_fil[df_fil[col_target].astype(str).str.upper().str.contains("RECHAZADO")])
                 
                 m2.metric("⏳ Pendientes", pendientes)
                 m3.metric("🟢 Aprobados", aprobados)
@@ -124,7 +125,6 @@ elif opcion == "✅ Aprobaciones Supervisores":
             st.subheader("Listado de Aprobaciones")
             st.dataframe(df_fil, use_container_width=True, hide_index=True)
             
-            # Botón de Descarga Excel
             buffer = io.BytesIO()
             with pd.ExcelWriter(buffer, engine='openpyxl') as writer:
                 df_fil.to_excel(writer, index=False, sheet_name='Aprobaciones')
