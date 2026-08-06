@@ -69,7 +69,6 @@ elif opcion == "✅ Aprobaciones Supervisores":
         df_aprob = load_sheet_data("03_Aprobaciones_Supervisores")
         
         if df_aprob is not None and not df_aprob.empty:
-            # Excluir 'Estado_Retraso' y 'Estado_Falta' para buscar la columna de aprobación global
             cols_cand = [c for c in df_aprob.columns if 'ESTADO' in str(c).upper() or 'APROB' in str(c).upper()]
             col_estado_list = [c for c in cols_cand if 'RETRASO' not in str(c).upper() and 'FALTA' not in str(c).upper()]
             col_estado = col_estado_list if col_estado_list else cols_cand
@@ -181,12 +180,13 @@ elif opcion == "📑 Pre-Planilla y Reportes":
                 st.subheader("Planilla de Control de Tiempos")
                 st.dataframe(df_filtrado, use_container_width=True, hide_index=True)
                 
-                col1, col2, col3, col4, col5 = st.columns(5)
-                col1.metric("Días / Registros", len(df_filtrado))
-                col2.metric("Total Horas Trabajadas", f"{df_filtrado['Horas Trabajadas'].sum():.2f} hrs")
+                col1, col2, col3, col4, col5, col6 = st.columns(6)
+                col1.metric("Registros", len(df_filtrado))
+                col2.metric("Horas Trabajadas", f"{df_filtrado['Horas Trabajadas'].sum():.2f} hrs")
                 col3.metric("Total Atrasos", f"{df_filtrado['Atraso (Minutos)'].sum()} min")
                 col4.metric("Horas Extras", f"{df_filtrado['Horas Extras'].sum():.2f} hrs")
-                col5.metric("Horas Nocturnas", f"{df_filtrado['Horas Nocturnas'].sum():.2f} hrs")
+                col5.metric("Turnos Computados", f"{df_filtrado['Turnos Computados'].sum():.1f}")
+                col6.metric("Horas Nocturnas", f"{df_filtrado['Horas Nocturnas'].sum():.2f} hrs")
                 
                 buffer = io.BytesIO()
                 with pd.ExcelWriter(buffer, engine='openpyxl') as writer:
