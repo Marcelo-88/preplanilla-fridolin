@@ -10,7 +10,10 @@ class LockManager:
     ESTADO_EN_PROCESO = "INICIAR APROBACIONES"
     ESTADO_FINALIZADO = "FINALIZADO"
 
-    ROLES_SUPERUSUARIO = ["RESPONSABLE_OPERACIONES", "JEFE_PRODUCCION", "Jefe de Producción", "ADMINISTRADOR", "Responsable de Operaciones y Producción (Acceso Total)"]
+    ROLES_SUPERUSUARIO = [
+        "RESPONSABLE_OPERACIONES", "JEFE_PRODUCCION", "Jefe de Producción", 
+        "ADMINISTRADOR", "Responsable de Operaciones y Producción (Acceso Total)"
+    ]
 
     def __init__(self, db_path: str = "period_locks.db"):
         self.db_path = db_path
@@ -168,7 +171,7 @@ class LockManager:
 
     def obtener_decisiones_excepciones(self, periodo: str) -> Dict[tuple, Dict[str, str]]:
         """
-        Obtiene las decisiones tomadas previamente para vincularlas con la Pre-Planilla.
+        Consulta las decisiones de excepciones tomadas para el período.
         """
         decisiones = {}
         with sqlite3.connect(self.db_path) as conn:
