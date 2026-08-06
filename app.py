@@ -157,7 +157,9 @@ elif opcion == "📝 Novedades y Permisos":
                     lista_emps = []
 
                 emp_seleccionado = st.selectbox("Seleccione Empleado:*", options=sorted(lista_emps))
-                tipo_nov = st.selectbox("Tipo de Novedad / Licencia:*", options=nov_mgr.TIPOS_NOVEDAD)
+                
+                # Se utiliza directamente la propiedad de clase para omitir el objeto en caché
+                tipo_nov = st.selectbox("Tipo de Novedad / Licencia:*", options=NovedadesManager.TIPOS_NOVEDAD)
                 
                 col_f1, col_f2 = st.columns(2)
                 with col_f1:
@@ -199,6 +201,7 @@ elif opcion == "📝 Novedades y Permisos":
                                 detalles={"empleado": emp_seleccionado, "tipo": tipo_nov, "inicio": str(fecha_ini), "fin": str(fecha_fin)}
                             )
                             st.cache_data.clear()
+                            st.cache_resource.clear()
                             st.success(res_reg["mensaje"])
                             st.rerun()
                         else:
