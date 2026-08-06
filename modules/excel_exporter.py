@@ -5,9 +5,6 @@ from datetime import datetime
 from typing import List, Dict, Any
 
 class ExcelExporter:
-    """
-    Exportador profesional multi-pestaña para Pre-Planilla, Excepciones y Canjes.
-    """
     @staticmethod
     def _aplicar_estilo_hoja(ws, titulo: str, periodo: str, datos_tabla: List[Dict[str, Any]]):
         ws.views.sheetView[0].showGridLines = True
@@ -86,12 +83,10 @@ class ExcelExporter:
     ) -> str:
         wb = openpyxl.Workbook()
         
-        # Pestaña 1: Excepciones
         ws_exc = wb.active
         ws_exc.title = "Excepciones Supervisores"
         ExcelExporter._aplicar_estilo_hoja(ws_exc, "CENTRO DE APROBACIONES Y EXCEPCIONES", periodo, datos_excepciones)
 
-        # Pestaña 2: Canje Masivo
         if datos_canje:
             ws_canje = wb.create_sheet(title="Bolsa Canje HE")
             ExcelExporter._aplicar_estilo_hoja(ws_canje, "RESUMEN BOLSAS DE CANJE Y FALTAS", periodo, datos_canje)
