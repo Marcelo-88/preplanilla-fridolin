@@ -3,44 +3,61 @@ import pandas as pd
 
 def render_user_selector(df_emp):
     """
-    Renderiza el selector de usuario en la barra lateral (Sidebar)
-    y retorna el usuario actual, su rol y su lista de supervisados.
+    Renderiza el selector de usuario en la barra lateral basándose únicamente
+    en nombres reales registrados en el Maestro de Empleados.
     """
     if df_emp is None or df_emp.empty:
         st.sidebar.warning("⚠️ No se pudo cargar el Maestro de Empleados.")
         return None, "Admin", []
 
-    # Normalizar columnas
+    # Normalizar nombres de columnas
     cols = {str(c).strip().lower(): c for c in df_emp.columns}
     c_nombre = next((cols[k] for k in cols if 'nombre' in k), df_emp.columns[1])
     c_sup = next((cols[k] for k in cols if 'supervisor' in k), None)
     c_rol = next((cols[k] for k in cols if 'rol' in k), None)
 
-    # Identificar lista de usuarios únicos (Supervisores + Admins/Jefes)
+    # 1. Lista de Supervisores únicos
     supervisores = []
     if c_sup and c_sup in df_emp.columns:
-        supervisores = list(df_emp[c_sup].dropna().unique())
+        supervisores = [
+            str(s).strip() for s in df_emp[c_sup].dropna().unique() 
+            if str(s).strip().upper() not in ['N/A', 'NONE', '', 'NAN']
+        ]
 
-    # Agregar roles especiales si existen
-    admins = []
+    # 2. Lista de Jefaturas / Responsables según columna Rol
+    jefes_admins = []
     if c_rol and c_rol in df_emp.columns:
-        admins = list(df_emp[df_emp[c_rol].str.contains('Jefe|Admin', case=False, na=False)][c_nombre].unique())
+        filtro_jefes = df_emp[c_rol].astype(str).str.contains(
+            'Jefe|Admin|Responsable|Operaciones|Gerente|Jefatura', case=False, na=False
+        )
+        jefes_admins = [str(n).strip() for n in df_emp[filtro_jefes][c_nombre].unique() if str(n).strip()]
 
-    # Lista total de usuarios para el selector
-    usuarios_sistema = sorted(list(set(supervisores + admins + ["Jefe de Producción (Acceso Total)"])))
+    # 3. Lista unificada SOLO con nombres reales (sin etiquetas genéricas)
+    lista_usuarios = sorted(list(set(supervisores + jefes_admins)))
+
+    if not lista_usuarios:
+        lista_usuarios = sorted([str(n).strip() for n in df_emp[c_nombre].unique() if str(n).strip()])
 
     st.sidebar.markdown("---")
     st.sidebar.subheader("👤 Sesión de Usuario")
-    usuario_actual = st.sidebar.selectbox("Seleccione su Usuario:", usuarios_sistema)
+    usuario_actual = st.sidebar.selectbox("Seleccione su Usuario:", lista_usuarios)
 
-    # Determinar Rol y Permisos
-    if "Jefe" in usuario_actual or "Admin" in usuario_actual:
+    # Validar si el usuario seleccionado es el Responsable / Jefe (Acceso Total)
+    es_jefe = False
+    if c_rol and c_rol in df_emp.columns:
+        m_emp = df_emp[df_emp[c_nombre].astype(str).str.strip().str.upper() == usuario_actual.strip().upper()]
+        if not m_emp.empty:
+            rol_registrado = str(m_emp[c_rol].values[0]).lower()
+            if any(k in rol_registrado for k in ['jefe', 'admin', 'responsable', 'operaciones', 'gerente']):
+                es_jefe = True
+
+    # Regla para tu usuario o cualquier perfil con rol de Jefatura/Operaciones
+    if es_jefe or usuario_actual in jefes_admins or "MEDRANO" in usuario_actual.upper():
         rol = "Jefe de Producción"
-        empleados_a_cargo = list(df_emp[c_nombre].unique()) # Acceso total
-        st.sidebar.success("👑 Rol: Jefe de Producción (Acceso Total)")
+        empleados_a_cargo = list(df_emp[c_nombre].unique())  # Acceso Total
+        st.sidebar.success("👑 Rol: Responsable de Operaciones y Producción (Acceso Total)")
     else:
         rol = "Supervisor"
-        # Filtrar solo personal asignado a este supervisor
         if c_sup:
             df_a_cargo = df_emp[df_emp[c_sup].astype(str).str.strip().str.upper() == usuario_actual.strip().upper()]
             empleados_a_cargo = list(df_a_cargo[c_nombre].unique())
@@ -54,12 +71,13 @@ def render_user_selector(df_emp):
 
 def filter_dataframe_by_supervisor(df, columna_nombre, empleados_a_cargo, rol):
     """
-    Filtra cualquier DataFrame para mostrar solo los empleados permitidos.
+    Filtra cualquier DataFrame para mostrar solo los empleados asignados.
+    Si el rol es 'Jefe de Producción' (Acceso Total), muestra el 100% de los datos.
     """
     if df is None or df.empty:
         return df
 
-    # El Jefe de Producción ve todo
+    # El Responsable de Operaciones / Jefe ve todo el sistema
     if rol == "Jefe de Producción":
         return df
 
