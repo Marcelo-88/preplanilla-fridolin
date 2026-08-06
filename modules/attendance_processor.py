@@ -84,7 +84,7 @@ def process_attendance(df_bio, df_params=None, df_nov=None, df_emp=None):
                 horas_netas = max(0.0, round(horas_brutas - DESCUENTO_COMIDA_HORAS, 2)) if horas_brutas > 0 else 0.0
 
                 # Cálculo de Atrasos (Tolerancia 10 minutos)
-                hora_esperada = time(22, 0) if es_nocturno else time(7, 0)
+                hora_esperada = time(22, 0) if es_nocturno else time(7, 30)
                 dt_esperada = datetime.combine(dt_in.date(), hora_esperada)
                 
                 minutos_diferencia = (dt_in - dt_esperada).total_seconds() / 60.0
@@ -117,19 +117,21 @@ def process_attendance(df_bio, df_params=None, df_nov=None, df_emp=None):
                     horas_extras = 0.0
                 elif es_nocturno:
                     if es_domingo or es_viernes:
-                        # Turno nocturno especial: 1.5 turnos SIN horas extras
                         turnos_computados = 1.5
                         horas_extras = 0.0
                     else:
-                        # Turno nocturno regular (Lun a Jue): 1.0 turno + HE sobre 7.0 hrs netas
                         turnos_computados = 1.0
                         if horas_netas > 7.0:
                             horas_extras = round(horas_netas - 7.0, 2)
                 else:
-                    # Turno diurno regular: 1.0 turno + HE sobre 8.0 hrs netas
                     turnos_computados = 1.0
                     if horas_netas > 8.0:
                         horas_extras = round(horas_netas - 8.0, 2)
+
+                # Clasificación de Excepción de Ingreso Tardío (Desfase de Horario)
+                desfase_ingreso = False
+                if horas_netas >= 7.0 and minutos_diferencia > 45:
+                    desfase_ingreso = True
 
                 registros.append({
                     'ID': emp_id_str,
@@ -145,8 +147,98 @@ def process_attendance(df_bio, df_params=None, df_nov=None, df_emp=None):
                     'Horas Nocturnas': horas_nocturnas,
                     'Turnos Computados': turnos_computados,
                     'Turno Dominante': turno_label,
+                    'Desfase Ingreso': desfase_ingreso,
                     'Estado': 'OK' if dt_out else 'Revisar Marcación'
                 })
             i += 1
 
     return pd.DataFrame(registros)
+
+
+def detect_exceptions(df_resultado):
+    """
+    Genera automáticamente la lista de casos que requieren decisión del Supervisor:
+    1. Faltas / Marcaciones Omisas.
+    2. Horas Extras por autorizar.
+    3. Exceso de días laborados (7º día en la semana).
+    4. Desfase de Horario de Ingreso (Entrada tardía completando jornada).
+    """
+    if df_resultado is None or df_resultado.empty:
+        return pd.DataFrame()
+
+    excepciones = []
+
+    # 1. Agrupamiento semanal para detectar 7º día laborado
+    df_temp = df_resultado.copy()
+    df_temp['dt_fecha'] = pd.to_datetime(df_temp['Fecha'])
+    df_temp['Semana'] = df_temp['dt_fecha'].dt.isocalendar().week
+
+    dias_por_semana = df_temp.groupby(['ID', 'Semana'])['Fecha'].nunique().reset_index()
+    semanas_7dias = set(
+        dias_por_semana[dias_por_semana['Fecha'] >= 7].set_index(['ID', 'Semana']).index
+    )
+
+    for _, row in df_resultado.iterrows():
+        emp_id = row['ID']
+        emp_nom = row['Nombre']
+        fecha = row['Fecha']
+        dt_f = pd.to_datetime(fecha)
+        semana = dt_f.isocalendar().week
+
+        # Caso 1: Marcación omisa o falta
+        if row['Estado'] != 'OK' or row['Salida'] == 'Falta Marcación':
+            excepciones.append({
+                'ID': emp_id,
+                'Nombre': emp_nom,
+                'Fecha': fecha,
+                'Tipo Excepción': 'Falta / Omisión Marcación',
+                'Detalle Excepción': f"Entrada: {row['Entrada']} | Salida: {row['Salida']}",
+                'Valor a Revisar': '1 Falta Potencial',
+                'Decisión Supervisor': 'Pendiente',
+                'Tipo Falta': 'Injustificada',
+                'Observaciones': ''
+            })
+
+        # Caso 2: Horas Extras acumuladas
+        if row['Horas Extras'] > 0:
+            excepciones.append({
+                'ID': emp_id,
+                'Nombre': emp_nom,
+                'Fecha': fecha,
+                'Tipo Excepción': 'Horas Extras',
+                'Detalle Excepción': f"Marcación excedente: {row['Horas Extras']} hrs",
+                'Valor a Revisar': f"{row['Horas Extras']} hrs HE",
+                'Decisión Supervisor': 'Pendiente',
+                'Tipo Falta': 'N/A',
+                'Observaciones': ''
+            })
+
+        # Caso 3: 7º día trabajado en la semana
+        if (emp_id, semana) in semanas_7dias:
+            excepciones.append({
+                'ID': emp_id,
+                'Nombre': emp_nom,
+                'Fecha': fecha,
+                'Tipo Excepción': '7º Día Laborado',
+                'Detalle Excepción': f"Empleado registró asistencia los 7 días de la semana {semana}",
+                'Valor a Revisar': '1 Día Excedente',
+                'Decisión Supervisor': 'Pendiente',
+                'Tipo Falta': 'N/A',
+                'Observaciones': ''
+            })
+
+        # Caso 4: Desfase de Horario de Ingreso
+        if row.get('Desfase Ingreso', False):
+            excepciones.append({
+                'ID': emp_id,
+                'Nombre': emp_nom,
+                'Fecha': fecha,
+                'Tipo Excepción': 'Desfase Horario Ingreso',
+                'Detalle Excepción': f"Ingresó a las {row['Entrada']} (Retraso significativo) pero completó {row['Horas Trabajadas']} hrs",
+                'Valor a Revisar': f"Entrada {row['Entrada']}",
+                'Decisión Supervisor': 'Pendiente',
+                'Tipo Falta': 'N/A',
+                'Observaciones': ''
+            })
+
+    return pd.DataFrame(excepciones)
