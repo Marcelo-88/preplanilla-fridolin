@@ -11,10 +11,6 @@ st.set_page_config(
     layout="wide"
 )
 
-# Inicialización de estado de sesión para Novedades
-if 'novedades_registradas' not in st.session_state:
-    st.session_state['novedades_registradas'] = []
-
 st.title("🏭 Control de Asistencia y Reportes - Fridolin")
 
 st.sidebar.image("https://em-content.zobj.net/source/apple/354/factory_1f3ed.png", width=80)
@@ -36,7 +32,7 @@ opcion = st.sidebar.radio(
         "📊 Parámetros y Reglas",
         "👥 Maestro de Empleados",
         "⏱️ Importación Biométrico",
-        "📋 Novedades y Permisos",
+        "📝 Novedades y Permisos",
         "✅ Aprobaciones Supervisores",
         "📑 Pre-Planilla y Reportes"
     ]
@@ -45,63 +41,25 @@ opcion = st.sidebar.radio(
 st.sidebar.divider()
 st.sidebar.caption("Sistema de Control de Asistencia v1.0")
 
-# Función auxiliar para obtener Novedades Combinadas (Sheets + Sesión Actual)
-def obtener_novedades_consolidadas():
-    lista_novs = []
-    try:
-        df_nov_sheets = load_sheet_data("04_Novedades_y_Permisos")
-        if df_nov_sheets is not None and not df_nov_sheets.empty:
-            lista_novs.append(df_nov_sheets)
-    except Exception:
-        pass
-
-    if st.session_state['novedades_registradas']:
-        lista_novs.append(pd.DataFrame(st.session_state['novedades_registradas']))
-
-    if lista_novs:
-        return pd.concat(lista_novs, ignore_index=True)
-    return None
-
-# Función auxiliar para obtener Parámetros
-def cargar_parametros():
-    try:
-        return load_sheet_data("05_Parametros_y_Reglas")
-    except Exception:
-        try:
-            return load_sheet_data("00_Parametros_Reglas")
-        except Exception:
-            return None
-
 # -----------------------------------------------------------------------------
 # 1. PARÁMETROS Y REGLAS (PÚBLICO)
 # -----------------------------------------------------------------------------
 if opcion == "📊 Parámetros y Reglas":
     st.header("Parámetros y Reglas del Sistema")
     try:
-        df_params = cargar_parametros()
-        if df_params is not None and not df_params.empty:
-            cols_vis = [c for c in df_params.columns if not str(c).startswith('Unnamed')]
-            st.dataframe(df_params[cols_vis], use_container_width=True, hide_index=True)
-        else:
-            st.info("No se encontraron datos de parámetros y reglas.")
+        df_params = load_sheet_data("05_Parametros_y_Reglas")
+        st.dataframe(df_params, use_container_width=True, hide_index=True)
     except Exception as e:
         st.error(f"Error al cargar la pestaña: {e}")
 
 # -----------------------------------------------------------------------------
-# 2. MAESTRO DE EMPLEADOS (PÚBLICO - CON SEGURIDAD Y LIMPIEZA DE PIN)
+# 2. MAESTRO DE EMPLEADOS (PÚBLICO)
 # -----------------------------------------------------------------------------
 elif opcion == "👥 Maestro de Empleados":
     st.header("Maestro de Empleados")
     try:
         df_emp = load_sheet_data("01_Maestro_Empleados")
-        
-        if df_emp is not None and not df_emp.empty:
-            cols_visibles = [c for c in df_emp.columns if not str(c).startswith('Unnamed')]
-            cols_visibles = [c for c in cols_visibles if str(c).strip().upper() != 'PIN']
-            st.dataframe(df_emp[cols_visibles], use_container_width=True, hide_index=True)
-        else:
-            st.info("No hay datos disponibles en el Maestro de Empleados.")
-            
+        st.dataframe(df_emp, use_container_width=True, hide_index=True)
     except Exception as e:
         st.error(f"Error al cargar la pestaña: {e}")
 
@@ -112,102 +70,21 @@ elif opcion == "⏱️ Importación Biométrico":
     st.header("Registros del Biométrico")
     try:
         df_bio = load_sheet_data("02_Importacion_Biometrico")
-        if df_bio is not None and not df_bio.empty:
-            cols_vis = [c for c in df_bio.columns if not str(c).startswith('Unnamed')]
-            st.dataframe(df_bio[cols_vis], use_container_width=True, hide_index=True)
-        else:
-            st.info("No hay registros biométricos disponibles.")
+        st.dataframe(df_bio, use_container_width=True, hide_index=True)
     except Exception as e:
         st.error(f"Error al cargar la pestaña: {e}")
 
 # -----------------------------------------------------------------------------
-# 4. NOVEDADES Y PERMISOS (FORMULARIO INTERACTIVO Y REGLAS DE IMPACTO)
+# 4. NOVEDADES Y PERMISOS (PÚBLICO)
 # -----------------------------------------------------------------------------
-elif opcion == "📋 Novedades y Permisos":
-    st.header("Gestión de Novedades, Licencias y Permisos")
-    
-    rol_str = str(rol_actual).lower()
-    es_autorizado = any(k in rol_str for k in ['supervisor', 'jefatura', 'responsable', 'operaciones', 'admin', 'producción', 'produccion'])
-
-    if not pin_ok or not es_autorizado:
-        st.error("⛔ Acceso restringido. Solo Supervisores, Jefatura o Administradores con PIN activo pueden registrar novedades.")
-    else:
-        st.success(f"🔓 Sesión Autorizada: **{usuario_actual}** ({rol_actual})")
-        
-        try:
-            df_emp = load_sheet_data("01_Maestro_Empleados")
-        except Exception:
-            df_emp = None
-
-        if df_emp is not None and not df_emp.empty:
-            cols_map = {str(c).strip().lower(): c for c in df_emp.columns}
-            col_nom = next((cols_map[k] for k in cols_map if 'nombre' in k or 'empleado' in k), df_emp.columns[0])
-            col_sup = next((cols_map[k] for k in cols_map if 'supervisor' in k), None)
-
-            if col_sup and not any(k in rol_str for k in ['responsable', 'admin', 'operaciones']):
-                personal_lista = df_emp[df_emp[col_sup].astype(str).str.upper() == str(usuario_actual).upper()][col_nom].dropna().unique().tolist()
-                if not personal_lista:
-                    personal_lista = df_emp[col_nom].dropna().unique().tolist()
-            else:
-                personal_lista = df_emp[col_nom].dropna().unique().tolist()
-
-            with st.expander("➕ Registrar Nueva Novedad / Licencia / Maternidad", expanded=True):
-                with st.form(key="form_novedades"):
-                    col1, col2 = st.columns(2)
-                    
-                    with col1:
-                        emp_seleccionado = st.selectbox("Seleccione el Empleado:", options=sorted(personal_lista))
-                        tipo_permiso = st.selectbox(
-                            "Tipo de Novedad / Licencia:",
-                            options=[
-                                "Baja Médica",
-                                "Licencia",
-                                "Permiso",
-                                "Maternidad (Lactancia)"
-                            ]
-                        )
-                    
-                    with col2:
-                        fechas = st.date_input("Rango de Fechas (Desde - Hasta):", value=[pd.to_datetime("today"), pd.to_datetime("today")])
-                        
-                        if isinstance(fechas, (list, tuple)) and len(fechas) == 2:
-                            fecha_ini, fecha_fin = fechas[0], fechas[1]
-                            duracion_dias = (fecha_fin - fecha_ini).days + 1
-                        else:
-                            fecha_ini = fechas[0] if isinstance(fechas, (list, tuple)) else fechas
-                            fecha_fin = fecha_ini
-                            duracion_dias = 1
-                            
-                        st.info(f"📅 Duración total: **{duracion_dias} día(s)**")
-
-                    if tipo_permiso == "Maternidad (Lactancia)":
-                        st.caption("ℹ️ **Impacto:** Reduce la jornada laboral a 7 horas/día. Exenta de atrasos y salidas tempranas.")
-                    else:
-                        st.caption("ℹ️ **Impacto:** Durante el rango seleccionado los días **NO se tomarán como FALTA ni Atraso**.")
-
-                    btn_guardar = st.form_submit_button("💾 Registrar y Aplicar Novedad")
-
-                    if btn_guardar:
-                        nueva_novedad = {
-                            "ID_Novedad": f"NOV-{len(st.session_state['novedades_registradas']) + 1:03d}",
-                            "Empleado": emp_seleccionado,
-                            "Tipo_Novedad": tipo_permiso,
-                            "Fecha_Inicio": str(fecha_ini),
-                            "Fecha_Fin": str(fecha_fin),
-                            "Duracion_Dias": duracion_dias,
-                            "Registrado_Por": usuario_actual
-                        }
-                        
-                        st.session_state['novedades_registradas'].append(nueva_novedad)
-                        st.success(f"✅ Novedad registrada exitosamente para {emp_seleccionado} del {fecha_ini} al {fecha_fin}.")
-
-        st.subheader("📋 Registro de Novedades Vigentes")
-        df_mostrar = obtener_novedades_consolidadas()
-        if df_mostrar is not None and not df_mostrar.empty:
-            cols_vis = [c for c in df_mostrar.columns if not str(c).startswith('Unnamed')]
-            st.dataframe(df_mostrar[cols_vis], use_container_width=True, hide_index=True)
-        else:
-            st.info("No hay novedades registradas hasta la fecha.")
+elif opcion == "📝 Novedades y Permisos":
+    st.header("Novedades, Licencias y Permisos Especiales")
+    st.info("💡 Incluye licencias legales, vacaciones y regla especial de Permiso de Lactancia Maternidad.")
+    try:
+        df_nov = load_sheet_data("04_Novedades_y_Permisos")
+        st.dataframe(df_nov, use_container_width=True, hide_index=True)
+    except Exception as e:
+        st.error(f"Error al cargar la pestaña: {e}")
 
 # -----------------------------------------------------------------------------
 # 5. APROBACIONES SUPERVISORES (🔒 CONTROLADO POR PIN Y SUPERVISOR)
@@ -215,10 +92,12 @@ elif opcion == "📋 Novedades y Permisos":
 elif opcion == "✅ Aprobaciones Supervisores":
     st.header("✅ Centro de Aprobaciones y Excepciones")
 
+    # VALIDACIÓN DE PIN EXCLUSIVA PARA ESTA PESTAÑA
     if not pin_ok:
         st.warning("🔒 Ingrese su PIN de 4 dígitos en la barra lateral para desbloquear el módulo de Aprobaciones.")
         st.stop()
 
+    # CONTROL DE ESTADO DE REVISIÓN
     if 'estado_revision' not in st.session_state:
         st.session_state['estado_revision'] = 'Pendiente / En Proceso'
 
@@ -244,25 +123,28 @@ elif opcion == "✅ Aprobaciones Supervisores":
 
     try:
         df_bio = load_sheet_data("02_Importacion_Biometrico")
-        df_params = cargar_parametros()
+        df_params = load_sheet_data("05_Parametros_y_Reglas")
         try:
             df_emp = load_sheet_data("01_Maestro_Empleados")
         except Exception:
             df_emp = None
-        
-        df_nov = obtener_novedades_consolidadas()
+        try:
+            df_nov = load_sheet_data("04_Novedades_y_Permisos")
+        except Exception:
+            df_nov = None
 
         df_res = process_attendance(df_bio, df_params, df_nov, df_emp)
         df_excepciones = detect_exceptions(df_res)
         df_canje_resumen = get_canje_summary(df_res)
 
+        # FILTRADO EXCLUSIVO POR SUPERVISOR A CARGO
         df_excepciones = filter_dataframe_by_supervisor(df_excepciones, 'Nombre', empleados_permitidos, rol_actual)
         df_canje_resumen = filter_dataframe_by_supervisor(df_canje_resumen, 'Nombre', empleados_permitidos, rol_actual)
 
     except Exception as e:
         df_excepciones = pd.DataFrame()
         df_canje_resumen = pd.DataFrame()
-        st.warning(f"No se pudieron procesar las excepciones biométricas: {e}")
+        st.warning(f"No se pudieron cargar los datos biométricos: {e}")
 
     # TAB 1: EXCEPCIONES AUTOMÁTICAS
     with tab_excepciones:
@@ -402,13 +284,9 @@ elif opcion == "📑 Pre-Planilla y Reportes":
     with st.spinner("Procesando marcaciones, novedades y tiempos..."):
         try:
             df_bio = load_sheet_data("02_Importacion_Biometrico")
-            df_params = cargar_parametros()
-            try:
-                df_emp = load_sheet_data("01_Maestro_Empleados")
-            except Exception:
-                df_emp = None
-                
-            df_nov = obtener_novedades_consolidadas()
+            df_params = load_sheet_data("05_Parametros_y_Reglas")
+            df_emp = load_sheet_data("01_Maestro_Empleados")
+            df_nov = load_sheet_data("04_Novedades_y_Permisos")
                 
             df_resultado = process_attendance(df_bio, df_params, df_nov, df_emp)
 
@@ -420,7 +298,7 @@ elif opcion == "📑 Pre-Planilla y Reportes":
                     emp_sel = st.selectbox("Filtrar por Empleado:", empleados)
                 
                 with col_filtro2:
-                    turnos = ["Todos", "Diurno", "Nocturno", "General"]
+                    turnos = ["Todos", "Diurno", "Nocturno"]
                     turno_sel = st.selectbox("Filtrar por Turno:", turnos)
                 
                 df_filtrado = df_resultado.copy()
