@@ -81,7 +81,7 @@ class NovedadesManager:
             cursor = conn.cursor()
             row = cursor.execute("""
                 SELECT * FROM novedades 
-                WHERE (empleado_id = ? OR empleado_nombre = ?) AND ? BETWEEN fecha_inicio AND fecha_fin
+                WHERE (LOWER(TRIM(empleado_id)) = LOWER(TRIM(?)) OR LOWER(TRIM(empleado_nombre)) = LOWER(TRIM(?))) AND ? BETWEEN fecha_inicio AND fecha_fin
             """, (empleado_id, empleado_id, fecha_str)).fetchone()
             if row:
                 return dict(row)
