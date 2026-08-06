@@ -1,474 +1,205 @@
 import streamlit as st
 import pandas as pd
-import io
-from datetime import datetime
 
-from modules.data_loader import load_sheet_data
-from modules.attendance_processor import process_attendance, detect_exceptions, get_canje_summary
-from modules.auth_permissions import render_user_selector, filter_dataframe_by_supervisor
-from modules.audit_logger import AuditLogger
-from modules.lock_manager import LockManager
-from modules.novedades import NovedadesManager
-from modules.excel_exporter import ExcelExporter
+# Módulos del Sistema
+from modules.data_loader import load_google_sheet_data
+from modules.auth_permissions import verify_pin, filter_dataframe_by_supervisor
+from modules.attendance_processor import process_attendance
+from modules.novedades import init_novedades_db, add_novedad, get_novedades, delete_novedad
+from modules.lock_manager import init_lock_db, get_period_status, set_period_status
+from modules.excel_exporter import export_preplanilla_excel
+from modules.audit_logger import init_audit_db, log_action
 
-# Inicialización de Gestores Persistence/DB
-@st.cache_resource
-def get_managers():
-    audit = AuditLogger()
-    lock = LockManager()
-    nov = NovedadesManager()
-    return audit, lock, nov
-
-audit_log, lock_mgr, nov_mgr = get_managers()
-
+# Configuración Inicial de Página
 st.set_page_config(
-    page_title="Pre-Planilla Fridolin",
-    page_icon="🏭",
+    page_title="Control de Tiempos - Fridolin",
+    page_icon="⏱️",
     layout="wide"
 )
 
-st.title("🏭 Control de Asistencia y Reportes - Fridolin")
+# Inicializar Base de Datos SQLite locales
+init_novedades_db()
+init_lock_db()
+init_audit_db()
 
-st.sidebar.image("https://em-content.zobj.net/source/apple/354/factory_1f3ed.png", width=80)
-st.sidebar.title("Menú Principal")
+# Título Principal
+st.title("Planilla de Control de Tiempos")
 
-# Cargar Maestro de Empleados para autenticación y PIN
-try:
-    df_emp_master = load_sheet_data("01_Maestro_Empleados")
-    usuario_actual, rol_actual, empleados_permitidos, pin_ok = render_user_selector(df_emp_master)
-except Exception as e:
-    usuario_actual, rol_actual, empleados_permitidos, pin_ok = "Invitado", "Jefe de Producción", [], True
-    st.sidebar.error(f"Error cargando credenciales: {e}")
+# --- SIDEBAR DE AUTENTICACIÓN Y NAVEGACIÓN ---
+st.sidebar.header("Credenciales de Supervisor")
 
-st.sidebar.divider()
+# Carga de Supervisores desde Google Sheets
+@st.cache_data(ttl=300)
+def fetch_supervisores():
+    return load_google_sheet_data("Supervisores")
 
-opcion = st.sidebar.radio(
+df_supervisores = fetch_supervisores()
+
+supervisor_nombre = None
+rol_supervisor = None
+
+if not df_supervisores.empty and 'Nombre' in df_supervisores.columns:
+    lista_supervisores = df_supervisores['Nombre'].dropna().tolist()
+    supervisor_nombre = st.sidebar.selectbox("Seleccione su Nombre:", options=lista_supervisores)
+    
+    pin_ingresado = st.sidebar.text_input("Ingrese su PIN (4 dígitos):", type="password")
+    
+    if pin_ingresado:
+        es_valido, rol = verify_pin(supervisor_nombre, pin_ingresado, df_supervisores)
+        if es_valido:
+            st.sidebar.success("🔑 PIN Correcto")
+            st.sidebar.info(f"👑 Rol: {rol}")
+            rol_supervisor = rol
+        else:
+            st.sidebar.error("❌ PIN Incorrecto")
+            st.stop()
+    else:
+        st.info("Por favor ingrese su PIN de acceso para continuar.")
+        st.stop()
+else:
+    st.error("No se pudo cargar la lista de supervisores desde Google Sheets.")
+    st.stop()
+
+# Menú de Navegación entre Vistas
+st.sidebar.markdown("---")
+vista_seleccionada = st.sidebar.radio(
     "Seleccione una vista:",
     [
         "📊 Parámetros y Reglas",
-        "👥 Maestro de Empleados",
-        "⏱️ Importación Biométrico",
+        "👤 Maestro de Empleados",
+        "⏰ Importación Biométrico",
         "📝 Novedades y Permisos",
         "✅ Aprobaciones Supervisores",
         "📑 Pre-Planilla y Reportes"
     ]
 )
 
-st.sidebar.divider()
-st.sidebar.caption("Sistema de Control de Asistencia v2.0")
+# --- CARGA GENERAL DE DATOS BASE ---
+@st.cache_data(ttl=180)
+def fetch_all_base_data():
+    emp = load_google_sheet_data("Empleados")
+    bio = load_google_sheet_data("Biometrico")
+    return emp, bio
 
-# -----------------------------------------------------------------------------
-# 1. PARÁMETROS Y REGLAS (PÚBLICO)
-# -----------------------------------------------------------------------------
-if opcion == "📊 Parámetros y Reglas":
-    st.header("Parámetros y Reglas del Sistema")
-    try:
-        df_params = load_sheet_data("05_Parametros_y_Reglas")
-        st.dataframe(df_params, use_container_width=True, hide_index=True)
-    except Exception as e:
-        st.error(f"Error al cargar la pestaña: {e}")
+df_empleados, df_biometrico = fetch_all_base_data()
 
-# -----------------------------------------------------------------------------
-# 2. MAESTRO DE EMPLEADOS (OCULTAMIENTO DE PIN)
-# -----------------------------------------------------------------------------
-elif opcion == "👥 Maestro de Empleados":
-    st.header("Maestro de Empleados")
-    try:
-        df_emp = load_sheet_data("01_Maestro_Empleados")
-        
-        # Ocultar columna PIN para proteger credenciales sensibles
-        cols_sin_pin = [col for col in df_emp.columns if col.strip().upper() != "PIN"]
-        df_emp_vista = df_emp[cols_sin_pin]
-        
-        st.dataframe(df_emp_vista, use_container_width=True, hide_index=True)
-    except Exception as e:
-        st.error(f"Error al cargar la pestaña: {e}")
+# Filtrar datos de empleados por asignación del supervisor actual
+df_emp_filtrado = filter_dataframe_by_supervisor(df_empleados, supervisor_nombre, rol_supervisor)
 
-# -----------------------------------------------------------------------------
-# 3. IMPORTACIÓN BIOMÉTRICO (PÚBLICO)
-# -----------------------------------------------------------------------------
-elif opcion == "⏱️ Importación Biométrico":
-    st.header("Registros del Biométrico")
-    try:
-        df_bio = load_sheet_data("02_Importacion_Biometrico")
-        st.dataframe(df_bio, use_container_width=True, hide_index=True)
-    except Exception as e:
-        st.error(f"Error al cargar la pestaña: {e}")
+# Carga de Novedades desde SQLite
+df_novedades = get_novedades()
 
-# -----------------------------------------------------------------------------
-# 4. NOVEDADES Y PERMISOS (INTERACTIVO Y RESTRINGIDO POR PIN)
-# -----------------------------------------------------------------------------
-elif opcion == "📝 Novedades y Permisos":
-    st.header("Novedades, Licencias y Permisos Especiales")
-    st.info("💡 Incluye licencias legales, bajas médicas, vacaciones y Reducción de Lactancia Maternidad (-1 hora diaria).")
+# --- PROCESAMIENTO DINÁMICO DE ASISTENCIA ---
+df_procesado, df_excepciones, df_resumen = process_attendance(
+    df_biometrico,
+    df_emp_filtrado,
+    df_novedades
+)
 
-    tab_ver_nov, tab_crear_nov = st.tabs(["📋 Novedades Registradas", "➕ Registrar Nueva Novedad"])
+# --- RENDERING DE VISTAS ---
 
-    with tab_ver_nov:
-        # Cargar novedades combinando Google Sheets y base de datos local sqlite
-        try:
-            df_nov_sheet = load_sheet_data("04_Novedades_y_Permisos")
-        except Exception:
-            df_nov_sheet = pd.DataFrame()
+# 1. PARÁMETROS Y REGLAS
+if vista_seleccionada == "📊 Parámetros y Reglas":
+    st.subheader("Parámetros y Reglas del Sistema")
+    st.write("Configuración activa de tolerancias, turnos y reglas de cálculo de horas extra.")
+    col1, col2, col3 = st.columns(3)
+    col1.metric("Tolerancia Atraso", "15 Mins")
+    col2.metric("Jornada Estándar", "8 Horas")
+    col3.metric("Días Laborales / Semana", "6 Días")
 
-        df_nov_local = pd.DataFrame(nov_mgr.obtener_todas_novedades())
-        
-        if not df_nov_local.empty and not df_nov_sheet.empty:
-            df_nov_comb = pd.concat([df_nov_sheet, df_nov_local], ignore_index=True)
-        elif not df_nov_local.empty:
-            df_nov_comb = df_nov_local
-        else:
-            df_nov_comb = df_nov_sheet
+# 2. MAESTRO DE EMPLEADOS
+elif vista_seleccionada == "👤 Maestro de Empleados":
+    st.subheader("Maestro de Empleados Asignados")
+    st.dataframe(df_emp_filtrado, use_container_width=True)
 
-        st.dataframe(df_nov_comb, use_container_width=True, hide_index=True)
+# 3. IMPORTACIÓN BIOMÉTRICO
+elif vista_seleccionada == "⏰ Importación Biométrico":
+    st.subheader("Registros Crudos del Biométrico")
+    st.dataframe(df_biometrico, use_container_width=True)
 
-    with tab_crear_nov:
-        if not pin_ok:
-            st.warning("🔒 Requiere ingresar su PIN de Supervisor en la barra lateral para registrar novedades.")
-        else:
-            st.subheader("Formulario de Registro de Novedad / Licencia")
-            with st.form("form_nueva_novedad"):
-                try:
-                    df_emp = load_sheet_data("01_Maestro_Empleados")
-                    # Normalizar nombres de columnas eliminando espacios
-                    df_emp.columns = [str(col).strip() for col in df_emp.columns]
-                    
-                    # Detectar columna con nombres de empleados
-                    col_nombre = 'Nombre_Completo' if 'Nombre_Completo' in df_emp.columns else ('Nombre' if 'Nombre' in df_emp.columns else None)
-                    
-                    if col_nombre:
-                        df_emp_fil = filter_dataframe_by_supervisor(df_emp, col_nombre, empleados_permitidos, rol_actual)
-                        lista_emps = df_emp_fil[col_nombre].dropna().unique().tolist()
-                    else:
-                        lista_emps = []
-                except Exception as e:
-                    lista_emps = []
-
-                emp_seleccionado = st.selectbox("Seleccione Empleado:*", options=sorted(lista_emps))
-                tipo_nov = st.selectbox("Tipo de Novedad / Licencia:*", options=nov_mgr.TIPOS_NOVEDAD)
-                
-                col_f1, col_f2 = st.columns(2)
-                with col_f1:
-                    fecha_ini = st.date_input("Fecha Inicio:*")
-                with col_f2:
-                    fecha_fin = st.date_input("Fecha Fin:*")
-                
-                justificacion_txt = st.text_area("Justificación / Certificado Médico / Observaciones:*")
-
-                sub_nov = st.form_submit_button("✅ Guardar Novedad")
-                if sub_nov:
-                    if not emp_seleccionado or not justificacion_txt:
-                        st.error("Debe completar todos los campos obligatorios.")
-                    else:
-                        # Extraer ID o Carnet del empleado
-                        emp_id = "EMP-000"
-                        if col_nombre and col_nombre in df_emp.columns:
-                            row_e = df_emp[df_emp[col_nombre] == emp_seleccionado]
-                            if not row_e.empty:
-                                col_id = 'Carnet_Identidad' if 'Carnet_Identidad' in df_emp.columns else ('ID' if 'ID' in df_emp.columns else None)
-                                if col_id:
-                                    emp_id = str(row_e[col_id].values[0])
-
-                        res_reg = nov_mgr.registrar_novedad(
-                            empleado_id=emp_id,
-                            empleado_nombre=emp_seleccionado,
-                            tipo_novedad=tipo_nov,
-                            fecha_inicio=fecha_ini.strftime("%Y-%m-%d"),
-                            fecha_fin=fecha_fin.strftime("%Y-%m-%d"),
-                            justificacion=justificacion_txt,
-                            registrado_por_pin=usuario_actual
-                        )
-
-                        if res_reg["exito"]:
-                            audit_log.registrar_evento(
-                                usuario_pin=usuario_actual,
-                                usuario_nombre=usuario_actual,
-                                accion="REGISTRO_NOVEDAD",
-                                modulo="Novedades",
-                                detalles={"empleado": emp_seleccionado, "tipo": tipo_nov, "inicio": str(fecha_ini), "fin": str(fecha_fin)}
-                            )
-                            st.success(res_reg["mensaje"])
-                            st.rerun()
-                        else:
-                            st.error(res_reg["mensaje"])
-
-# -----------------------------------------------------------------------------
-# 5. APROBACIONES SUPERVISORES (🔒 CONTROL POR PIN, FILTRO MULTI-MES Y LOCK MANAGER)
-# -----------------------------------------------------------------------------
-elif opcion == "✅ Aprobaciones Supervisores":
-    st.header("✅ Centro de Aprobaciones y Excepciones")
-
-    if not pin_ok:
-        st.warning("🔒 Ingrese su PIN de 4 dígitos en la barra lateral para desbloquear el módulo de Aprobaciones.")
-        st.stop()
-
-    # Cargar datos para selector de períodos
-    try:
-        df_bio = load_sheet_data("02_Importacion_Biometrico")
-        df_bio['dt_temp'] = pd.to_datetime(df_bio.iloc[:, 2], dayfirst=True, errors='coerce')
-        periodos_disponibles = sorted(df_bio['dt_temp'].dt.strftime('%Y-%m').dropna().unique().tolist(), reverse=True)
-    except Exception:
-        periodos_disponibles = [datetime.now().strftime('%Y-%m')]
-
-    col_p1, col_p2 = st.columns([2, 2])
-    with col_p1:
-        periodo_sel = st.selectbox("🗓️ Seleccionar Período de Revisión:", options=periodos_disponibles)
-
-    # Evaluación de estado del período con LockManager
-    estado_periodo = lock_mgr.obtener_estado_periodo(periodo_sel)
-    es_editable = lock_mgr.es_editable(periodo_sel, rol_actual)
-
-    with col_p2:
-        st.subheader(f"Estado Período: **{estado_periodo}**")
-        if estado_periodo == "FINALIZADO" and not es_editable:
-            st.error("🔒 Este período está CERRADO. Solo el Responsable de Operaciones puede desbloquearlo.")
-
-    # Botones de gobernanza de estados
-    col_rev1, col_rev2, col_rev3 = st.columns(3)
-    with col_rev1:
-        if st.button("▶️ Marcar EN PROCESO"):
-            res_c = lock_mgr.cambiar_estado(periodo_sel, lock_mgr.ESTADO_EN_PROCESO, usuario_actual, rol_actual)
-            if res_c["exito"]:
-                audit_log.registrar_evento(usuario_actual, usuario_actual, "CAMBIO_ESTADO_PERIODO", "Aprobaciones", {"periodo": periodo_sel, "nuevo_estado": "EN_PROCESO"})
-                st.success(res_c["mensaje"])
-                st.rerun()
-            else:
-                st.error(res_c["mensaje"])
-
-    with col_rev2:
-        if st.button("🔒 FINALIZAR y Cerrar Período"):
-            res_c = lock_mgr.cambiar_estado(periodo_sel, lock_mgr.ESTADO_FINALIZADO, usuario_actual, rol_actual)
-            if res_c["exito"]:
-                audit_log.registrar_evento(usuario_actual, usuario_actual, "CAMBIO_ESTADO_PERIODO", "Aprobaciones", {"periodo": periodo_sel, "nuevo_estado": "FINALIZADO"})
-                st.success(res_c["mensaje"])
-                st.rerun()
-            else:
-                st.error(res_c["mensaje"])
-
-    with col_rev3:
-        if estado_periodo == "FINALIZADO" and (rol_actual == "Jefe de Producción"):
-            if st.button("🔓 Desbloquear Período (Superusuario)"):
-                res_c = lock_mgr.cambiar_estado(periodo_sel, lock_mgr.ESTADO_PENDIENTE, usuario_actual, rol_actual, motivo="Desbloqueo por Jefatura")
-                if res_c["exito"]:
-                    audit_log.registrar_evento(usuario_actual, usuario_actual, "DESBLOQUEO_PERIODO", "Aprobaciones", {"periodo": periodo_sel})
-                    st.success(res_c["mensaje"])
-                    st.rerun()
-
-    st.divider()
-
-    tab_excepciones, tab_canje_masivo, tab_regularizar = st.tabs([
-        "🚨 Excepciones Automáticas", 
-        "⚖️ Canje Masivo (Bolsa HE x Faltas)", 
-        "➕ Regularizar Olvido Marcación"
-    ])
-
-    try:
-        df_params = load_sheet_data("05_Parametros_y_Reglas")
-        try:
-            df_emp = load_sheet_data("01_Maestro_Empleados")
-        except Exception:
-            df_emp = None
-
-        # Filtrar biométrico por el período seleccionado YYYY-MM
-        df_bio_periodo = df_bio[df_bio['dt_temp'].dt.strftime('%Y-%m') == periodo_sel].copy() if 'dt_temp' in df_bio.columns else df_bio
-
-        df_res = process_attendance(df_bio_periodo, df_params, None, df_emp, nov_mgr)
-        df_excepciones = detect_exceptions(df_res)
-        df_canje_resumen = get_canje_summary(df_res)
-
-        # FILTRADO EXCLUSIVO POR SUPERVISOR A CARGO
-        df_excepciones = filter_dataframe_by_supervisor(df_excepciones, 'Nombre', empleados_permitidos, rol_actual)
-        df_canje_resumen = filter_dataframe_by_supervisor(df_canje_resumen, 'Nombre', empleados_permitidos, rol_actual)
-
-    except Exception as e:
-        df_excepciones = pd.DataFrame()
-        df_canje_resumen = pd.DataFrame()
-        st.warning(f"No se pudieron procesar las excepciones para el período {periodo_sel}: {e}")
-
-    # TAB 1: EXCEPCIONES AUTOMÁTICAS
-    with tab_excepciones:
-        if df_excepciones is not None and not df_excepciones.empty:
-            st.subheader(f"Excepciones Detectadas ({periodo_sel})")
-
-            col_f1, col_f2 = st.columns(2)
-            with col_f1:
-                tipo_exc = ["Todos"] + list(df_excepciones['Tipo Excepción'].unique())
-                sel_tipo = st.selectbox("Filtrar por Tipo de Excepción:", tipo_exc)
-            with col_f2:
-                emps = ["Todos"] + list(df_excepciones['Nombre'].unique())
-                sel_emp_exc = st.selectbox("Filtrar por Empleado:", emps)
-
-            df_fil_exc = df_excepciones.copy()
-            if sel_tipo != "Todos":
-                df_fil_exc = df_fil_exc[df_fil_exc['Tipo Excepción'] == sel_tipo]
-            if sel_emp_exc != "Todos":
-                df_fil_exc = df_fil_exc[df_fil_exc['Nombre'] == sel_emp_exc]
-
-            m1, m2, m3, m4 = st.columns(4)
-            m1.metric("Excepciones Totales", len(df_fil_exc))
-            m2.metric("Faltas Totales", len(df_fil_exc[df_fil_exc['Tipo Excepción'] == 'Falta / Omisión Marcación']))
-            m3.metric("Sol. Horas Extras", len(df_fil_exc[df_fil_exc['Tipo Excepción'] == 'Horas Extras']))
-            m4.metric("Desfases Ingreso", len(df_fil_exc[df_fil_exc['Tipo Excepción'] == 'Desfase Horario Ingreso']))
-
-            df_edited_exc = st.data_editor(
-                df_fil_exc,
-                use_container_width=True,
-                hide_index=True,
-                disabled=["ID", "Nombre", "Fecha", "Tipo Excepción", "Detalle Excepción", "Valor a Revisar"] if not es_editable else [],
-                column_config={
-                    "Decisión Supervisor": st.column_config.SelectboxColumn(
-                        "Decisión",
-                        options=["Pendiente", "Aprobado (Pago)", "Acumular (Próx. Mes)", "Rechazado", "Justificado", "Canjeado"],
-                        required=True
-                    ),
-                    "Tipo Falta": st.column_config.SelectboxColumn(
-                        "Tipo Falta (Para Contabilidad)",
-                        options=["N/A", "Justificada", "Injustificada"],
-                        required=True
-                    ),
-                    "Observaciones": st.column_config.TextColumn("Observaciones / Motivo", width="medium")
-                }
-            )
-
-            st.divider()
-            st.subheader("📥 Exportación Profesional a Excel")
-            
-            # Exportación estructurada mediante OpenPyXL
-            archivo_path = f"Aprobaciones_{periodo_sel}.xlsx"
-            ExcelExporter.exportar_aprobaciones(df_edited_exc.to_dict('records'), periodo_sel, archivo_path)
-            
-            with open(archivo_path, "rb") as f:
-                st.download_button(
-                    label="📥 Descargar Aprobaciones Procesadas (Excel)",
-                    data=f,
-                    file_name=f"Aprobaciones_Supervisores_{periodo_sel}.xlsx",
-                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-                )
-        else:
-            st.success("🎉 No se detectaron excepciones pendientes para el personal asignado en este período.")
-
-    # TAB 2: CANJE MASIVO
-    with tab_canje_masivo:
-        st.subheader("⚖️ Canje Masivo de Horas Extras por Faltas")
-        if df_canje_resumen is not None and not df_canje_resumen.empty:
-            df_edited_canje = st.data_editor(
-                df_canje_resumen,
-                use_container_width=True,
-                hide_index=True,
-                disabled=[] if es_editable else ["Días a Canjear (Aplicar)", "Estado Canje"],
-                column_config={
-                    "ID": st.column_config.Column(disabled=True),
-                    "Nombre": st.column_config.Column(disabled=True),
-                    "Turno Dominante": st.column_config.Column(disabled=True),
-                    "Horas Costo por Día": st.column_config.NumberColumn("Costo Día (hrs)", disabled=True, format="%.0f hrs"),
-                    "Bolsa HE Acumulada (hrs)": st.column_config.NumberColumn("Bolsa HE (hrs)", disabled=True, format="%.2f hrs"),
-                    "Días Máx. Canjeables": st.column_config.NumberColumn("Días Máx.", disabled=True, format="%d días"),
-                    "Faltas Registradas": st.column_config.NumberColumn("Faltas Reg.", disabled=True, format="%d días"),
-                    "Días a Canjear (Aplicar)": st.column_config.NumberColumn("Días a Canjear", min_value=0, max_value=10, step=1),
-                    "Estado Canje": st.column_config.SelectboxColumn("Estado Canje", options=["Sin Aplicar", "Canje Aplicado", "Rechazado por Supervisor"], required=True)
-                }
-            )
-
-            dias_totales_canjeados = df_edited_canje['Días a Canjear (Aplicar)'].sum()
-            c_m1, c_m2 = st.columns(2)
-            c_m1.metric("Personal con Bolsa HE / Faltas", len(df_edited_canje))
-            c_m2.metric("Total Días Canjeados", f"{int(dias_totales_canjeados)} días")
-        else:
-            st.info("No hay empleados a su cargo con saldo de horas extras o faltas en este período.")
-
-    # TAB 3: REGULARIZACIÓN MANUAL
-    with tab_regularizar:
-        st.subheader("Regularizar Marcación Faltante u Olvido")
-        with st.form("form_regularizacion_panel"):
-            r_col1, r_col2 = st.columns(2)
-            with r_col1:
-                id_emp_reg = st.text_input("ID / Carnet Empleado:*")
-                nombre_emp_reg = st.text_input("Nombre Completo Empleado:*")
-                fecha_reg = st.date_input("Fecha de la Marcación Omisa:")
-            with r_col2:
-                tipo_marcacion = st.selectbox("Tipo de Marcación Faltante:", ["Entrada Omisa", "Salida Omisa", "Jornada Completa Omisa"])
-                hora_reg = st.time_input("Hora Aprobada de Marcación:")
-                motivo_reg = st.text_area("Motivo / Justificación del Supervisor:*")
-
-            submitted = st.form_submit_button("✅ Registrar Regularización")
-            if submitted:
-                if not id_emp_reg or not nombre_emp_reg or not motivo_reg:
-                    st.warning("Por favor complete todos los campos obligatorios (*).")
-                elif not es_editable:
-                    st.error("No se pueden registrar regularizaciones en un período CERRADO.")
-                else:
-                    audit_log.registrar_evento(
-                        usuario_pin=usuario_actual,
-                        usuario_nombre=usuario_actual,
-                        accion="REGULARIZACION_OMISION",
-                        modulo="Aprobaciones",
-                        detalles={"empleado": nombre_emp_reg, "fecha": str(fecha_reg), "tipo": tipo_marcacion, "motivo": motivo_reg}
-                    )
-                    st.success(f"Regularización registrada para {nombre_emp_reg} el día {fecha_reg}.")
-
-# -----------------------------------------------------------------------------
-# 6. PRE-PLANILLA Y REPORTES (PÚBLICO)
-# -----------------------------------------------------------------------------
-elif opcion == "📑 Pre-Planilla y Reportes":
-    st.header("Reporte Consolidado de Asistencia para RRHH / Contabilidad")
+# 4. NOVEDADES Y PERMISOS
+elif vista_seleccionada == "📝 Novedades y Permisos":
+    st.subheader("Gestión de Novedades, Licencias y Permisos")
     
-    with st.spinner("Procesando marcaciones, novedades y tiempos..."):
-        try:
-            df_bio = load_sheet_data("02_Importacion_Biometrico")
-            df_params = load_sheet_data("05_Parametros_y_Reglas")
-            df_emp = load_sheet_data("01_Maestro_Empleados")
-                
-            # Extraer períodos
-            df_bio['dt_temp'] = pd.to_datetime(df_bio.iloc[:, 2], dayfirst=True, errors='coerce')
-            periodos_rep = sorted(df_bio['dt_temp'].dt.strftime('%Y-%m').dropna().unique().tolist(), reverse=True)
-            
-            p_sel_rep = st.selectbox("🗓️ Filtrar Período de Reporte:", options=["Todos"] + periodos_rep)
+    st.markdown("### Registrar Nueva Novedad")
+    with st.form("form_novedad", clear_on_submit=True):
+        col_emp, col_tipo = st.columns(2)
+        
+        emp_options = df_emp_filtrado['Nombre'].tolist() if 'Nombre' in df_emp_filtrado.columns else []
+        emp_sel = col_emp.selectbox("Empleado:", options=emp_options)
+        tipo_nov = col_tipo.selectbox("Tipo de Novedad:", ["Permiso", "Licencia Médica", "Vacación", "Lactancia", "Suspensión"])
+        
+        col_f1, col_f2 = st.columns(2)
+        f_inicio = col_f1.date_input("Fecha Inicio:")
+        f_fin = col_f2.date_input("Fecha Fin:")
+        obs = st.text_input("Observación / Justificación:")
+        
+        btn_guardar = st.form_submit_button("Guardar Novedad")
+        
+        if btn_guardar:
+            # Buscar ID del empleado seleccionado
+            emp_id_found = ""
+            if 'ID' in df_emp_filtrado.columns:
+                match = df_emp_filtrado[df_emp_filtrado['Nombre'] == emp_sel]
+                if not match.empty:
+                    emp_id_found = str(match['ID'].iloc[0])
 
-            if p_sel_rep != "Todos":
-                df_bio_rep = df_bio[df_bio['dt_temp'].dt.strftime('%Y-%m') == p_sel_rep].copy()
-            else:
-                df_bio_rep = df_bio
+            add_novedad(emp_id_found, emp_sel, tipo_nov, str(f_inicio), str(f_fin), obs, supervisor_nombre)
+            log_action(supervisor_nombre, "REGISTRO_NOVEDAD", f"Novedad {tipo_nov} para {emp_sel} ({f_inicio} a {f_fin})")
+            st.success("✅ Novedad registrada con éxito. Se actualizarán las excepciones automáticamente.")
+            st.rerun()
 
-            df_resultado = process_attendance(df_bio_rep, df_params, None, df_emp, nov_mgr)
+    st.markdown("---")
+    st.markdown("### Histórico de Novedades Registradas")
+    if not df_novedades.empty:
+        st.dataframe(df_novedades, use_container_width=True)
+    else:
+        st.info("No hay novedades registradas en el sistema.")
 
-            if df_resultado is not None and not df_resultado.empty:
-                col_filtro1, col_filtro2 = st.columns(2)
-                
-                with col_filtro1:
-                    empleados = ["Todos"] + list(df_resultado['Nombre'].unique())
-                    emp_sel = st.selectbox("Filtrar por Empleado:", empleados)
-                
-                with col_filtro2:
-                    turnos = ["Todos", "Diurno", "Nocturno"]
-                    turno_sel = st.selectbox("Filtrar por Turno:", turnos)
-                
-                df_filtrado = df_resultado.copy()
-                if emp_sel != "Todos":
-                    df_filtrado = df_filtrado[df_filtrado['Nombre'] == emp_sel]
-                if turno_sel != "Todos":
-                    df_filtrado = df_filtrado[df_filtrado['Turno Dominante'] == turno_sel]
-                
-                st.subheader("Planilla de Control de Tiempos")
-                st.dataframe(df_filtrado, use_container_width=True, hide_index=True)
-                
-                c1, c2, c3, c4, c5, c6, c7 = st.columns(7)
-                c1.metric("Registros", len(df_filtrado))
-                c2.metric("Horas Trabajadas", f"{df_filtrado['Horas Trabajadas'].sum():.2f} hrs")
-                c3.metric("Total Atrasos", f"{df_filtrado['Atraso (Minutos)'].sum()} min")
-                c4.metric("Horas Extras", f"{df_filtrado['Horas Extras'].sum():.2f} hrs")
-                c5.metric("Faltas Justif.", int(df_filtrado['Falta Justificada'].sum()))
-                c6.metric("Faltas Injustif.", int(df_filtrado['Falta Injustificada'].sum()))
-                c7.metric("Turnos Comp.", f"{df_filtrado['Turnos Computados'].sum():.1f}")
-                
-                archivo_rep = f"PrePlanilla_{p_sel_rep}.xlsx"
-                ExcelExporter.exportar_preplanilla(df_filtrado.to_dict('records'), p_sel_rep, archivo_rep)
+# 5. APROBACIONES SUPERVISORES (EXCEPCIONES)
+elif vista_seleccionada == "✅ Aprobaciones Supervisores":
+    st.subheader("Módulo de Aprobaciones y Control de Excepciones")
+    
+    if not df_excepciones.empty:
+        st.warning(f"Se han detectado {len(df_excepciones)} excepciones pendientes de revisión.")
+        st.dataframe(df_excepciones, use_container_width=True)
+    else:
+        st.success("🎉 No existen excepciones o faltas pendientes de revisión para sus empleados asignados.")
 
-                with open(archivo_rep, "rb") as f:
-                    st.download_button(
-                        label="📥 Descargar Reporte Consolidado (Excel)",
-                        data=f,
-                        file_name=f"Reporte_PrePlanilla_Fridolin_{p_sel_rep}.xlsx",
-                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-                    )
-        except Exception as e:
-            st.error(f"Error durante el procesamiento del reporte: {e}")
+# 6. PRE-PLANILLA Y REPORTES
+elif vista_seleccionada == "📑 Pre-Planilla y Reportes":
+    st.subheader("Pre-Planilla Consolidada de Control de Tiempos")
+    
+    if not df_procesado.empty:
+        # Métricas principales
+        total_reg = len(df_procesado)
+        tot_hrs = df_procesado['Horas Trabajadas'].sum()
+        tot_atrasos = df_procesado['Atraso (Minutos)'].sum()
+        tot_he = df_procesado['Horas Extras 50%'].sum() + df_procesado['Horas Extras 100%'].sum()
+        tot_fj = df_procesado['Falta Justificada'].sum()
+        tot_fij = df_procesado['Falta Injustificada'].sum()
+        tot_turnos = df_procesado['Turnos Completados'].sum()
+
+        m1, m2, m3, m4, m5, m6, m7 = st.columns(7)
+        m1.metric("Registros", total_reg)
+        m2.metric("Horas Trab.", f"{tot_hrs:.1f}")
+        m3.metric("Atrasos Min", f"{tot_atrasos}")
+        m4.metric("Horas Extras", f"{tot_he:.1f}")
+        m5.metric("Faltas Just.", f"{tot_fj}")
+        m6.metric("Faltas Injust.", f"{tot_fij}")
+        m7.metric("Turnos Comp.", f"{tot_turnos:.1f}")
+
+        st.markdown("---")
+        st.dataframe(df_procesado, use_container_width=True)
+
+        # Exportación a Excel
+        st.markdown("---")
+        excel_data = export_preplanilla_excel(df_procesado, df_resumen)
+        st.download_button(
+            label="📥 Descargar Reporte Consolidado (Excel)",
+            data=excel_data,
+            file_name="Preplanilla_Control_Tiempos.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+        )
+    else:
+        st.info("No hay registros para mostrar en el período actual.")
