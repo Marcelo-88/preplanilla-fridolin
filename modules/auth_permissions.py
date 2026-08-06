@@ -4,13 +4,14 @@ import pandas as pd
 def render_user_selector(df_emp):
     """
     Renderiza el selector de usuario y valida el PIN de 4 dígitos dinámico desde Google Sheets.
-    Garantiza que SOLO el Responsable de Operaciones / Producción tenga Acceso Total en Aprobaciones.
+    Asocia usuarios y permisos mediante Carnet_Identidad y Nombres.
     """
     if df_emp is None or df_emp.empty:
         st.sidebar.warning("⚠️ No se pudo cargar el Maestro de Empleados.")
         return None, "Admin", [], False
 
     cols = {str(c).strip().lower(): c for c in df_emp.columns}
+    c_ci = next((cols[k] for k in cols if any(x in k for x in ['carnet', 'ci', 'identidad', 'id'])), df_emp.columns[0])
     c_nombre = next((cols[k] for k in cols if 'nombre' in k), df_emp.columns[1])
     c_sup = next((cols[k] for k in cols if 'supervisor' in k), None)
     c_rol = next((cols[k] for k in cols if 'rol' in k), None)
@@ -62,13 +63,13 @@ def render_user_selector(df_emp):
 
     if es_responsable_operaciones:
         rol = "Jefe de Producción"
-        empleados_a_cargo = list(df_emp[c_nombre].unique())
+        empleados_a_cargo = list(df_emp[c_ci].dropna().astype(str).str.strip().str.replace(".0", "", regex=False).unique())
         st.sidebar.success("👑 Rol: Responsable de Operaciones y Producción (Acceso Total)")
     else:
         rol = "Supervisor"
         if c_sup:
             df_a_cargo = df_emp[df_emp[c_sup].astype(str).str.strip().str.upper() == usuario_actual.strip().upper()]
-            empleados_a_cargo = list(df_a_cargo[c_nombre].unique())
+            empleados_a_cargo = list(df_a_cargo[c_ci].dropna().astype(str).str.strip().str.replace(".0", "", regex=False).unique())
         else:
             empleados_a_cargo = []
         st.sidebar.info(f"📋 Personal Asignado: {len(empleados_a_cargo)} personas")
@@ -76,14 +77,16 @@ def render_user_selector(df_emp):
     return usuario_actual, rol, empleados_a_cargo, pin_valido
 
 
-def filter_dataframe_by_supervisor(df, columna_nombre, empleados_a_cargo, rol):
+def filter_dataframe_by_supervisor(df, columna_identificador, empleados_a_cargo, rol):
     if df is None or df.empty:
         return df
 
     if rol == "Jefe de Producción":
         return df
 
-    if columna_nombre in df.columns:
-        return df[df[columna_nombre].isin(empleados_a_cargo)]
+    if columna_identificador in df.columns:
+        # Asegurar formato string limpio
+        df_col_clean = df[columna_identificador].astype(str).str.strip().str.replace(".0", "", regex=False)
+        return df[df_col_clean.isin([str(e).strip() for e in empleados_a_cargo])]
     
     return df
