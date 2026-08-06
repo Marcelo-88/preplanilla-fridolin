@@ -87,16 +87,98 @@ elif opcion == "⏱️ Importación Biométrico":
         st.error(f"Error al cargar la pestaña: {e}")
 
 # -----------------------------------------------------------------------------
-# 4. NOVEDADES Y PERMISOS (PÚBLICO)
+# 4. NOVEDADES Y PERMISOS (FORMULARIO INTERACTIVO Y REGLAS DE IMPACTO)
 # -----------------------------------------------------------------------------
-elif opcion == "📝 Novedades y Permisos":
-    st.header("Novedades, Licencias y Permisos Especiales")
-    st.info("💡 Incluye licencias legales, vacaciones y regla especial de Permiso de Lactancia Maternidad.")
-    try:
-        df_nov = load_sheet_data("04_Novedades_y_Permisos")
-        st.dataframe(df_nov, use_container_width=True, hide_index=True)
-    except Exception as e:
-        st.error(f"Error al cargar la pestaña: {e}")
+elif opcion == "📋 Novedades y Permisos":
+    st.header("Gestión de Novedades, Licencias y Permisos")
+    
+    # Validar Permisos de Registro (Solo Supervisores, Jefatura o Acceso Total)
+    rol_actual = st.session_state.get('user_role', '').lower()
+    es_autorizado = any(k in rol_actual for k in ['supervisor', 'jefatura', 'responsable', 'operaciones', 'admin'])
+
+    if not st.session_state.get('pin_correct', False) or not es_autorizado:
+        st.error("⛔ Acceso restringido. Solo Supervisores, Jefatura o Administradores con PIN activo pueden registrar novedades.")
+    else:
+        st.success(f"🔓 Sesión Autorizada: {st.session_state.get('user_name', 'Usuario')} ({st.session_state.get('user_role', '')})")
+        
+        # Cargar Maestro para lista desplegable de empleados asignados
+        df_emp = load_sheet_data("01_Maestro_Empleados")
+        df_nov_existentes = load_sheet_data("04_Novedades_y_Permisos")
+
+        if df_emp is not None and not df_emp.empty:
+            # Filtrar solo el personal asignado al supervisor actual (o todos si es Responsable)
+            supervisor_actual = st.session_state.get('user_name', '').upper()
+            if 'responsable' in rol_actual or 'admin' in rol_actual:
+                personal_lista = df_emp['Nombre'].dropna().unique().tolist()
+            else:
+                personal_lista = df_emp[df_emp['Supervisor_Asignado'].astype(str).str.upper() == supervisor_actual]['Nombre'].dropna().unique().tolist()
+
+            with st.expander("➕ Registrar Nueva Novedad / Licencia / Maternidad", expanded=True):
+                with st.form(key="form_novedades"):
+                    col1, col2 = st.columns(2)
+                    
+                    with col1:
+                        emp_seleccionado = st.selectbox("Seleccione el Empleado:", options=sorted(personal_lista))
+                        tipo_permiso = st.selectbox(
+                            "Tipo de Novedad / Licencia:",
+                            options=[
+                                "Baja Médica",
+                                "Licencia",
+                                "Permiso",
+                                "Maternidad (Lactancia)"
+                            ]
+                        )
+                    
+                    with col2:
+                        fechas = st.date_input("Rango de Fechas (Desde - Hasta):", value=[pd.to_datetime("today"), pd.to_datetime("today")])
+                        
+                        # Calcular duración en días
+                        if isinstance(fechas, (list, tuple)) and len(fechas) == 2:
+                            fecha_ini, fecha_fin = fechas[0], fechas[1]
+                            duracion_dias = (fecha_fin - fecha_ini).days + 1
+                        else:
+                            fecha_ini = fechas[0] if isinstance(fechas, (list, tuple)) else fechas
+                            fecha_fin = fecha_ini
+                            duracion_dias = 1
+                            
+                        st.info(f"📅 Duración total: **{duracion_dias} día(s)**")
+
+                    # Explicación del impacto según el tipo seleccionado
+                    if tipo_permiso == "Maternidad (Lactancia)":
+                        st.caption("ℹ️ **Impacto:** Reduce la jornada laboral a 7 horas/día. No se consideran ingresos tardíos ni salidas tempranas.")
+                    else:
+                        st.caption("ℹ️ **Impacto:** Durante el rango seleccionado los días **NO se tomarán como FALTA ni Atraso**.")
+
+                    btn_guardar = st.form_submit_button("💾 Registrar y Aplicar Novedad")
+
+                    if btn_guardar:
+                        nueva_novedad = {
+                            "ID_Novedad": f"NOV-{len(df_nov_existentes) + 1:03d}",
+                            "Empleado": emp_seleccionado,
+                            "Tipo_Novedad": tipo_permiso,
+                            "Fecha_Inicio": str(fecha_ini),
+                            "Fecha_Fin": str(fecha_fin),
+                            "Duracion_Dias": duracion_dias,
+                            "Registrado_Por": st.session_state.get('user_name', 'Sistema')
+                        }
+                        
+                        # Almacenar en la sesión temporal para procesamiento en Pre-Planilla
+                        if 'novedades_registradas' not in st.session_state:
+                            st.session_state['novedades_registradas'] = []
+                        
+                        st.session_state['novedades_registradas'].append(nueva_novedad)
+                        st.success(f"✅ Novedad registrada exitosamente para {emp_seleccionado} del {fecha_ini} al {fecha_fin}.")
+
+        # Tabla de novedades registradas
+        st.subheader("📋 Registro de Novedades Vigentes")
+        if 'novedades_registradas' in st.session_state and st.session_state['novedades_registradas']:
+            df_mostrar = pd.DataFrame(st.session_state['novedades_registradas'])
+            st.dataframe(df_mostrar, use_container_width=True, hide_index=True)
+        elif df_nov_existentes is not None and not df_nov_existentes.empty:
+            cols_vis = [c for c in df_nov_existentes.columns if not str(c).startswith('Unnamed')]
+            st.dataframe(df_nov_existentes[cols_vis], use_container_width=True, hide_index=True)
+        else:
+            st.info("No hay novedades registradas hasta la fecha.")
 
 # -----------------------------------------------------------------------------
 # 5. APROBACIONES SUPERVISORES (🔒 CONTROLADO POR PIN Y SUPERVISOR)
