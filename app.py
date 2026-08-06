@@ -21,6 +21,25 @@ def get_managers():
 
 audit_log, lock_mgr, nov_mgr = get_managers()
 
+# Caching de Carga de Hojas de Cálculo
+@st.cache_data(ttl=300, show_spinner=False)
+def cached_load_sheet_data(sheet_name):
+    return load_sheet_data(sheet_name)
+
+# Caching de Procesamiento de Asistencia
+@st.cache_data(ttl=300, show_spinner=False)
+def run_cached_attendance_processing(df_bio, df_params, df_emp, _nov_mgr):
+    return process_attendance(df_bio, df_params, None, df_emp, _nov_mgr)
+
+@st.cache_data(ttl=300, show_spinner=False)
+def run_cached_exceptions(df_res):
+    return detect_exceptions(df_res)
+
+@st.cache_data(ttl=300, show_spinner=False)
+def run_cached_canje(df_res):
+    return get_canje_summary(df_res)
+
+
 st.set_page_config(
     page_title="Pre-Planilla Fridolin",
     page_icon="🏭",
@@ -34,7 +53,7 @@ st.sidebar.title("Menú Principal")
 
 # Cargar Maestro de Empleados para autenticación y PIN
 try:
-    df_emp_master = load_sheet_data("01_Maestro_Empleados")
+    df_emp_master = cached_load_sheet_data("01_Maestro_Empleados")
     usuario_actual, rol_actual, empleados_permitidos, pin_ok = render_user_selector(df_emp_master)
 except Exception as e:
     usuario_actual, rol_actual, empleados_permitidos, pin_ok = "Invitado", "Jefe de Producción", [], True
@@ -63,7 +82,7 @@ st.sidebar.caption("Sistema de Control de Asistencia v2.0")
 if opcion == "📊 Parámetros y Reglas":
     st.header("Parámetros y Reglas del Sistema")
     try:
-        df_params = load_sheet_data("05_Parametros_y_Reglas")
+        df_params = cached_load_sheet_data("05_Parametros_y_Reglas")
         st.dataframe(df_params, use_container_width=True, hide_index=True)
     except Exception as e:
         st.error(f"Error al cargar la pestaña: {e}")
@@ -74,7 +93,7 @@ if opcion == "📊 Parámetros y Reglas":
 elif opcion == "👥 Maestro de Empleados":
     st.header("Maestro de Empleados")
     try:
-        df_emp = load_sheet_data("01_Maestro_Empleados")
+        df_emp = cached_load_sheet_data("01_Maestro_Empleados")
         cols_sin_pin = [col for col in df_emp.columns if col.strip().upper() != "PIN"]
         df_emp_vista = df_emp[cols_sin_pin]
         st.dataframe(df_emp_vista, use_container_width=True, hide_index=True)
@@ -87,7 +106,7 @@ elif opcion == "👥 Maestro de Empleados":
 elif opcion == "⏱️ Importación Biométrico":
     st.header("Registros del Biométrico")
     try:
-        df_bio = load_sheet_data("02_Importacion_Biometrico")
+        df_bio = cached_load_sheet_data("02_Importacion_Biometrico")
         st.dataframe(df_bio, use_container_width=True, hide_index=True)
     except Exception as e:
         st.error(f"Error al cargar la pestaña: {e}")
@@ -103,7 +122,7 @@ elif opcion == "📝 Novedades y Permisos":
 
     with tab_ver_nov:
         try:
-            df_nov_sheet = load_sheet_data("04_Novedades_y_Permisos")
+            df_nov_sheet = cached_load_sheet_data("04_Novedades_y_Permisos")
         except Exception:
             df_nov_sheet = pd.DataFrame()
 
@@ -125,7 +144,7 @@ elif opcion == "📝 Novedades y Permisos":
             st.subheader("Formulario de Registro de Novedad / Licencia")
             with st.form("form_nueva_novedad"):
                 try:
-                    df_emp = load_sheet_data("01_Maestro_Empleados")
+                    df_emp = cached_load_sheet_data("01_Maestro_Empleados")
                     df_emp.columns = [str(col).strip() for col in df_emp.columns]
                     col_nombre = 'Nombre_Completo' if 'Nombre_Completo' in df_emp.columns else ('Nombre' if 'Nombre' in df_emp.columns else None)
                     
@@ -179,6 +198,7 @@ elif opcion == "📝 Novedades y Permisos":
                                 modulo="Novedades",
                                 detalles={"empleado": emp_seleccionado, "tipo": tipo_nov, "inicio": str(fecha_ini), "fin": str(fecha_fin)}
                             )
+                            st.cache_data.clear()
                             st.success(res_reg["mensaje"])
                             st.rerun()
                         else:
@@ -195,7 +215,7 @@ elif opcion == "✅ Aprobaciones Supervisores":
         st.stop()
 
     try:
-        df_bio = load_sheet_data("02_Importacion_Biometrico")
+        df_bio = cached_load_sheet_data("02_Importacion_Biometrico")
         df_bio['dt_temp'] = pd.to_datetime(df_bio.iloc[:, 2], dayfirst=True, errors='coerce')
         periodos_disponibles = sorted(df_bio['dt_temp'].dt.strftime('%Y-%m').dropna().unique().tolist(), reverse=True)
     except Exception:
@@ -252,16 +272,18 @@ elif opcion == "✅ Aprobaciones Supervisores":
     ])
 
     try:
-        df_params = load_sheet_data("05_Parametros_y_Reglas")
+        df_params = cached_load_sheet_data("05_Parametros_y_Reglas")
         try:
-            df_emp = load_sheet_data("01_Maestro_Empleados")
+            df_emp = cached_load_sheet_data("01_Maestro_Empleados")
         except Exception:
             df_emp = None
 
-        # --- CÁLCULO OPTIMIZADO FILTRADO DESDE EL MOTOR ---
-        df_res = process_attendance(df_bio, df_params, None, df_emp, nov_mgr, periodo_filtro=periodo_sel, emp_id_filtro="Todos")
-        df_excepciones = detect_exceptions(df_res)
-        df_canje_resumen = get_canje_summary(df_res)
+        df_bio_periodo = df_bio[df_bio['dt_temp'].dt.strftime('%Y-%m') == periodo_sel].copy() if 'dt_temp' in df_bio.columns else df_bio
+
+        # Procesamiento optimizado y cacheado
+        df_res = run_cached_attendance_processing(df_bio_periodo, df_params, df_emp, nov_mgr)
+        df_excepciones = run_cached_exceptions(df_res)
+        df_canje_resumen = run_cached_canje(df_res)
 
         df_excepciones = filter_dataframe_by_supervisor(df_excepciones, 'Nombre', empleados_permitidos, rol_actual)
         df_canje_resumen = filter_dataframe_by_supervisor(df_canje_resumen, 'Nombre', empleados_permitidos, rol_actual)
@@ -397,78 +419,63 @@ elif opcion == "✅ Aprobaciones Supervisores":
 elif opcion == "📑 Pre-Planilla y Reportes":
     st.header("Reporte Consolidado de Asistencia para RRHH / Contabilidad")
     
-    try:
-        df_bio = load_sheet_data("02_Importacion_Biometrico")
-        df_params = load_sheet_data("05_Parametros_y_Reglas")
-        df_emp = load_sheet_data("01_Maestro_Empleados")
+    with st.spinner("Procesando marcaciones, novedades y tiempos..."):
+        try:
+            df_bio = cached_load_sheet_data("02_Importacion_Biometrico")
+            df_params = cached_load_sheet_data("05_Parametros_y_Reglas")
+            df_emp = cached_load_sheet_data("01_Maestro_Empleados")
+                
+            df_bio['dt_temp'] = pd.to_datetime(df_bio.iloc[:, 2], dayfirst=True, errors='coerce')
+            periodos_rep = sorted(df_bio['dt_temp'].dt.strftime('%Y-%m').dropna().unique().tolist(), reverse=True)
             
-        df_bio['dt_temp'] = pd.to_datetime(df_bio.iloc[:, 2], dayfirst=True, errors='coerce')
-        periodos_rep = sorted(df_bio['dt_temp'].dt.strftime('%Y-%m').dropna().unique().tolist(), reverse=True)
-        
-        # 1. FILTROS PREVIOS (Aparecen antes del procesamiento para máxima velocidad)
-        col_filtro1, col_filtro2, col_filtro3 = st.columns(3)
-        
-        with col_filtro1:
-            p_sel_rep = st.selectbox("🗓️ 1. Filtrar Período (Mes):", options=periodos_rep if periodos_rep else ["Todos"])
-        
-        # Mapeo de nombres para selector
-        dict_nombres_id = {}
-        if df_emp is not None and not df_emp.empty:
-            c_id = next((c for c in df_emp.columns if any(x in str(c).lower() for x in ['id', 'carnet', 'ci'])), df_emp.columns[0])
-            c_nom = next((c for c in df_emp.columns if any(x in str(c).lower() for x in ['nombre', 'empleado'])), df_emp.columns[1])
-            for _, r in df_emp.iterrows():
-                dict_nombres_id[str(r[c_nom]).strip()] = str(r[c_id]).strip()
+            p_sel_rep = st.selectbox("🗓️ Filtrar Período de Reporte:", options=["Todos"] + periodos_rep)
 
-        lista_nombres_disp = ["Todos"] + sorted(list(dict_nombres_id.keys()))
-        
-        with col_filtro2:
-            emp_nom_sel = st.selectbox("👤 2. Filtrar Empleado:", options=lista_nombres_disp)
-        
-        emp_id_target = dict_nombres_id.get(emp_nom_sel, "Todos") if emp_nom_sel != "Todos" else "Todos"
+            if p_sel_rep != "Todos":
+                df_bio_rep = df_bio[df_bio['dt_temp'].dt.strftime('%Y-%m') == p_sel_rep].copy()
+            else:
+                df_bio_rep = df_bio
 
-        with col_filtro3:
-            turno_sel = st.selectbox("🌙 3. Filtrar Turno:", options=["Todos", "Diurno", "Nocturno"])
+            # Procesamiento optimizado y cacheado
+            df_resultado = run_cached_attendance_processing(df_bio_rep, df_params, df_emp, nov_mgr)
 
-        # 2. EJECUCIÓN OPTIMIZADA Y FILTRADA
-        with st.spinner("⚡ Cargando reporte seleccionado..."):
-            df_resultado = process_attendance(
-                df_bio=df_bio, 
-                df_params=df_params, 
-                df_nov=None, 
-                df_emp=df_emp, 
-                nov_mgr=nov_mgr, 
-                periodo_filtro=p_sel_rep, 
-                emp_id_filtro=emp_id_target
-            )
+            if df_resultado is not None and not df_resultado.empty:
+                col_filtro1, col_filtro2 = st.columns(2)
+                
+                with col_filtro1:
+                    empleados = ["Todos"] + list(df_resultado['Nombre'].unique())
+                    emp_sel = st.selectbox("Filtrar por Empleado:", empleados)
+                
+                with col_filtro2:
+                    turnos = ["Todos", "Diurno", "Nocturno"]
+                    turno_sel = st.selectbox("Filtrar por Turno:", turnos)
+                
+                df_filtrado = df_resultado.copy()
+                if emp_sel != "Todos":
+                    df_filtrado = df_filtrado[df_filtrado['Nombre'] == emp_sel]
+                if turno_sel != "Todos":
+                    df_filtrado = df_filtrado[df_filtrado['Turno Dominante'] == turno_sel]
+                
+                st.subheader("Planilla de Control de Tiempos")
+                st.dataframe(df_filtrado, use_container_width=True, hide_index=True)
+                
+                c1, c2, c3, c4, c5, c6, c7 = st.columns(7)
+                c1.metric("Registros", len(df_filtrado))
+                c2.metric("Horas Trabajadas", f"{df_filtrado['Horas Trabajadas'].sum():.2f} hrs")
+                c3.metric("Total Atrasos", f"{df_filtrado['Atraso (Minutos)'].sum()} min")
+                c4.metric("Horas Extras", f"{df_filtrado['Horas Extras'].sum():.2f} hrs")
+                c5.metric("Faltas Justif.", int(df_filtrado['Falta Justificada'].sum()))
+                c6.metric("Faltas Injustif.", int(df_filtrado['Falta Injustificada'].sum()))
+                c7.metric("Turnos Comp.", f"{df_filtrado['Turnos Computados'].sum():.1f}")
+                
+                archivo_rep = f"PrePlanilla_{p_sel_rep}.xlsx"
+                ExcelExporter.exportar_preplanilla(df_filtrado.to_dict('records'), p_sel_rep, archivo_rep)
 
-        if df_resultado is not None and not df_resultado.empty:
-            df_filtrado = df_resultado.copy()
-            if turno_sel != "Todos":
-                df_filtrado = df_filtrado[df_filtrado['Turno Dominante'] == turno_sel]
-
-            st.subheader("Planilla de Control de Tiempos")
-            st.dataframe(df_filtrado, use_container_width=True, hide_index=True)
-            
-            c1, c2, c3, c4, c5, c6, c7 = st.columns(7)
-            c1.metric("Registros", len(df_filtrado))
-            c2.metric("Horas Trabajadas", f"{df_filtrado['Horas Trabajadas'].sum():.2f} hrs")
-            c3.metric("Total Atrasos", f"{df_filtrado['Atraso (Minutos)'].sum()} min")
-            c4.metric("Horas Extras", f"{df_filtrado['Horas Extras'].sum():.2f} hrs")
-            c5.metric("Faltas Justif.", int(df_filtrado['Falta Justificada'].sum()))
-            c6.metric("Faltas Injustif.", int(df_filtrado['Falta Injustificada'].sum()))
-            c7.metric("Turnos Comp.", f"{df_filtrado['Turnos Computados'].sum():.1f}")
-            
-            archivo_rep = f"PrePlanilla_{p_sel_rep}.xlsx"
-            ExcelExporter.exportar_preplanilla(df_filtrado.to_dict('records'), p_sel_rep, archivo_rep)
-
-            with open(archivo_rep, "rb") as f:
-                st.download_button(
-                    label="📥 Descargar Reporte Consolidado (Excel)",
-                    data=f,
-                    file_name=f"Reporte_PrePlanilla_Fridolin_{p_sel_rep}.xlsx",
-                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-                )
-        else:
-            st.info("No existen registros para los filtros seleccionados.")
-    except Exception as e:
-        st.error(f"Error durante el procesamiento del reporte: {e}")
+                with open(archivo_rep, "rb") as f:
+                    st.download_button(
+                        label="📥 Descargar Reporte Consolidado (Excel)",
+                        data=f,
+                        file_name=f"Reporte_PrePlanilla_Fridolin_{p_sel_rep}.xlsx",
+                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+                    )
+        except Exception as e:
+            st.error(f"Error durante el procesamiento del reporte: {e}")
