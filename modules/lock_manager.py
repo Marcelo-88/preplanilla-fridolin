@@ -1,5 +1,4 @@
 import sqlite3
-import json
 from datetime import datetime
 from typing import Dict, Any, Optional, List
 
@@ -20,7 +19,6 @@ class LockManager:
     def _init_db(self):
         with sqlite3.connect(self.db_path) as conn:
             cursor = conn.cursor()
-            # Estado general del periodo
             cursor.execute("""
                 CREATE TABLE IF NOT EXISTS period_locks (
                     periodo TEXT PRIMARY KEY,
@@ -31,7 +29,6 @@ class LockManager:
                 )
             """)
             
-            # Cierre individual por colaborador
             cursor.execute("""
                 CREATE TABLE IF NOT EXISTS employee_period_locks (
                     periodo TEXT,
@@ -44,7 +41,6 @@ class LockManager:
                 )
             """)
 
-            # Decisiones tomadas por supervisores sobre excepciones y canjes
             cursor.execute("""
                 CREATE TABLE IF NOT EXISTS exception_decisions (
                     periodo TEXT,
@@ -92,14 +88,6 @@ class LockManager:
         rol_usuario: str,
         motivo: Optional[str] = None
     ) -> Dict[str, Any]:
-        estado_actual = self.obtener_estado_periodo(periodo)
-        if estado_actual == self.ESTADO_FINALIZADO and nuevo_estado != self.ESTADO_FINALIZADO:
-            if not ("Acceso Total" in rol_usuario or rol_usuario in self.ROLES_SUPERUSUARIO):
-                return {
-                    "exito": False,
-                    "mensaje": "Permiso denegado: Solo el Responsable de Operaciones o Administrador puede reabrir un período cerrado."
-                }
-
         fecha_actual = datetime.now().isoformat()
         with sqlite3.connect(self.db_path) as conn:
             cursor = conn.cursor()
@@ -116,7 +104,6 @@ class LockManager:
 
         return {"exito": True, "mensaje": f"Período {periodo} actualizado a estado '{nuevo_estado}'."}
 
-    # --- CIERRE Y REVERSIÓN INDIVIDUAL POR EMPLEADO ---
     def obtener_estado_empleado(self, periodo: str, carnet_identidad: str) -> str:
         with sqlite3.connect(self.db_path) as conn:
             cursor = conn.cursor()
@@ -152,7 +139,6 @@ class LockManager:
             conn.commit()
         return {"exito": True, "mensaje": f"Empleado CI {ci_clean} en período {periodo} actualizado a '{nuevo_estado}'."}
 
-    # --- GUARDAR Y CARGAR DECISIONES DE EXCEPCIONES ---
     def guardar_decisiones_excepciones(self, periodo: str, registros: List[Dict[str, Any]], usuario_pin: str):
         fecha_actual = datetime.now().isoformat()
         with sqlite3.connect(self.db_path) as conn:
@@ -180,6 +166,9 @@ class LockManager:
             conn.commit()
 
     def obtener_decisiones_excepciones(self, periodo: str) -> Dict[tuple, Dict[str, str]]:
+        """
+        Devuelve el diccionario de decisiones tomadas para un período determinado.
+        """
         decisiones = {}
         with sqlite3.connect(self.db_path) as conn:
             cursor = conn.cursor()
@@ -188,7 +177,7 @@ class LockManager:
                 (periodo,)
             ).fetchall()
             for r in rows:
-                key = (r[0], r[1], r[2]) # (CI, Fecha, Tipo Excepción)
+                key = (str(r[0]).strip(), str(r[1]).strip(), str(r[2]).strip())
                 decisiones[key] = {
                     "decision": r[3],
                     "tipo_falta": r[4],
