@@ -63,10 +63,81 @@ elif opcion == "📝 Novedades y Permisos":
         st.error(f"Error al cargar la pestaña: {e}")
 
 elif opcion == "✅ Aprobaciones Supervisores":
-    st.header("Aprobaciones de Supervisores")
+    st.header("✅ Centro de Aprobaciones de Supervisores")
+    
     try:
         df_aprob = load_sheet_data("03_Aprobaciones_Supervisores")
-        st.dataframe(df_aprob, use_container_width=True, hide_index=True)
+        
+        if df_aprob is not None and not df_aprob.empty:
+            # Detectar columnas dinámicamente
+            col_estado = [c for c in df_aprob.columns if 'ESTADO' in str(c).upper() or 'APROB' in str(c).upper()]
+            col_sup = [c for c in df_aprob.columns if 'SUPERVISOR' in str(c).upper() or 'JEFE' in str(c).upper()]
+            col_emp = [c for c in df_aprob.columns if 'EMPLEADO' in str(c).upper() or 'NOMBRE' in str(c).upper() or 'ID' in str(c).upper()]
+            
+            # Filtros superiores
+            col_f1, col_f2, col_f3 = st.columns(3)
+            
+            with col_f1:
+                opciones_estado = ["Todos"]
+                if col_estado:
+                    opciones_estado += list(df_aprob[col_estado[0]].astype(str).unique())
+                estado_sel = st.selectbox("Filtrar por Estado:", opciones_estado)
+                
+            with col_f2:
+                opciones_sup = ["Todos"]
+                if col_sup:
+                    opciones_sup += list(df_aprob[col_sup[0]].astype(str).unique())
+                sup_sel = st.selectbox("Filtrar por Supervisor:", opciones_sup)
+                
+            with col_f3:
+                opciones_emp = ["Todos"]
+                if col_emp:
+                    opciones_emp += list(df_aprob[col_emp[0]].astype(str).unique())
+                emp_sel = st.selectbox("Filtrar por Empleado:", opciones_emp)
+            
+            # Aplicar filtros
+            df_fil = df_aprob.copy()
+            if estado_sel != "Todos" and col_estado:
+                df_fil = df_fil[df_fil[col_estado[0]].astype(str) == estado_sel]
+            if sup_sel != "Todos" and col_sup:
+                df_fil = df_fil[df_fil[col_sup[0]].astype(str) == sup_sel]
+            if emp_sel != "Todos" and col_emp:
+                df_fil = df_fil[df_fil[col_emp[0]].astype(str) == emp_sel]
+                
+            # Métricas de estado
+            m1, m2, m3, m4 = st.columns(4)
+            m1.metric("Total Registros", len(df_fil))
+            
+            if col_estado:
+                pendientes = len(df_fil[df_fil[col_estado[0]].astype(str).str.upper().str.contains("PENDIENTE")])
+                aprobados = len(df_fil[df_fil[col_estado[0]].astype(str).str.upper().str.contains("APROBADO")])
+                rechazados = len(df_fil[df_fil[col_estado[0]].astype(str).str.upper().str.contains("RECHAZADO")])
+                
+                m2.metric("⏳ Pendientes", pendientes)
+                m3.metric("🟢 Aprobados", aprobados)
+                m4.metric("🔴 Rechazados", rechazados)
+            else:
+                m2.metric("⏳ Pendientes", 0)
+                m3.metric("🟢 Aprobados", 0)
+                m4.metric("🔴 Rechazados", 0)
+
+            st.subheader("Listado de Aprobaciones")
+            st.dataframe(df_fil, use_container_width=True, hide_index=True)
+            
+            # Botón de Descarga Excel
+            buffer = io.BytesIO()
+            with pd.ExcelWriter(buffer, engine='openpyxl') as writer:
+                df_fil.to_excel(writer, index=False, sheet_name='Aprobaciones')
+            
+            st.download_button(
+                label="📥 Descargar Registro de Aprobaciones (Excel)",
+                data=buffer.getvalue(),
+                file_name="Aprobaciones_Supervisores_Fridolin.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+            )
+        else:
+            st.info("La pestaña de Aprobaciones de Supervisores se encuentra vacía por el momento.")
+            
     except Exception as e:
         st.error(f"Error al cargar la pestaña: {e}")
 
@@ -110,7 +181,6 @@ elif opcion == "📑 Pre-Planilla y Reportes":
                 st.subheader("Planilla de Control de Tiempos")
                 st.dataframe(df_filtrado, use_container_width=True, hide_index=True)
                 
-                # Métricas operativas (sin montos de dinero)
                 col1, col2, col3, col4, col5 = st.columns(5)
                 col1.metric("Días / Registros", len(df_filtrado))
                 col2.metric("Total Horas Trabajadas", f"{df_filtrado['Horas Trabajadas'].sum():.2f} hrs")
@@ -118,7 +188,6 @@ elif opcion == "📑 Pre-Planilla y Reportes":
                 col4.metric("Horas Extras", f"{df_filtrado['Horas Extras'].sum():.2f} hrs")
                 col5.metric("Horas Nocturnas", f"{df_filtrado['Horas Nocturnas'].sum():.2f} hrs")
                 
-                # Botón de Descarga Excel
                 buffer = io.BytesIO()
                 with pd.ExcelWriter(buffer, engine='openpyxl') as writer:
                     df_filtrado.to_excel(writer, index=False, sheet_name='Reporte_Asistencia')
