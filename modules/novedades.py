@@ -4,7 +4,7 @@ from typing import List, Dict, Any, Optional
 
 class NovedadesManager:
     """
-    Administración de Permisos, Bajas Médicas, Licencias y Reducción de Lactancia.
+    Administración de Permisos, Bajas Médicas, Licencias, Reducción de Lactancia y Cambios de Turno.
     """
     TIPOS_NOVEDAD = [
         "BAJA_MEDICA",
@@ -14,7 +14,10 @@ class NovedadesManager:
         "REDUCCION_LACTANCIA",
         "VACACIONES",
         "LICENCIA_PATERNIDAD",
-        "DUELO_FAMILIAR"
+        "DUELO_FAMILIAR",
+        "CAMBIO_TURNO",
+        "CAMBIO_TURNO_NOCTURNO",
+        "CAMBIO_TURNO_DIURNO"
     ]
 
     def __init__(self, db_path: str = "novedades.db"):
