@@ -2,7 +2,7 @@ import openpyxl
 from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
 from openpyxl.utils import get_column_letter
 from datetime import datetime
-from typing import List, Dict, Any
+from typing import List, Dict, Any, Optional
 
 class ExcelExporter:
     @staticmethod
@@ -30,7 +30,7 @@ class ExcelExporter:
         ws.append([])
 
         if not datos_tabla:
-            ws.append(["Sin datos disponibles para el periodo seleccionado"])
+            ws.append(["Sin datos disponibles para el período seleccionado"])
             return
 
         headers = list(datos_tabla[0].keys())
@@ -77,9 +77,9 @@ class ExcelExporter:
     @staticmethod
     def exportar_aprobaciones(
         datos_excepciones: List[Dict[str, Any]],
-        datos_canje: List[Dict[str, Any]],
         periodo: str,
-        nombre_archivo: str = "Aprobaciones_Export.xlsx"
+        nombre_archivo: str = "Aprobaciones_Export.xlsx",
+        datos_canje: Optional[List[Dict[str, Any]]] = None
     ) -> str:
         wb = openpyxl.Workbook()
         
