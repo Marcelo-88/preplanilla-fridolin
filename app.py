@@ -130,12 +130,21 @@ elif opcion == "📝 Novedades y Permisos":
             with st.form("form_nueva_novedad"):
                 try:
                     df_emp = load_sheet_data("01_Maestro_Empleados")
-                    df_emp_fil = filter_dataframe_by_supervisor(df_emp, 'Nombre', empleados_permitidos, rol_actual)
-                    lista_emps = df_emp_fil['Nombre'].tolist() if 'Nombre' in df_emp_fil.columns else []
-                except Exception:
+                    # Normalizar nombres de columnas eliminando espacios
+                    df_emp.columns = [str(col).strip() for col in df_emp.columns]
+                    
+                    # Detectar columna con nombres de empleados
+                    col_nombre = 'Nombre_Completo' if 'Nombre_Completo' in df_emp.columns else ('Nombre' if 'Nombre' in df_emp.columns else None)
+                    
+                    if col_nombre:
+                        df_emp_fil = filter_dataframe_by_supervisor(df_emp, col_nombre, empleados_permitidos, rol_actual)
+                        lista_emps = df_emp_fil[col_nombre].dropna().unique().tolist()
+                    else:
+                        lista_emps = []
+                except Exception as e:
                     lista_emps = []
 
-                emp_seleccionado = st.selectbox("Seleccione Empleado:*", options=lista_emps)
+                emp_seleccionado = st.selectbox("Seleccione Empleado:*", options=sorted(lista_emps))
                 tipo_nov = st.selectbox("Tipo de Novedad / Licencia:*", options=nov_mgr.TIPOS_NOVEDAD)
                 
                 col_f1, col_f2 = st.columns(2)
@@ -151,12 +160,14 @@ elif opcion == "📝 Novedades y Permisos":
                     if not emp_seleccionado or not justificacion_txt:
                         st.error("Debe completar todos los campos obligatorios.")
                     else:
-                        # Extraer ID del empleado
+                        # Extraer ID o Carnet del empleado
                         emp_id = "EMP-000"
-                        if 'ID' in df_emp.columns:
-                            row_e = df_emp[df_emp['Nombre'] == emp_seleccionado]
+                        if col_nombre and col_nombre in df_emp.columns:
+                            row_e = df_emp[df_emp[col_nombre] == emp_seleccionado]
                             if not row_e.empty:
-                                emp_id = str(row_e['ID'].values[0])
+                                col_id = 'Carnet_Identidad' if 'Carnet_Identidad' in df_emp.columns else ('ID' if 'ID' in df_emp.columns else None)
+                                if col_id:
+                                    emp_id = str(row_e[col_id].values[0])
 
                         res_reg = nov_mgr.registrar_novedad(
                             empleado_id=emp_id,
