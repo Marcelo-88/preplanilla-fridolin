@@ -2,7 +2,7 @@ import streamlit as st
 import pandas as pd
 import io
 from modules.data_loader import load_sheet_data
-from modules.attendance_processor import process_attendance, detect_exceptions
+from modules.attendance_processor import process_attendance, detect_exceptions, get_canje_summary
 
 st.set_page_config(
     page_title="Pre-Planilla Fridolin",
@@ -64,11 +64,11 @@ elif opcion == "📝 Novedades y Permisos":
 
 elif opcion == "✅ Aprobaciones Supervisores":
     st.header("✅ Centro de Aprobaciones y Excepciones")
-    st.caption("Panel dinámico para revisión de faltas, horas extras, 7º día y canje de compensaciones.")
+    st.caption("Panel dinámico para revisión de faltas, horas extras, acumulación mensual y canje masivo de días.")
 
-    tab_excepciones, tab_canje, tab_regularizar = st.tabs([
+    tab_excepciones, tab_canje_masivo, tab_regularizar = st.tabs([
         "🚨 Excepciones Automáticas", 
-        "⚖️ Canje HE por Faltas", 
+        "⚖️ Canje Masivo (Bolsa HE x Faltas)", 
         "➕ Regularizar Olvido Marcación"
     ])
 
@@ -86,14 +86,19 @@ elif opcion == "✅ Aprobaciones Supervisores":
 
         df_res = process_attendance(df_bio, df_params, df_nov, df_emp)
         df_excepciones = detect_exceptions(df_res)
+        df_canje_resumen = get_canje_summary(df_res)
     except Exception as e:
         df_excepciones = pd.DataFrame()
+        df_canje_resumen = pd.DataFrame()
         st.warning(f"No se pudieron cargar los datos biométricos para calcular excepciones: {e}")
 
+    # -------------------------------------------------------------------------
+    # TAB 1: EXCEPCIONES AUTOMÁTICAS
+    # -------------------------------------------------------------------------
     with tab_excepciones:
         if df_excepciones is not None and not df_excepciones.empty:
             st.subheader("Excepciones Detectadas en el Periodo")
-            st.info("💡 Haz clic sobre las celdas de 'Decisión' o 'Tipo Falta' para cambiar su estado (Aprobado, Rechazado, Justificada, Injustificada).")
+            st.info("💡 Marca las Horas Extras como 'Aprobado (Pago)' o 'Acumular (Próx. Mes)' si pasan al siguiente periodo.")
 
             col_f1, col_f2 = st.columns(2)
             with col_f1:
@@ -111,7 +116,7 @@ elif opcion == "✅ Aprobaciones Supervisores":
 
             m1, m2, m3, m4 = st.columns(4)
             m1.metric("Excepciones Totales", len(df_fil_exc))
-            m2.metric("Faltas Totales (A Reportar)", len(df_fil_exc[df_fil_exc['Tipo Excepción'] == 'Falta / Omisión Marcación']))
+            m2.metric("Faltas Totales", len(df_fil_exc[df_fil_exc['Tipo Excepción'] == 'Falta / Omisión Marcación']))
             m3.metric("Sol. Horas Extras", len(df_fil_exc[df_fil_exc['Tipo Excepción'] == 'Horas Extras']))
             m4.metric("7º Día / Desfases", len(df_fil_exc[df_fil_exc['Tipo Excepción'].isin(['7º Día Laborado', 'Desfase Horario Ingreso'])]))
 
@@ -122,7 +127,14 @@ elif opcion == "✅ Aprobaciones Supervisores":
                 column_config={
                     "Decisión Supervisor": st.column_config.SelectboxColumn(
                         "Decisión",
-                        options=["Pendiente", "Aprobado", "Rechazado", "Justificado", "Canjeado"],
+                        options=[
+                            "Pendiente", 
+                            "Aprobado (Pago)", 
+                            "Acumular (Próx. Mes)", 
+                            "Rechazado", 
+                            "Justificado", 
+                            "Canjeado"
+                        ],
                         required=True
                     ),
                     "Tipo Falta": st.column_config.SelectboxColumn(
@@ -139,7 +151,7 @@ elif opcion == "✅ Aprobaciones Supervisores":
 
             st.divider()
             st.subheader("📥 Exportación 'Copy-Paste Ready' para Google Drive")
-            st.caption("Descarga este Excel con las clasificaciones ajustadas para enviarlo a Contabilidad.")
+            st.caption("Descarga este Excel con los estados actualizados para copiar y pegar en la pestaña `03_Aprobaciones_Supervisores`.")
 
             buffer_exc = io.BytesIO()
             with pd.ExcelWriter(buffer_exc, engine='openpyxl') as writer:
@@ -154,41 +166,69 @@ elif opcion == "✅ Aprobaciones Supervisores":
         else:
             st.success("🎉 No se detectaron excepciones pendientes de revisión.")
 
-    with tab_canje:
-        st.subheader("⚖️ Compensación y Canje de Bolsa de Horas Extras por Faltas")
-        st.write("Permite cancelar 1 Falta utilizando la bolsa de Horas Extras acumuladas del empleado.")
+    # -------------------------------------------------------------------------
+    # TAB 2: CANJE MASIVO EN TABLA (8h Diurno / 7h Nocturno = 1 Día Entero)
+    # -------------------------------------------------------------------------
+    with tab_canje_masivo:
+        st.subheader("⚖️ Lista General para Canje Masivo de Horas Extras por Faltas")
+        st.info("💡 **Regla Estricta:** 1 Día entero = **8 hrs** (Diurno) o **7 hrs** (Nocturno). Modifica directamente la columna **'Días a Canjear (Aplicar)'** en la tabla. Solo se permiten valores enteros (0, 1, 2, etc.).")
 
-        if df_res is not None and not df_res.empty:
-            df_canje_summary = df_res.groupby(['ID', 'Nombre']).agg(
-                Total_HE=('Horas Extras', 'sum'),
-                Horas_Trabajadas=('Horas Trabajadas', 'sum')
-            ).reset_index()
-
-            col_c1, col_c2 = st.columns(2)
-            with col_c1:
-                emp_canje_sel = st.selectbox("Seleccione Empleado para Canje:", df_canje_summary['Nombre'].unique())
+        if df_canje_resumen is not None and not df_canje_resumen.empty:
             
-            info_emp = df_canje_summary[df_canje_summary['Nombre'] == emp_canje_sel].iloc[0]
+            # Editor masivo en formato tabla
+            df_edited_canje = st.data_editor(
+                df_canje_resumen,
+                use_container_width=True,
+                hide_index=True,
+                column_config={
+                    "ID": st.column_config.Column(disabled=True),
+                    "Nombre": st.column_config.Column(disabled=True),
+                    "Turno Dominante": st.column_config.Column(disabled=True),
+                    "Horas Costo por Día": st.column_config.NumberColumn("Costo Día (hrs)", disabled=True, format="%.0f hrs"),
+                    "Bolsa HE Acumulada (hrs)": st.column_config.NumberColumn("Bolsa HE (hrs)", disabled=True, format="%.2f hrs"),
+                    "Días Máx. Canjeables": st.column_config.NumberColumn("Días Máx.", disabled=True, format="%d días"),
+                    "Faltas Registradas": st.column_config.NumberColumn("Faltas Reg.", disabled=True, format="%d días"),
+                    "Días a Canjear (Aplicar)": st.column_config.NumberColumn(
+                        "Días a Canjear",
+                        min_value=0,
+                        max_value=10,
+                        step=1,
+                        help="Número exacto de días enteros a cancelar usando las horas extras acumuladas"
+                    ),
+                    "Estado Canje": st.column_config.SelectboxColumn(
+                        "Estado Canje",
+                        options=["Sin Aplicar", "Canje Aplicado", "Rechazado por Supervisor"],
+                        required=True
+                    )
+                }
+            )
+
+            # Cálculo en tiempo real de los canjes aplicados
+            dias_totales_canjeados = df_edited_canje['Días a Canjear (Aplicar)'].sum()
             
-            with col_c2:
-                st.metric("Bolsa HE Disponibles", f"{info_emp['Total_HE']:.2f} hrs")
+            c_m1, c_m2 = st.columns(2)
+            c_m1.metric("Personal con Bolsa HE / Faltas", len(df_edited_canje))
+            c_m2.metric("Total Días Canjeados en Tabla", f"{int(dias_totales_canjeados)} días")
 
-            with st.form("form_canje_he"):
-                st.write(f"**Empleado:** {info_emp['Nombre']} (ID: {info_emp['ID']})")
-                fecha_falta_canje = st.date_input("Fecha de la Falta a Compensar:")
-                he_a_canjear = st.number_input("Horas Extras a Descontar (Ej: 8.0 hrs por 1 día de falta):", min_value=1.0, max_value=24.0, value=8.0, step=0.5)
-                obs_canje = st.text_area("Justificación del Canje / Autorización:")
+            st.divider()
+            st.subheader("📥 Exportación del Resumen de Canjes")
+            
+            buffer_canje = io.BytesIO()
+            with pd.ExcelWriter(buffer_canje, engine='openpyxl') as writer:
+                df_edited_canje.to_excel(writer, index=False, sheet_name='Resumen_Canjes')
 
-                submit_canje = st.form_submit_button("🔄 Aplicar Canje de Horas Extras")
-
-                if submit_canje:
-                    if info_emp['Total_HE'] < he_a_canjear:
-                        st.error(f"El empleado solo cuenta con {info_emp['Total_HE']:.2f} hrs extras. No alcanza para compensar {he_a_canjear} hrs.")
-                    else:
-                        st.success(f"✅ Canje exitoso: Se descontarán {he_a_canjear} hrs HE para la falta del día {fecha_falta_canje}.")
+            st.download_button(
+                label="📥 Descargar Registro de Canjes (Excel)",
+                data=buffer_canje.getvalue(),
+                file_name="Resumen_Canjes_Fridolin.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+            )
         else:
-            st.info("Cargue los datos biométricos para habilitar la calculadora de canjes.")
+            st.info("No hay empleados con saldo de horas extras o faltas para procesar canjes.")
 
+    # -------------------------------------------------------------------------
+    # TAB 3: REGULARIZACIÓN MANUAL
+    # -------------------------------------------------------------------------
     with tab_regularizar:
         st.subheader("Regularizar Marcación Faltante u Olvido")
         st.write("Permite al supervisor completar horas de entrada o salida no marcadas en el biométrico.")
