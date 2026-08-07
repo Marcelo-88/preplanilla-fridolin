@@ -38,10 +38,13 @@ class LockManager:
         return str(periodo)
 
     def obtener_estado_periodo(self, periodo: str, usuario: Optional[str] = None, *args, **kwargs) -> str:
-        # Tolerancia a cache si el parámetro viene posicional en args
+        """
+        Consulta el estado del período en la base de datos.
+        Acepta tanto 'usuario' nombrado como parámetro posicional para compatibilidad estricta.
+        """
         if not usuario and args:
             usuario = args[0]
-            
+
         clave = self._construir_clave(periodo, usuario)
         with sqlite3.connect(self.db_path) as conn:
             cursor = conn.cursor()
@@ -56,11 +59,12 @@ class LockManager:
         Si está 'PENDIENTE', está bloqueado hasta presionar 'MARCAR EN PROCESO'.
         Si está 'FINALIZADO', solo los superusuarios pueden editar o desbloquear.
         """
-        estado = self.obtener_estado_periodo(periodo, usuario)
+        estado = self.obtener_estado_periodo(periodo, usuario=usuario)
         if estado == self.ESTADO_EN_PROCESO:
             return True
         if estado == self.ESTADO_FINALIZADO:
-            return rol_usuario in self.ROLES_SUPERUSUARIO
+            rol_clean = str(rol_usuario).strip().upper().replace(" ", "_")
+            return rol_clean in self.ROLES_SUPERUSUARIO or rol_usuario in self.ROLES_SUPERUSUARIO
         return False
 
     def cambiar_estado(
@@ -78,9 +82,10 @@ class LockManager:
         usuario_ref = usuario_nombre or usuario_pin
         clave = self._construir_clave(periodo, usuario_ref)
 
-        estado_actual = self.obtener_estado_periodo(periodo, usuario_ref)
+        estado_actual = self.obtener_estado_periodo(periodo, usuario=usuario_ref)
         if estado_actual == self.ESTADO_FINALIZADO and nuevo_estado != self.ESTADO_FINALIZADO:
-            if rol_usuario not in self.ROLES_SUPERUSUARIO:
+            rol_clean = str(rol_usuario).strip().upper().replace(" ", "_")
+            if rol_clean not in self.ROLES_SUPERUSUARIO and rol_usuario not in self.ROLES_SUPERUSUARIO:
                 return {
                     "exito": False,
                     "mensaje": "Permiso denegado: Solo el Responsable de Operaciones o Jefe de Producción puede reabrir un período cerrado."
