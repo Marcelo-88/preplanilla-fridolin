@@ -266,8 +266,8 @@ def process_attendance(df_bio, df_params=None, df_nov=None, df_emp=None, _nov_mg
                 hora_out_str = dt_out.strftime('%H:%M') if dt_out else 'Falta Marcación'
 
                 # Determinación del Tipo de Turno Oficial Ejecutado
-                # 1. Turno y Medio (Nocturno Especial): Entradas 17:30 a 19:30 en Domingo o Viernes
-                es_turno_y_medio = (es_domingo or es_viernes) and (time(17, 30) <= dt_in.time() <= time(19, 30))
+                # 1. Turno y Medio (Nocturno Especial): Entradas de 16:30 a 19:30 en Domingo o Viernes (soporta llegada anticipada)
+                es_turno_y_medio = (es_domingo or es_viernes) and (time(16, 30) <= dt_in.time() <= time(19, 30))
                 
                 # 2. Turno Nocturno Ordinario: Entrada >= 20:00 o < 05:00 o Turno Fijo Nocturno
                 es_nocturno_ordinario = not es_turno_y_medio and (
