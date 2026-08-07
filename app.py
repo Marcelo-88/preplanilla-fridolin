@@ -5,133 +5,185 @@ import os
 import sqlite3
 import json
 from datetime import datetime
+from typing import Dict, Any, Optional
 
-# --- IMPORTS DE MÓDULOS CON MANEJO DE ERRORES Y FALLBACK SEGURO ---
+# --- IMPORTS DE MÓDULOS DEL PROYECTO ---
 from modules.data_loader import load_sheet_data
 from modules.attendance_processor import process_attendance, detect_exceptions, get_canje_summary
 from modules.auth_permissions import render_user_selector, filter_dataframe_by_supervisor
 from modules.excel_exporter import ExcelExporter
 
-# Intentar importar módulos dinámicos; si faltan en el despliegue de GitHub, la app crea clases de respaldo
+# -----------------------------------------------------------------------------
+# CLASE AUDIT LOGGER (Garantiza funcionamiento de la Bitácora)
+# -----------------------------------------------------------------------------
+class AuditLogger:
+    def __init__(self, db_path: str = "audit_log.db"):
+        self.db_path = db_path
+        self._init_db()
+
+    def _init_db(self):
+        try:
+            with sqlite3.connect(self.db_path) as conn:
+                conn.cursor().execute("""
+                    CREATE TABLE IF NOT EXISTS audit_logs (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        timestamp TEXT NOT NULL,
+                        usuario_pin TEXT,
+                        usuario_nombre TEXT,
+                        accion TEXT NOT NULL,
+                        modulo TEXT NOT NULL,
+                        detalles TEXT
+                    )
+                """)
+                conn.commit()
+        except Exception:
+            pass
+
+    def registrar_evento(self, usuario_pin: str, usuario_nombre: str, accion: str, modulo: str, detalles: Optional[Dict[str, Any]] = None) -> bool:
+        try:
+            ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            det = json.dumps(detalles, ensure_ascii=False) if detalles else "{}"
+            with sqlite3.connect(self.db_path) as conn:
+                conn.cursor().execute(
+                    "INSERT INTO audit_logs (timestamp, usuario_pin, usuario_nombre, accion, modulo, detalles) VALUES (?, ?, ?, ?, ?, ?)",
+                    (ts, usuario_pin, usuario_nombre, accion, modulo, det)
+                )
+                conn.commit()
+            return True
+        except Exception:
+            return False
+
+    def obtener_logs(self, limite: int = 1000) -> pd.DataFrame:
+        try:
+            with sqlite3.connect(self.db_path) as conn:
+                df = pd.read_sql_query(
+                    """
+                    SELECT 
+                        timestamp AS 'Fecha y Hora', 
+                        usuario_nombre AS 'Usuario', 
+                        accion AS 'Acción', 
+                        modulo AS 'Módulo', 
+                        detalles AS 'Detalles / Datos' 
+                    FROM audit_logs 
+                    ORDER BY id DESC 
+                    LIMIT ?
+                    """,
+                    conn, params=(limite,)
+                )
+                return df
+        except Exception:
+            return pd.DataFrame(columns=['Fecha y Hora', 'Usuario', 'Acción', 'Módulo', 'Detalles / Datos'])
+
+# Importar o fallback de AuditLogger
 try:
     from modules.audit_logger import AuditLogger
 except ImportError:
-    class AuditLogger:
-        def __init__(self, db_path: str = "audit_log.db"):
-            self.db_path = db_path
-            self._init_db()
+    pass
 
-        def _init_db(self):
-            try:
-                with sqlite3.connect(self.db_path) as conn:
-                    conn.cursor().execute("""
-                        CREATE TABLE IF NOT EXISTS audit_logs (
-                            id INTEGER PRIMARY KEY AUTOINCREMENT,
-                            timestamp TEXT NOT NULL,
-                            usuario_pin TEXT,
-                            usuario_nombre TEXT,
-                            accion TEXT NOT NULL,
-                            modulo TEXT NOT NULL,
-                            detalles TEXT
-                        )
-                    """)
-                    conn.commit()
-            except Exception:
-                pass
 
-        def registrar_evento(self, usuario_pin, usuario_nombre, accion, modulo, detalles=None):
-            try:
-                ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-                det = json.dumps(detalles, ensure_ascii=False) if detalles else "{}"
-                with sqlite3.connect(self.db_path) as conn:
-                    conn.cursor().execute(
-                        "INSERT INTO audit_logs (timestamp, usuario_pin, usuario_nombre, accion, modulo, detalles) VALUES (?, ?, ?, ?, ?, ?)",
-                        (ts, usuario_pin, usuario_nombre, accion, modulo, det)
-                    )
-                    conn.commit()
-                return True
-            except Exception:
-                return False
+# -----------------------------------------------------------------------------
+# CLASE LOCK MANAGER (Integrada de tu archivo original)
+# -----------------------------------------------------------------------------
+class LockManager:
+    """
+    Gestión de estado y cierre de períodos mensuales de asistencia con autonomía por supervisor.
+    Clave de control: Periodo_Supervisor (ejemplo: 2026-07_CABRERA_YASMIN).
+    """
+    ESTADO_PENDIENTE = "PENDIENTE"
+    ESTADO_EN_PROCESO = "EN_PROCESO"
+    ESTADO_FINALIZADO = "FINALIZADO"
 
-        def obtener_logs(self, limite: int = 500) -> pd.DataFrame:
-            try:
-                with sqlite3.connect(self.db_path) as conn:
-                    return pd.read_sql_query(
-                        "SELECT timestamp AS 'Fecha y Hora', usuario_nombre AS 'Usuario', accion AS 'Acción', modulo AS 'Módulo', detalles AS 'Detalles / Datos' FROM audit_logs ORDER BY id DESC LIMIT ?",
-                        conn, params=(limite,)
-                    )
-            except Exception:
-                return pd.DataFrame()
+    ROLES_SUPERUSUARIO = ["RESPONSABLE_OPERACIONES", "JEFE_PRODUCCION", "Jefe de Producción", "ADMINISTRADOR"]
 
-try:
-    from modules.lock_manager import LockManager
-except ImportError:
-    class LockManager:
-        ESTADO_PENDIENTE = "PENDIENTE"
-        ESTADO_EN_PROCESO = "EN_PROCESO"
-        ESTADO_FINALIZADO = "FINALIZADO"
+    def __init__(self, db_path: str = "period_locks.db"):
+        self.db_path = db_path
+        self._init_db()
 
-        def __init__(self, db_path: str = "period_locks.db"):
-            self.db_path = db_path
-            self._init_db()
+    def _init_db(self):
+        with sqlite3.connect(self.db_path) as conn:
+            cursor = conn.cursor()
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS period_locks (
+                    periodo TEXT PRIMARY KEY,
+                    estado TEXT NOT NULL DEFAULT 'PENDIENTE',
+                    cerrado_por TEXT,
+                    fecha_cierre TEXT,
+                    motivo_desbloqueo TEXT
+                )
+            """)
+            conn.commit()
 
-        def _init_db(self):
-            try:
-                with sqlite3.connect(self.db_path) as conn:
-                    conn.cursor().execute("""
-                        CREATE TABLE IF NOT EXISTS period_locks (
-                            periodo TEXT PRIMARY KEY,
-                            estado TEXT NOT NULL,
-                            fecha_actualizacion TEXT,
-                            actualizado_por TEXT,
-                            motivo TEXT
-                        )
-                    """)
-                    conn.commit()
-            except Exception:
-                pass
+    def _construir_clave(self, periodo: str, usuario: Optional[str] = None) -> str:
+        if usuario:
+            usr_clean = str(usuario).strip().upper().replace(" ", "_")
+            return f"{periodo}_{usr_clean}"
+        return str(periodo)
 
-        def _get_key(self, periodo: str, usuario: str = None) -> str:
-            if usuario and usuario.strip():
-                return f"{periodo}_{usuario.strip().replace(' ', '_').upper()}"
-            return periodo
+    def obtener_estado_periodo(self, periodo: str, usuario: Optional[str] = None, *args, **kwargs) -> str:
+        if not usuario and args:
+            usuario = args[0]
 
-        def obtener_estado_periodo(self, periodo: str, usuario: str = None) -> str:
-            try:
-                key = self._get_key(periodo, usuario)
-                with sqlite3.connect(self.db_path) as conn:
-                    cur = conn.cursor()
-                    cur.execute("SELECT estado FROM period_locks WHERE periodo = ?", (key,))
-                    row = cur.fetchone()
-                    return row[0] if row else self.ESTADO_PENDIENTE
-            except Exception:
-                return self.ESTADO_PENDIENTE
+        clave = self._construir_clave(periodo, usuario)
+        with sqlite3.connect(self.db_path) as conn:
+            cursor = conn.cursor()
+            res = cursor.execute("SELECT estado FROM period_locks WHERE periodo = ?", (clave,)).fetchone()
+            if res:
+                return res[0]
+        return self.ESTADO_PENDIENTE
 
-        def es_editable(self, periodo: str, rol: str = "", usuario: str = None) -> bool:
-            if rol in ["Administrador", "Jefe de Producción", "Superusuario"]:
-                return True
-            estado = self.obtener_estado_periodo(periodo, usuario=usuario)
-            return estado == self.ESTADO_EN_PROCESO
+    def es_editable(self, periodo: str, rol_usuario: str, usuario: Optional[str] = None) -> bool:
+        estado = self.obtener_estado_periodo(periodo, usuario=usuario)
+        if estado == self.ESTADO_EN_PROCESO:
+            return True
+        if estado == self.ESTADO_FINALIZADO:
+            rol_clean = str(rol_usuario).strip().upper().replace(" ", "_")
+            return rol_clean in self.ROLES_SUPERUSUARIO or rol_usuario in self.ROLES_SUPERUSUARIO
+        return False
 
-        def cambiar_estado(self, periodo: str, nuevo_estado: str, usuario_pin: str, rol: str, usuario_nombre: str = "", motivo: str = "") -> dict:
-            try:
-                key = self._get_key(periodo, usuario_nombre or usuario_pin)
-                now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-                with sqlite3.connect(self.db_path) as conn:
-                    conn.cursor().execute("""
-                        INSERT INTO period_locks (periodo, estado, fecha_actualizacion, actualizado_por, motivo)
-                        VALUES (?, ?, ?, ?, ?)
-                        ON CONFLICT(periodo) DO UPDATE SET
-                            estado=excluded.estado,
-                            fecha_actualizacion=excluded.fecha_actualizacion,
-                            actualizado_por=excluded.actualizado_por,
-                            motivo=excluded.motivo
-                    """, (key, nuevo_estado, now_str, usuario_nombre or usuario_pin, motivo))
-                    conn.commit()
-                return {"exito": True, "mensaje": f"Estado del período actualizado a {nuevo_estado}."}
-            except Exception as e:
-                return {"exito": False, "mensaje": f"Error: {e}"}
+    def cambiar_estado(
+        self,
+        periodo: str,
+        nuevo_estado: str,
+        usuario_pin: str,
+        rol_usuario: str,
+        usuario_nombre: Optional[str] = None,
+        motivo: Optional[str] = None
+    ) -> Dict[str, Any]:
+        if nuevo_estado not in [self.ESTADO_PENDIENTE, self.ESTADO_EN_PROCESO, self.ESTADO_FINALIZADO]:
+            return {"exito": False, "mensaje": "Estado de período no válido."}
 
+        usuario_ref = usuario_nombre or usuario_pin
+        clave = self._construir_clave(periodo, usuario_ref)
+
+        estado_actual = self.obtener_estado_periodo(periodo, usuario=usuario_ref)
+        if estado_actual == self.ESTADO_FINALIZADO and nuevo_estado != self.ESTADO_FINALIZADO:
+            rol_clean = str(rol_usuario).strip().upper().replace(" ", "_")
+            if rol_clean not in self.ROLES_SUPERUSUARIO and rol_usuario not in self.ROLES_SUPERUSUARIO:
+                return {
+                    "exito": False,
+                    "mensaje": "Permiso denegado: Solo el Responsable de Operaciones o Jefe de Producción puede reabrir un período cerrado."
+                }
+
+        fecha_actual = datetime.now().isoformat()
+        with sqlite3.connect(self.db_path) as conn:
+            cursor = conn.cursor()
+            cursor.execute("""
+                INSERT INTO period_locks (periodo, estado, cerrado_por, fecha_cierre, motivo_desbloqueo)
+                VALUES (?, ?, ?, ?, ?)
+                ON CONFLICT(periodo) DO UPDATE SET
+                    estado = excluded.estado,
+                    cerrado_por = excluded.cerrado_por,
+                    fecha_cierre = excluded.fecha_cierre,
+                    motivo_desbloqueo = excluded.motivo_desbloqueo
+            """, (clave, nuevo_estado, usuario_pin, fecha_actual, motivo or ""))
+            conn.commit()
+
+        return {"exito": True, "mensaje": f"Estado del período {periodo} para {usuario_ref} actualizado a '{nuevo_estado}'."}
+
+
+# -----------------------------------------------------------------------------
+# GESTOR DE NOVEDADES FALLBACK
+# -----------------------------------------------------------------------------
 try:
     from modules.novedades import NovedadesManager
 except ImportError:
@@ -172,7 +224,7 @@ except ImportError:
                 return {"exito": False, "mensaje": f"Error guardando novedad: {e}"}
 
 
-# --- INICIALIZACIÓN Y CACHÉ ---
+# --- INICIALIZACIÓN DE GESTORES ---
 @st.cache_resource
 def get_managers():
     audit = AuditLogger()
@@ -182,6 +234,7 @@ def get_managers():
 
 audit_log, lock_mgr, nov_mgr = get_managers()
 
+# Caching de Funciones
 @st.cache_data(ttl=300, show_spinner=False)
 def cached_load_sheet_data(sheet_name):
     return load_sheet_data(sheet_name)
@@ -210,7 +263,7 @@ st.title("🏭 Control de Asistencia y Reportes - Fridolin")
 st.sidebar.image("https://em-content.zobj.net/source/apple/354/factory_1f3ed.png", width=80)
 st.sidebar.title("Menú Principal")
 
-# Autenticación y Carga de Credenciales
+# Autenticación y Credenciales
 try:
     df_emp_master = cached_load_sheet_data("01_Maestro_Empleados")
     usuario_actual, rol_actual, empleados_permitidos, pin_ok = render_user_selector(df_emp_master)
@@ -478,7 +531,7 @@ elif opcion == "✅ Aprobaciones Supervisores":
                 st.error(res_c["mensaje"])
 
     with col_rev3:
-        if estado_periodo == "FINALIZADO" and (rol_actual == "Jefe de Producción"):
+        if estado_periodo == "FINALIZADO" and (rol_actual in LockManager.ROLES_SUPERUSUARIO):
             if st.button("🔓 Desbloquear Período (Superusuario)"):
                 res_c = lock_mgr.cambiar_estado(periodo_sel, lock_mgr.ESTADO_PENDIENTE, usuario_actual, rol_actual, usuario_nombre=usuario_actual, motivo="Desbloqueo por Jefatura")
                 if res_c["exito"]:
