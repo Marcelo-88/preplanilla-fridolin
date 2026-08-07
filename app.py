@@ -69,7 +69,8 @@ opcion = st.sidebar.radio(
         "⏱️ Importación Biométrico",
         "📝 Novedades y Permisos",
         "✅ Aprobaciones Supervisores",
-        "📑 Pre-Planilla y Reportes"
+        "📑 Pre-Planilla y Reportes",
+        "📜 Bitácora de Auditoría"
     ]
 )
 
@@ -563,3 +564,43 @@ elif opcion == "📑 Pre-Planilla y Reportes":
                     )
         except Exception as e:
             st.error(f"Error durante el procesamiento del reporte: {e}")
+
+# -----------------------------------------------------------------------------
+# 7. BITÁCORA DE AUDITORÍA
+# -----------------------------------------------------------------------------
+elif opcion == "📜 Bitácora de Auditoría":
+    st.header("📜 Bitácora de Auditoría e Historial de Cambios")
+    st.caption("Registro inalterable de acciones realizadas por los supervisores en el sistema.")
+
+    df_logs = audit_log.obtener_logs(limite=1000)
+
+    if not df_logs.empty:
+        col_b1, col_b2 = st.columns(2)
+        with col_b1:
+            usuarios_log = ["Todos"] + list(df_logs['Usuario'].dropna().unique())
+            u_sel = st.selectbox("Filtrar por Usuario:", usuarios_log)
+        with col_b2:
+            modulos_log = ["Todos"] + list(df_logs['Módulo'].dropna().unique())
+            m_sel = st.selectbox("Filtrar por Módulo:", modulos_log)
+
+        df_logs_fil = df_logs.copy()
+        if u_sel != "Todos":
+            df_logs_fil = df_logs_fil[df_logs_fil['Usuario'] == u_sel]
+        if m_sel != "Todos":
+            df_logs_fil = df_logs_fil[df_logs_fil['Módulo'] == m_sel]
+
+        st.dataframe(df_logs_fil, use_container_width=True, hide_index=True)
+
+        # Botón para descargar la bitácora en Excel
+        buffer_log = io.BytesIO()
+        with pd.ExcelWriter(buffer_log, engine='xlsxwriter') as writer:
+            df_logs_fil.to_excel(writer, sheet_name='Bitacora_Auditoria', index=False)
+        
+        st.download_button(
+            label="📥 Descargar Bitácora en Excel",
+            data=buffer_log.getvalue(),
+            file_name=f"Bitacora_Auditoria_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+        )
+    else:
+        st.info("ℹ️ Aún no existen registros en la bitácora de auditoría.")
