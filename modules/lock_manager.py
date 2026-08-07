@@ -4,7 +4,8 @@ from typing import Dict, Any, Optional
 
 class LockManager:
     """
-    Gestión de estado y cierre de períodos mensuales de asistencia.
+    Gestión de estado y cierre de períodos mensuales de asistencia con autonomía por supervisor.
+    Clave de control: Periodo_Supervisor (ejemplo: 2026-07_CABRERA_YASMIN).
     """
     ESTADO_PENDIENTE = "PENDIENTE"
     ESTADO_EN_PROCESO = "EN_PROCESO"
@@ -30,19 +31,33 @@ class LockManager:
             """)
             conn.commit()
 
-    def obtener_estado_periodo(self, periodo: str) -> str:
+    def _construir_clave(self, periodo: str, usuario: Optional[str] = None) -> str:
+        if usuario:
+            usr_clean = str(usuario).strip().upper().replace(" ", "_")
+            return f"{periodo}_{usr_clean}"
+        return periodo
+
+    def obtener_estado_periodo(self, periodo: str, usuario: Optional[str] = None) -> str:
+        clave = self._construir_clave(periodo, usuario)
         with sqlite3.connect(self.db_path) as conn:
             cursor = conn.cursor()
-            res = cursor.execute("SELECT estado FROM period_locks WHERE periodo = ?", (periodo,)).fetchone()
+            res = cursor.execute("SELECT estado FROM period_locks WHERE periodo = ?", (clave,)).fetchone()
             if res:
                 return res[0]
         return self.ESTADO_PENDIENTE
 
-    def es_editable(self, periodo: str, rol_usuario: str) -> bool:
-        estado = self.obtener_estado_periodo(periodo)
-        if estado != self.ESTADO_FINALIZADO:
+    def es_editable(self, periodo: str, rol_usuario: str, usuario: Optional[str] = None) -> bool:
+        """
+        Bloqueo estricto: La edición SOLO se habilita cuando el estado es 'EN_PROCESO'.
+        Si está 'PENDIENTE', está bloqueado hasta presionar 'MARCAR EN PROCESO'.
+        Si está 'FINALIZADO', solo los superusuarios pueden editar o desbloquear.
+        """
+        estado = self.obtener_estado_periodo(periodo, usuario)
+        if estado == self.ESTADO_EN_PROCESO:
             return True
-        return rol_usuario in self.ROLES_SUPERUSUARIO
+        if estado == self.ESTADO_FINALIZADO:
+            return rol_usuario in self.ROLES_SUPERUSUARIO
+        return False
 
     def cambiar_estado(
         self,
@@ -50,12 +65,16 @@ class LockManager:
         nuevo_estado: str,
         usuario_pin: str,
         rol_usuario: str,
+        usuario_nombre: Optional[str] = None,
         motivo: Optional[str] = None
     ) -> Dict[str, Any]:
         if nuevo_estado not in [self.ESTADO_PENDIENTE, self.ESTADO_EN_PROCESO, self.ESTADO_FINALIZADO]:
             return {"exito": False, "mensaje": "Estado de período no válido."}
 
-        estado_actual = self.obtener_estado_periodo(periodo)
+        usuario_ref = usuario_nombre or usuario_pin
+        clave = self._construir_clave(periodo, usuario_ref)
+
+        estado_actual = self.obtener_estado_periodo(periodo, usuario_ref)
         if estado_actual == self.ESTADO_FINALIZADO and nuevo_estado != self.ESTADO_FINALIZADO:
             if rol_usuario not in self.ROLES_SUPERUSUARIO:
                 return {
@@ -74,7 +93,7 @@ class LockManager:
                     cerrado_por = excluded.cerrado_por,
                     fecha_cierre = excluded.fecha_cierre,
                     motivo_desbloqueo = excluded.motivo_desbloqueo
-            """, (periodo, nuevo_estado, usuario_pin, fecha_actual, motivo or ""))
+            """, (clave, nuevo_estado, usuario_pin, fecha_actual, motivo or ""))
             conn.commit()
 
-        return {"exito": True, "mensaje": f"Período {periodo} actualizado a estado '{nuevo_estado}'."}
+        return {"exito": True, "mensaje": f"Estado del período {periodo} para {usuario_ref} actualizado a '{nuevo_estado}'."}
