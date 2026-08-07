@@ -125,7 +125,7 @@ if opcion == "📊 Parámetros y Reglas":
         st.warning("""
         ⚠️ **REGLA CRÍTICA DE PROCESAMIENTO:**
         
-        1. Al ingresar a Aprobaciones, debe presionar **`MARCAR EN PROCESO`** para habilitar la edición de las tablas de su personal asignado.
+        1. Al ingresar en Aprobaciones, debe presionar **`MARCAR EN PROCESO`** para habilitar la edición de las tablas de su personal asignado.
         2. Una vez concluida la revisión total, presione **`FINALIZAR Y CERRAR PERÍODO`**.
         3. **Importante:** Cada supervisor gestiona su propia autonomía de revisión.
         4. En caso de error tras finalizar, debe comunicarse con **Ever Medrano** para solicitar la reapertura.
