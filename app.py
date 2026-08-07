@@ -1,17 +1,178 @@
 import streamlit as st
 import pandas as pd
 import io
+import os
+import sqlite3
+import json
 from datetime import datetime
 
+# --- IMPORTS DE MÓDULOS CON MANEJO DE ERRORES Y FALLBACK SEGURO ---
 from modules.data_loader import load_sheet_data
 from modules.attendance_processor import process_attendance, detect_exceptions, get_canje_summary
 from modules.auth_permissions import render_user_selector, filter_dataframe_by_supervisor
-from modules.audit_logger import AuditLogger
-from modules.lock_manager import LockManager
-from modules.novedades import NovedadesManager
 from modules.excel_exporter import ExcelExporter
 
-# Inicialización de Gestores Persistence/DB
+# Intentar importar módulos dinámicos; si faltan en el despliegue de GitHub, la app crea clases de respaldo
+try:
+    from modules.audit_logger import AuditLogger
+except ImportError:
+    class AuditLogger:
+        def __init__(self, db_path: str = "audit_log.db"):
+            self.db_path = db_path
+            self._init_db()
+
+        def _init_db(self):
+            try:
+                with sqlite3.connect(self.db_path) as conn:
+                    conn.cursor().execute("""
+                        CREATE TABLE IF NOT EXISTS audit_logs (
+                            id INTEGER PRIMARY KEY AUTOINCREMENT,
+                            timestamp TEXT NOT NULL,
+                            usuario_pin TEXT,
+                            usuario_nombre TEXT,
+                            accion TEXT NOT NULL,
+                            modulo TEXT NOT NULL,
+                            detalles TEXT
+                        )
+                    """)
+                    conn.commit()
+            except Exception:
+                pass
+
+        def registrar_evento(self, usuario_pin, usuario_nombre, accion, modulo, detalles=None):
+            try:
+                ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                det = json.dumps(detalles, ensure_ascii=False) if detalles else "{}"
+                with sqlite3.connect(self.db_path) as conn:
+                    conn.cursor().execute(
+                        "INSERT INTO audit_logs (timestamp, usuario_pin, usuario_nombre, accion, modulo, detalles) VALUES (?, ?, ?, ?, ?, ?)",
+                        (ts, usuario_pin, usuario_nombre, accion, modulo, det)
+                    )
+                    conn.commit()
+                return True
+            except Exception:
+                return False
+
+        def obtener_logs(self, limite: int = 500) -> pd.DataFrame:
+            try:
+                with sqlite3.connect(self.db_path) as conn:
+                    return pd.read_sql_query(
+                        "SELECT timestamp AS 'Fecha y Hora', usuario_nombre AS 'Usuario', accion AS 'Acción', modulo AS 'Módulo', detalles AS 'Detalles / Datos' FROM audit_logs ORDER BY id DESC LIMIT ?",
+                        conn, params=(limite,)
+                    )
+            except Exception:
+                return pd.DataFrame()
+
+try:
+    from modules.lock_manager import LockManager
+except ImportError:
+    class LockManager:
+        ESTADO_PENDIENTE = "PENDIENTE"
+        ESTADO_EN_PROCESO = "EN_PROCESO"
+        ESTADO_FINALIZADO = "FINALIZADO"
+
+        def __init__(self, db_path: str = "period_locks.db"):
+            self.db_path = db_path
+            self._init_db()
+
+        def _init_db(self):
+            try:
+                with sqlite3.connect(self.db_path) as conn:
+                    conn.cursor().execute("""
+                        CREATE TABLE IF NOT EXISTS period_locks (
+                            periodo TEXT PRIMARY KEY,
+                            estado TEXT NOT NULL,
+                            fecha_actualizacion TEXT,
+                            actualizado_por TEXT,
+                            motivo TEXT
+                        )
+                    """)
+                    conn.commit()
+            except Exception:
+                pass
+
+        def _get_key(self, periodo: str, usuario: str = None) -> str:
+            if usuario and usuario.strip():
+                return f"{periodo}_{usuario.strip().replace(' ', '_').upper()}"
+            return periodo
+
+        def obtener_estado_periodo(self, periodo: str, usuario: str = None) -> str:
+            try:
+                key = self._get_key(periodo, usuario)
+                with sqlite3.connect(self.db_path) as conn:
+                    cur = conn.cursor()
+                    cur.execute("SELECT estado FROM period_locks WHERE periodo = ?", (key,))
+                    row = cur.fetchone()
+                    return row[0] if row else self.ESTADO_PENDIENTE
+            except Exception:
+                return self.ESTADO_PENDIENTE
+
+        def es_editable(self, periodo: str, rol: str = "", usuario: str = None) -> bool:
+            if rol in ["Administrador", "Jefe de Producción", "Superusuario"]:
+                return True
+            estado = self.obtener_estado_periodo(periodo, usuario=usuario)
+            return estado == self.ESTADO_EN_PROCESO
+
+        def cambiar_estado(self, periodo: str, nuevo_estado: str, usuario_pin: str, rol: str, usuario_nombre: str = "", motivo: str = "") -> dict:
+            try:
+                key = self._get_key(periodo, usuario_nombre or usuario_pin)
+                now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                with sqlite3.connect(self.db_path) as conn:
+                    conn.cursor().execute("""
+                        INSERT INTO period_locks (periodo, estado, fecha_actualizacion, actualizado_por, motivo)
+                        VALUES (?, ?, ?, ?, ?)
+                        ON CONFLICT(periodo) DO UPDATE SET
+                            estado=excluded.estado,
+                            fecha_actualizacion=excluded.fecha_actualizacion,
+                            actualizado_por=excluded.actualizado_por,
+                            motivo=excluded.motivo
+                    """, (key, nuevo_estado, now_str, usuario_nombre or usuario_pin, motivo))
+                    conn.commit()
+                return {"exito": True, "mensaje": f"Estado del período actualizado a {nuevo_estado}."}
+            except Exception as e:
+                return {"exito": False, "mensaje": f"Error: {e}"}
+
+try:
+    from modules.novedades import NovedadesManager
+except ImportError:
+    class NovedadesManager:
+        def __init__(self, json_path: str = "novedades_local.json"):
+            self.json_path = json_path
+
+        def obtener_tipos_novedad(self):
+            return ["Baja Médica", "Licencia por Paternidad", "Licencia por Luto", "Vacación", "Lactancia Maternidad", "Permiso Personal"]
+
+        def obtener_todas_novedades(self):
+            if os.path.exists(self.json_path):
+                try:
+                    with open(self.json_path, "r", encoding="utf-8") as f:
+                        return json.load(f)
+                except Exception:
+                    return []
+            return []
+
+        def registrar_novedad(self, empleado_id, empleado_nombre, tipo_novedad, fecha_inicio, fecha_fin, justificacion, registrado_por_pin):
+            novs = self.obtener_todas_novedades()
+            nueva = {
+                "ID": empleado_id,
+                "Nombre_Completo": empleado_nombre,
+                "Tipo_Novedad": tipo_novedad,
+                "Fecha_Inicio": fecha_inicio,
+                "Fecha_Fin": fecha_fin,
+                "Justificacion": justificacion,
+                "Registrado_Por": registrado_por_pin,
+                "Fecha_Registro": datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            }
+            novs.append(nueva)
+            try:
+                with open(self.json_path, "w", encoding="utf-8") as f:
+                    json.dump(novs, f, ensure_ascii=False, indent=2)
+                return {"exito": True, "mensaje": "Novedad registrada exitosamente."}
+            except Exception as e:
+                return {"exito": False, "mensaje": f"Error guardando novedad: {e}"}
+
+
+# --- INICIALIZACIÓN Y CACHÉ ---
 @st.cache_resource
 def get_managers():
     audit = AuditLogger()
@@ -21,12 +182,10 @@ def get_managers():
 
 audit_log, lock_mgr, nov_mgr = get_managers()
 
-# Caching de Carga de Hojas de Cálculo
 @st.cache_data(ttl=300, show_spinner=False)
 def cached_load_sheet_data(sheet_name):
     return load_sheet_data(sheet_name)
 
-# Caching de Procesamiento de Asistencia
 @st.cache_data(ttl=300, show_spinner=False)
 def run_cached_attendance_processing(df_bio, df_params, df_emp, _nov_mgr):
     return process_attendance(df_bio, df_params, None, df_emp, _nov_mgr)
@@ -51,7 +210,7 @@ st.title("🏭 Control de Asistencia y Reportes - Fridolin")
 st.sidebar.image("https://em-content.zobj.net/source/apple/354/factory_1f3ed.png", width=80)
 st.sidebar.title("Menú Principal")
 
-# Cargar Maestro de Empleados para autenticación y PIN
+# Autenticación y Carga de Credenciales
 try:
     df_emp_master = cached_load_sheet_data("01_Maestro_Empleados")
     usuario_actual, rol_actual, empleados_permitidos, pin_ok = render_user_selector(df_emp_master)
@@ -83,7 +242,6 @@ st.sidebar.caption("Sistema de Control de Asistencia v2.0")
 if opcion == "📊 Parámetros y Reglas":
     st.header("⚙️ Parámetros y Reglas del Sistema")
 
-    # --- SECCIÓN 1: TABLA DE PARÁMETROS Y REGLAS ---
     st.subheader("📋 Matriz de Parámetros Normativos")
     
     data_reglas = [
@@ -102,7 +260,6 @@ if opcion == "📊 Parámetros y Reglas":
 
     st.divider()
 
-    # --- SECCIÓN 2: TUTORIAL Y GUÍA OPERATIVA PARA SUPERVISORES ---
     st.subheader("📖 Guía Operativa para Cierre Mensual (Paso a Paso)")
     st.caption("Manual rápido de procedimiento obligatorio para supervisores al cierre de cada período.")
 
@@ -234,7 +391,7 @@ elif opcion == "📝 Novedades y Permisos":
                         if col_nombre and col_nombre in df_emp.columns:
                             row_e = df_emp[df_emp[col_nombre] == emp_seleccionado]
                             if not row_e.empty:
-                                col_id = 'Carnet_Identidad' if 'Carnet_Identidad' in df_emp.columns else ('ID' if 'ID' in df_emp.columns else None)
+                                col_id = 'Carnet_Identidad' if 'Carnet_Identidad' in row_e.columns else ('ID' if 'ID' in row_e.columns else None)
                                 if col_id and col_id in row_e.columns:
                                     emp_id = str(row_e[col_id].values[0])
 
@@ -284,7 +441,6 @@ elif opcion == "✅ Aprobaciones Supervisores":
     with col_p1:
         periodo_sel = st.selectbox("🗓️ Seleccionar Período de Revisión:", options=periodos_disponibles)
 
-    # Autonomía por supervisor: El estado de revisión depende de (periodo_sel, usuario_actual)
     estado_periodo = lock_mgr.obtener_estado_periodo(periodo_sel, usuario=usuario_actual)
     es_editable = lock_mgr.es_editable(periodo_sel, rol_actual, usuario=usuario_actual)
 
@@ -347,7 +503,6 @@ elif opcion == "✅ Aprobaciones Supervisores":
 
         df_bio_periodo = df_bio[df_bio['dt_temp'].dt.strftime('%Y-%m') == periodo_sel].copy() if 'dt_temp' in df_bio.columns else df_bio
 
-        # Procesamiento optimizado y cacheado
         df_res = run_cached_attendance_processing(df_bio_periodo, df_params, df_emp, nov_mgr)
         df_excepciones = run_cached_exceptions(df_res)
         df_canje_resumen = run_cached_canje(df_res)
@@ -388,7 +543,6 @@ elif opcion == "✅ Aprobaciones Supervisores":
             m3.metric("Sol. Horas Extras / Dom", len(df_fil_exc[df_fil_exc['Tipo Excepción'].str.contains('Horas Extras')]))
             m4.metric("Desfases Ingreso", len(df_fil_exc[df_fil_exc['Tipo Excepción'] == 'Desfase Horario Ingreso']))
 
-            # Definición estricta de columnas deshabilitadas según estado
             if not es_editable:
                 cols_deshabilitadas_exc = list(df_fil_exc.columns)
             else:
@@ -520,7 +674,6 @@ elif opcion == "📑 Pre-Planilla y Reportes":
             else:
                 df_bio_rep = df_bio
 
-            # Procesamiento optimizado y cacheado
             df_resultado = run_cached_attendance_processing(df_bio_rep, df_params, df_emp, nov_mgr)
 
             if df_resultado is not None and not df_resultado.empty:
@@ -591,7 +744,6 @@ elif opcion == "📜 Bitácora de Auditoría":
 
         st.dataframe(df_logs_fil, use_container_width=True, hide_index=True)
 
-        # Botón para descargar la bitácora en Excel
         buffer_log = io.BytesIO()
         with pd.ExcelWriter(buffer_log, engine='xlsxwriter') as writer:
             df_logs_fil.to_excel(writer, sheet_name='Bitacora_Auditoria', index=False)
