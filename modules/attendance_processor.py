@@ -3,7 +3,7 @@ import numpy as np
 from datetime import datetime, time, timedelta
 
 TOLERANCIA_MINUTOS = 10
-DESCUENTO_COMIDA_HORAS = 0.5  # 30 minutos obligatorios
+DESCUENTO_COMIDA_HORAS = 0.5  # 30 minutos obligatorios de almuerzo/cena
 
 DIAS_ESPANOL = {
     0: 'Lunes',
@@ -166,6 +166,7 @@ def process_attendance(df_bio, df_params=None, df_nov=None, df_emp=None, _nov_mg
     for emp_id_str in todos_emp_ids:
         emp_nombre = dict_nombres_master.get(emp_id_str) or bio_names_map.get(emp_id_str) or f"EMP-{emp_id_str}"
         tipo_personal = dict_tipo_personal.get(emp_id_str, "Fijo").capitalize()
+        es_staff = "STAFF" in tipo_personal.upper()
         turno_asignado_base = dict_turno_personal.get(emp_id_str, "Diurno").capitalize()
 
         for single_date in rango_dias:
@@ -201,6 +202,7 @@ def process_attendance(df_bio, df_params=None, df_nov=None, df_emp=None, _nov_mg
                     dt_in = p_in['dt_parsed']
                     p_type = str(p_in.get(col_tipo, '')).strip().lower() if col_tipo else ''
 
+                    # Pareo Dinámico con Ventana Flotante de 18 Horas
                     dt_out = None
                     if 'salida' not in p_type:
                         j = i + 1
@@ -208,7 +210,7 @@ def process_attendance(df_bio, df_params=None, df_nov=None, df_emp=None, _nov_mg
                             next_dt = punches_dia[j]['dt_parsed']
                             next_type = str(punches_dia[j].get(col_tipo, '')).strip().lower() if col_tipo else ''
                             
-                            if (next_dt - dt_in).total_seconds() <= 16 * 3600:
+                            if (next_dt - dt_in).total_seconds() <= 18 * 3600:
                                 if 'salida' in next_type or j == len(punches_dia) - 1 or (punches_dia[j+1]['dt_parsed'] - next_dt).total_seconds() > 4 * 3600:
                                     dt_out = next_dt
                                     i = j
@@ -218,24 +220,70 @@ def process_attendance(df_bio, df_params=None, df_nov=None, df_emp=None, _nov_mg
                     hora_in_str = dt_in.strftime('%H:%M')
                     hora_out_str = dt_out.strftime('%H:%M') if dt_out else 'Falta Marcación'
 
-                    es_ingreso_nocturno = (dt_in.hour >= 18 or dt_in.hour < 5)
+                    es_ingreso_nocturno = (dt_in.hour >= 17 or dt_in.hour < 5)
                     es_nocturno = es_turno_nocturno_fijo or es_ingreso_nocturno
                     turno_label = 'Nocturno' if es_nocturno else 'Diurno'
 
+                    # Evaluaciones de Turno y Medio Nocturno
+                    es_turno_y_medio = False
+                    if es_nocturno and (es_viernes or es_domingo):
+                        # Si entra en ventana de 17:30 a 19:30 o está programado a las 18:00
+                        if (dt_in.hour == 17 and dt_in.minute >= 30) or (dt_in.hour in [18, 19]):
+                            es_turno_y_medio = True
+
+                    # Definición de Horarios Oficiales Esperados
+                    if es_nocturno:
+                        if es_turno_y_medio:
+                            hora_esperada_in = time(18, 0)
+                            dt_esperada_in = datetime.combine(dt_in.date(), hora_esperada_in)
+                            dt_salida_oficial = datetime.combine(dt_in.date() + timedelta(days=1), time(5, 30))
+                        else:
+                            hora_esperada_in = time(22, 0)
+                            dt_esperada_in = datetime.combine(dt_in.date(), hora_esperada_in)
+                            dt_salida_oficial = datetime.combine(dt_in.date() + timedelta(days=1), time(5, 30))
+                    else:
+                        hora_esperada_in = time(7, 0)  # Entrada Oficial Diurna
+                        dt_esperada_in = datetime.combine(dt_in.date(), hora_esperada_in)
+                        dt_salida_oficial = datetime.combine(dt_in.date(), time(15, 30)) # Salida Oficial Diurna
+
+                    # Lógica de Entrada/Salida Efectiva (Rechazo Implícito por Defecto)
+                    dt_in_efectiva = dt_in
+                    entrada_anticipada_flag = False
+                    if dt_in < dt_esperada_in:
+                        dif_min_anticipada = (dt_esperada_in - dt_in).total_seconds() / 60.0
+                        if dif_min_anticipada >= 30:
+                            entrada_anticipada_flag = True
+                        dt_in_efectiva = dt_esperada_in
+
+                    dt_out_efectiva = dt_out
+                    salida_tardia_flag = False
+                    minutos_extra_solicitados = 0.0
                     if dt_out:
-                        horas_brutas = (dt_out - dt_in).total_seconds() / 3600.0
-                        if dt_out <= dt_in:
-                            horas_brutas += 24.0
+                        if dt_out > dt_salida_oficial:
+                            dif_min_tardio = (dt_out - dt_salida_oficial).total_seconds() / 60.0
+                            if dif_min_tardio >= 30:
+                                salida_tardia_flag = True
+                                minutos_extra_solicitados = round(dif_min_tardio / 60.0, 2)
+                            dt_out_efectiva = dt_salida_oficial
+
+                    # Cálculo de Horas Trabajadas Efectivas
+                    if dt_out_efectiva and dt_out_efectiva > dt_in_efectiva:
+                        horas_brutas = (dt_out_efectiva - dt_in_efectiva).total_seconds() / 3600.0
                     else:
                         horas_brutas = 0.0
 
                     horas_netas = max(0.0, round(horas_brutas - DESCUENTO_COMIDA_HORAS, 2)) if horas_brutas > 0 else 0.0
 
-                    hora_esperada = time(22, 0) if es_nocturno else time(7, 30)
-                    dt_esperada = datetime.combine(dt_in.date(), hora_esperada)
-                    
-                    minutos_diferencia = (dt_in - dt_esperada).total_seconds() / 60.0
-                    atraso_minutos = max(0, int(minutos_diferencia - TOLERANCIA_MINUTOS)) if minutos_diferencia > TOLERANCIA_MINUTOS else 0
+                    # Tolerancia de Atraso (Todo o Nada: <=10min = 0, >10min = cobro completo)
+                    minutos_diferencia_atraso = (dt_in - dt_esperada_in).total_seconds() / 60.0
+                    if minutos_diferencia_atraso <= TOLERANCIA_MINUTOS:
+                        atraso_minutos = 0
+                    else:
+                        atraso_minutos = int(minutos_diferencia_atraso)
+
+                    # Inmunidad STAFF
+                    if es_staff:
+                        atraso_minutos = 0
 
                     novedad_activa = None
                     exento_faltas = False
@@ -254,44 +302,53 @@ def process_attendance(df_bio, df_params=None, df_nov=None, df_emp=None, _nov_mg
                             exento_atrasos = True
                             atraso_minutos = 0
 
+                    # Cómputo de Turnos y Horas Extras
                     turnos_computados = 1.0
                     horas_extras = 0.0
                     horas_nocturnas = horas_netas if es_nocturno else 0.0
 
                     if es_domingo:
-                        if es_nocturno and dt_in.hour >= 18:
-                            turnos_computados = 1.0
+                        if es_nocturno and dt_in.hour >= 17:
+                            if es_turno_y_medio:
+                                turnos_computados = 1.5
+                            else:
+                                turnos_computados = 1.0
                             horas_extras = 0.0
                             if not novedad_activa:
                                 novedad_activa = 'Inicio Semana Nocturna'
                         else:
                             turnos_computados = 1.5
-                            if "Jornal" not in tipo_personal:
+                            if "Jornal" not in tipo_personal and not es_staff:
                                 horas_extras = horas_netas
                             if not novedad_activa:
                                 novedad_activa = 'Trabajo Domingo / Temporada Alta'
                     else:
                         if "Jornal" in tipo_personal:
-                            turnos_computados = 1.5 if (es_nocturno and es_viernes) or horas_netas >= 11.5 else 1.0
+                            turnos_computados = 1.5 if (es_nocturno and (es_viernes or es_turno_y_medio)) or horas_netas >= 11.0 else 1.0
                             horas_extras = 0.0
                         elif es_nocturno:
-                            if es_viernes:
+                            if es_turno_y_medio:
+                                turnos_computados = 1.5
+                                horas_extras = 0.0
+                            elif es_viernes:
                                 turnos_computados = 1.5
                                 horas_extras = 0.0
                             else:
                                 turnos_computados = 1.0
                                 jornada_limite = 7.0
-                                if horas_netas > jornada_limite:
+                                if horas_netas > jornada_limite and not es_staff:
                                     horas_extras = round(horas_netas - jornada_limite, 2)
                         else:
                             turnos_computados = 1.0
                             jornada_limite = 7.0 if novedad_activa == "REDUCCION_LACTANCIA" else 8.0
-                            if horas_netas > jornada_limite:
+                            if horas_netas > jornada_limite and not es_staff:
                                 horas_extras = round(horas_netas - jornada_limite, 2)
 
-                    es_falta = (not dt_out) and not exento_faltas
+                    if es_staff:
+                        horas_extras = 0.0
+
+                    es_falta = (not dt_out) and not exento_faltas and not es_staff
                     
-                    # Clasificación estricta de Falta con Marcación Incompleta
                     falta_justificada = 0
                     falta_injustificada = 0
 
@@ -302,7 +359,7 @@ def process_attendance(df_bio, df_params=None, df_nov=None, df_emp=None, _nov_mg
                             falta_injustificada = 1
 
                     desfase_ingreso = False
-                    if horas_netas >= 7.0 and minutos_diferencia > 45 and not exento_atrasos:
+                    if horas_netas >= 7.0 and minutos_diferencia_atraso > 45 and not exento_atrasos and not es_staff:
                         desfase_ingreso = True
 
                     registros.append({
@@ -323,7 +380,10 @@ def process_attendance(df_bio, df_params=None, df_nov=None, df_emp=None, _nov_mg
                         'Turno Dominante': turno_label,
                         'Novedad / Licencia': novedad_activa if novedad_activa else 'Ninguna',
                         'Desfase Ingreso': desfase_ingreso,
-                        'Estado': 'OK' if dt_out or exento_faltas else 'Revisar Marcación'
+                        'Entrada Anticipada Flag': entrada_anticipada_flag,
+                        'Salida Tardia Flag': salida_tardia_flag,
+                        'HE Solicitadas': minutos_extra_solicitados,
+                        'Estado': 'OK' if dt_out or exento_faltas or es_staff else 'Revisar Marcación'
                     })
                     i += 1
 
@@ -335,13 +395,11 @@ def process_attendance(df_bio, df_params=None, df_nov=None, df_emp=None, _nov_mg
                 falta_justificada = 0
                 estado_registro = 'OK'
 
-                # Licencias con Goce de Haber (Cobran 100% | No implican descuento | No son falta)
                 es_licencia_pagada = novedad_activa in [
                     "BAJA_MEDICA", "PERMISO_CON_GOCE", "VACACIONES",
                     "LICENCIA_MATERNIDAD", "LICENCIA_PATERNIDAD", "DUELO_FAMILIAR"
                 ]
 
-                # Licencias Sin Goce de Haber (Descuento pero CANJEABLE)
                 es_licencia_canjeable = novedad_activa in [
                     "PERMISO_SIN_GOCE", "FALTA_JUSTIFICADA"
                 ]
@@ -354,6 +412,10 @@ def process_attendance(df_bio, df_params=None, df_nov=None, df_emp=None, _nov_mg
                     falta_justificada = 1
                     falta_injustificada = 0
                     estado_registro = 'Permiso/Falta Justificada'
+                elif es_staff:
+                    falta_justificada = 0
+                    falta_injustificada = 0
+                    estado_registro = 'OK (Staff)'
                 else:
                     if es_domingo:
                         if es_turno_nocturno_fijo:
@@ -387,6 +449,9 @@ def process_attendance(df_bio, df_params=None, df_nov=None, df_emp=None, _nov_mg
                     'Turno Dominante': turno_asignado_dia,
                     'Novedad / Licencia': novedad_activa if novedad_activa else ('Descanso Semanal' if estado_registro == 'Descanso Semanal' else 'Ninguna'),
                     'Desfase Ingreso': False,
+                    'Entrada Anticipada Flag': False,
+                    'Salida Tardia Flag': False,
+                    'HE Solicitadas': 0.0,
                     'Estado': estado_registro
                 })
 
@@ -418,6 +483,7 @@ def detect_exceptions(df_resultado):
         dt_f = pd.to_datetime(fecha)
         semana = dt_f.isocalendar().week
 
+        # 1. Faltas u Omisión de Marcación
         if row['Estado'] in ['Revisar Marcación', 'Falta / Omisión Marcación'] and row['Falta Injustificada'] == 1:
             excepciones.append({
                 'Carnet_Identidad': emp_id,
@@ -431,6 +497,7 @@ def detect_exceptions(df_resultado):
                 'Observaciones': ''
             })
 
+        # 2. Horas Extras Automáticas / Dominicales
         if row['Horas Extras'] > 0 or row.get('Novedad / Licencia') == 'Trabajo Domingo / Temporada Alta':
             detalle_txt = f"Trabajo Domingo: {row['Horas Trabajadas']} hrs" if row.get('Novedad / Licencia') == 'Trabajo Domingo / Temporada Alta' else f"Marcación excedente: {row['Horas Extras']} hrs"
             excepciones.append({
@@ -445,6 +512,35 @@ def detect_exceptions(df_resultado):
                 'Observaciones': ''
             })
 
+        # 3. Salida Tardía (Horas Extras Solicitadas no Aprobadas)
+        if row.get('Salida Tardia Flag', False):
+            excepciones.append({
+                'Carnet_Identidad': emp_id,
+                'Nombre': emp_nom,
+                'Fecha': fecha,
+                'Tipo Excepción': 'Horas Extras Solicitadas (Salida Tardía)',
+                'Detalle Excepción': f"Salida marcada a las {row['Salida']} ({row.get('HE Solicitadas', 0)} hrs solicitadas)",
+                'Valor a Revisar': f"{row.get('HE Solicitadas', 0)} hrs",
+                'Decisión Supervisor': 'Pendiente',
+                'Tipo Falta': 'N/A',
+                'Observaciones': 'Rechazado por defecto. Apruebe para computar extras.'
+            })
+
+        # 4. Entrada Anticipada Pendiente
+        if row.get('Entrada Anticipada Flag', False):
+            excepciones.append({
+                'Carnet_Identidad': emp_id,
+                'Nombre': emp_nom,
+                'Fecha': fecha,
+                'Tipo Excepción': 'Entrada Anticipada Pendiente',
+                'Detalle Excepción': f"Ingresó a las {row['Entrada']} (antes del horario oficial)",
+                'Valor a Revisar': f"Entrada {row['Entrada']}",
+                'Decisión Supervisor': 'Pendiente',
+                'Tipo Falta': 'N/A',
+                'Observaciones': 'Computado desde hora oficial por defecto.'
+            })
+
+        # 5. Séptimo Día Laborado
         if (emp_id, semana) in semanas_7dias:
             excepciones.append({
                 'Carnet_Identidad': emp_id,
@@ -458,6 +554,7 @@ def detect_exceptions(df_resultado):
                 'Observaciones': ''
             })
 
+        # 6. Desfase de Horario de Ingreso
         if row.get('Desfase Ingreso', False):
             excepciones.append({
                 'Carnet_Identidad': emp_id,
@@ -484,8 +581,7 @@ def get_canje_summary(df_resultado):
     for (emp_id, emp_nom), grp in df_resultado.groupby([col_id_key, 'Nombre']):
         total_he = grp['Horas Extras'].sum()
         
-        # REGLA CLAVE: Solo las Faltas Justificadas son canjeables
-        # Las Faltas Injustificadas no entran a la bolsa de canje (se excluyen)
+        # Solo las Faltas Justificadas son canjeables
         total_faltas_canjeables = grp['Falta Justificada'].sum()
         
         turno_dom = grp['Turno Dominante'].mode()[0] if not grp['Turno Dominante'].empty else 'Diurno'
