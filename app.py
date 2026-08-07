@@ -285,8 +285,8 @@ elif opcion == "✅ Aprobaciones Supervisores":
         periodo_sel = st.selectbox("🗓️ Seleccionar Período de Revisión:", options=periodos_disponibles)
 
     # Autonomía por supervisor: El estado de revisión depende de (periodo_sel, usuario_actual)
-   estado_periodo = lock_mgr.obtener_estado_periodo(periodo_sel, usuario=usuario_actual)
-    es_editable = lock_mgr.es_editable(periodo_sel, rol_actual, usuario_actual)
+    estado_periodo = lock_mgr.obtener_estado_periodo(periodo_sel, usuario=usuario_actual)
+    es_editable = lock_mgr.es_editable(periodo_sel, rol_actual, usuario=usuario_actual)
 
     with col_p2:
         st.subheader(f"Estado Período ({usuario_actual}): **{estado_periodo}**")
