@@ -80,12 +80,68 @@ st.sidebar.caption("Sistema de Control de Asistencia v2.0")
 # 1. PARÁMETROS Y REGLAS
 # -----------------------------------------------------------------------------
 if opcion == "📊 Parámetros y Reglas":
-    st.header("Parámetros y Reglas del Sistema")
-    try:
-        df_params = cached_load_sheet_data("05_Parametros_y_Reglas")
-        st.dataframe(df_params, use_container_width=True, hide_index=True)
-    except Exception as e:
-        st.error(f"Error al cargar la pestaña: {e}")
+    st.header("⚙️ Parámetros y Reglas del Sistema")
+
+    # --- SECCIÓN 1: TABLA DE PARÁMETROS Y REGLAS ---
+    st.subheader("📋 Matriz de Parámetros Normativos")
+    
+    data_reglas = [
+        {"Parámetro / Regla": "Tolerancia_Atraso_Min", "Valor": "10 min", "Descripción y Aplicación": "Regla 'Todo o Nada': Atrasos <= 10 min no se descuentan. Atrasos >= 11 min cobran el total acumulado desde el minuto 1."},
+        {"Parámetro / Regla": "Tiempo_Comida_Min", "Valor": "30 min", "Descripción y Aplicación": "Descuento automático obligatorio de 0.5 horas en toda jornada con marcación de salida."},
+        {"Parámetro / Regla": "Ventana_Pareo_Horas", "Valor": "18 hrs", "Descripción y Aplicación": "Ventana máxima continua para emparejar Entrada y Salida. Toda la jornada se asigna al Día de la Entrada."},
+        {"Parámetro / Regla": "Jornada_Diurna_Base", "Valor": "8.0 hrs", "Descripción y Aplicación": "Horario oficial 07:00 a 15:30 (8.5h brutas - 0.5h comida) = 1.0 Turno."},
+        {"Parámetro / Regla": "Jornada_Nocturna_Base", "Valor": "7.0 hrs", "Descripción y Aplicación": "Horario oficial 22:00 a 05:30 (7.5h brutas - 0.5h cena) = 1.0 Turno."},
+        {"Parámetro / Regla": "Jornada_Nocturna_Especial", "Valor": "11.0 hrs", "Descripción y Aplicación": "Viernes y Domingos (Ingreso 16:00 a 19:30, Oficial 18:00 a 05:30) = 1.5 Turnos."},
+        {"Parámetro / Regla": "Umbral_Excepción_Horario", "Valor": "30 min", "Descripción y Aplicación": "Entradas/Salidas anticipadas o tardías >= 30 min generan Excepción Pendiente. Por defecto se truncan al horario oficial."},
+        {"Parámetro / Regla": "Alerta_7mo_Dia", "Valor": "7 días", "Descripción y Aplicación": "Genera alerta automática si un trabajador registra marcaciones los 7 días de una misma semana."}
+    ]
+
+    df_reglas = pd.DataFrame(data_reglas)
+    st.dataframe(df_reglas, use_container_width=True, hide_index=True)
+
+    st.divider()
+
+    # --- SECCIÓN 2: TUTORIAL Y GUÍA OPERATIVA PARA SUPERVISORES ---
+    st.subheader("📖 Guía Operativa para Cierre Mensual (Paso a Paso)")
+    st.caption("Manual rápido de procedimiento obligatorio para supervisores al cierre de cada período.")
+
+    c_p1, c_p2 = st.columns(2)
+
+    with c_p1:
+        st.markdown("""
+        #### 📌 Procedimiento Paso a Paso
+        
+        * **Paso 1: Verificación de Datos Previos**  
+          Confirmar que la información del Google Drive esté completamente actualizada tanto en la lista **Maestro de Empleados** como en el extracto del biométrico dentro de la pestaña **Importación Biométrico**.
+        
+        * **Paso 2: Registro de Novedades y Permisos**  
+          Iniciar sesión y acceder a **Novedades y Permisos**. Cargar todas las novedades, licencias y permisos especiales correspondientes a su personal asignado presionando el botón **`+ Registrar una novedad`**. Verificar que todo esté completo.
+        
+        * **Paso 3: Aprobaciones y Excepciones**  
+          Ingresar a la vista **Aprobaciones Supervisores**, donde podrá visualizar e intervenir sobre las incoherencias de su personal asignado (faltas justificadas, faltas injustificadas, horas extras, etc.).
+        """)
+
+    with c_p2:
+        st.warning("""
+        ⚠️ **REGLA CRÍTICA DE PROCESAMIENTO:**
+        
+        1. Al ingresar a Aprobaciones, debe presionar **`MARCAR EN PROCESO`** y **no detenerse** hasta haber revisado a todo su personal.
+        2. Una vez concluida la revisión total, presione **`FINALIZAR Y CERRAR PERÍODO`**.
+        3. **Importante:** Solo tiene **UNA oportunidad** para realizar las aprobaciones.
+        4. En caso de error, debe comunicarse con **Ever Medrano** y solicitar la reversión. La reversión solo se realiza **por persona** (no de todo el proceso), por lo que es indispensable estar completamente seguro antes de finalizar.
+        """)
+
+    st.info("""
+    💡 **Consideraciones Operativas sobre Aprobaciones:**
+    * **Faltas:** Puede convertir una falta injustificada en justificada si cuenta con el respaldo correspondiente.
+    * **Canje de Horas Extras:** Puede canjear horas extras acumuladas por faltas justificadas. Estos canjes aplican únicamente por **jornadas completas** (no a medias).
+    * **Procesamiento por Defecto:** Si no aprueba una excepción u observación, el sistema la procesará automáticamente acorde a las reglas normativas establecidas (descuento de falta, truncamiento de horas extras no autorizadas, etc.).
+    """)
+
+    st.success("""
+    🏁 **Finalización del Proceso:**  
+    Una vez finalizado y cerrado el período de aprobaciones, puede acceder a **Pre-Planilla y Reportes** para generar y exportar la planilla oficial consolidada.
+    """)
 
 # -----------------------------------------------------------------------------
 # 2. MAESTRO DE EMPLEADOS
