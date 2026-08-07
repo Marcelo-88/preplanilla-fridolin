@@ -35,9 +35,13 @@ class LockManager:
         if usuario:
             usr_clean = str(usuario).strip().upper().replace(" ", "_")
             return f"{periodo}_{usr_clean}"
-        return periodo
+        return str(periodo)
 
-    def obtener_estado_periodo(self, periodo: str, usuario: Optional[str] = None) -> str:
+    def obtener_estado_periodo(self, periodo: str, usuario: Optional[str] = None, *args, **kwargs) -> str:
+        # Tolerancia a cache si el parámetro viene posicional en args
+        if not usuario and args:
+            usuario = args[0]
+            
         clave = self._construir_clave(periodo, usuario)
         with sqlite3.connect(self.db_path) as conn:
             cursor = conn.cursor()
