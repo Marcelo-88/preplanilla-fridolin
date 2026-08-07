@@ -125,10 +125,10 @@ if opcion == "📊 Parámetros y Reglas":
         st.warning("""
         ⚠️ **REGLA CRÍTICA DE PROCESAMIENTO:**
         
-        1. Al ingresar a Aprobaciones, debe presionar **`MARCAR EN PROCESO`** y **no detenerse** hasta haber revisado a todo su personal.
+        1. Al ingresar a Aprobaciones, debe presionar **`MARCAR EN PROCESO`** para habilitar la edición de las tablas de su personal asignado.
         2. Una vez concluida la revisión total, presione **`FINALIZAR Y CERRAR PERÍODO`**.
-        3. **Importante:** Solo tiene **UNA oportunidad** para realizar las aprobaciones.
-        4. En caso de error, debe comunicarse con **Ever Medrano** y solicitar la reversión. La reversión solo se realiza **por persona** (no de todo el proceso), por lo que es indispensable estar completamente seguro antes de finalizar.
+        3. **Importante:** Cada supervisor gestiona su propia autonomía de revisión.
+        4. En caso de error tras finalizar, debe comunicarse con **Ever Medrano** para solicitar la reapertura.
         """)
 
     st.info("""
@@ -284,20 +284,28 @@ elif opcion == "✅ Aprobaciones Supervisores":
     with col_p1:
         periodo_sel = st.selectbox("🗓️ Seleccionar Período de Revisión:", options=periodos_disponibles)
 
-    estado_periodo = lock_mgr.obtener_estado_periodo(periodo_sel)
-    es_editable = lock_mgr.es_editable(periodo_sel, rol_actual)
+    # Autonomía por supervisor: El estado de revisión depende de (periodo_sel, usuario_actual)
+    estado_periodo = lock_mgr.obtener_estado_periodo(periodo_sel, usuario_actual)
+    es_editable = lock_mgr.es_editable(periodo_sel, rol_actual, usuario_actual)
 
     with col_p2:
-        st.subheader(f"Estado Período: **{estado_periodo}**")
-        if estado_periodo == "FINALIZADO" and not es_editable:
-            st.error("🔒 Este período está CERRADO. Solo el Responsable de Operaciones puede desbloquearlo.")
+        st.subheader(f"Estado Período ({usuario_actual}): **{estado_periodo}**")
+        if estado_periodo == "PENDIENTE":
+            st.info("ℹ️ Para habilitar la edición de tablas y procesar las excepciones de su personal, presione **'▶️ Marcar EN PROCESO'**.")
+        elif estado_periodo == "EN_PROCESO":
+            st.warning("⚡ **EN PROCESO:** Edición habilitada. Revise a su personal y al terminar presione **'🔒 FINALIZAR y Cerrar Período'**.")
+        elif estado_periodo == "FINALIZADO":
+            if not es_editable:
+                st.success("🔒 Período FINALIZADO para su usuario. Las revisiones están guardadas y bloqueadas.")
+            else:
+                st.info("🔓 Período CERRADO, pero cuenta con permisos de Superusuario para modificar.")
 
     col_rev1, col_rev2, col_rev3 = st.columns(3)
     with col_rev1:
         if st.button("▶️ Marcar EN PROCESO"):
-            res_c = lock_mgr.cambiar_estado(periodo_sel, lock_mgr.ESTADO_EN_PROCESO, usuario_actual, rol_actual)
+            res_c = lock_mgr.cambiar_estado(periodo_sel, lock_mgr.ESTADO_EN_PROCESO, usuario_actual, rol_actual, usuario_nombre=usuario_actual)
             if res_c["exito"]:
-                audit_log.registrar_evento(usuario_actual, usuario_actual, "CAMBIO_ESTADO_PERIODO", "Aprobaciones", {"periodo": periodo_sel, "nuevo_estado": "EN_PROCESO"})
+                audit_log.registrar_evento(usuario_actual, usuario_actual, "CAMBIO_ESTADO_PERIODO", "Aprobaciones", {"periodo": periodo_sel, "nuevo_estado": "EN_PROCESO", "supervisor": usuario_actual})
                 st.success(res_c["mensaje"])
                 st.rerun()
             else:
@@ -305,9 +313,9 @@ elif opcion == "✅ Aprobaciones Supervisores":
 
     with col_rev2:
         if st.button("🔒 FINALIZAR y Cerrar Período"):
-            res_c = lock_mgr.cambiar_estado(periodo_sel, lock_mgr.ESTADO_FINALIZADO, usuario_actual, rol_actual)
+            res_c = lock_mgr.cambiar_estado(periodo_sel, lock_mgr.ESTADO_FINALIZADO, usuario_actual, rol_actual, usuario_nombre=usuario_actual)
             if res_c["exito"]:
-                audit_log.registrar_evento(usuario_actual, usuario_actual, "CAMBIO_ESTADO_PERIODO", "Aprobaciones", {"periodo": periodo_sel, "nuevo_estado": "FINALIZADO"})
+                audit_log.registrar_evento(usuario_actual, usuario_actual, "CAMBIO_ESTADO_PERIODO", "Aprobaciones", {"periodo": periodo_sel, "nuevo_estado": "FINALIZADO", "supervisor": usuario_actual})
                 st.success(res_c["mensaje"])
                 st.rerun()
             else:
@@ -316,9 +324,9 @@ elif opcion == "✅ Aprobaciones Supervisores":
     with col_rev3:
         if estado_periodo == "FINALIZADO" and (rol_actual == "Jefe de Producción"):
             if st.button("🔓 Desbloquear Período (Superusuario)"):
-                res_c = lock_mgr.cambiar_estado(periodo_sel, lock_mgr.ESTADO_PENDIENTE, usuario_actual, rol_actual, motivo="Desbloqueo por Jefatura")
+                res_c = lock_mgr.cambiar_estado(periodo_sel, lock_mgr.ESTADO_PENDIENTE, usuario_actual, rol_actual, usuario_nombre=usuario_actual, motivo="Desbloqueo por Jefatura")
                 if res_c["exito"]:
-                    audit_log.registrar_evento(usuario_actual, usuario_actual, "DESBLOQUEO_PERIODO", "Aprobaciones", {"periodo": periodo_sel})
+                    audit_log.registrar_evento(usuario_actual, usuario_actual, "DESBLOQUEO_PERIODO", "Aprobaciones", {"periodo": periodo_sel, "supervisor": usuario_actual})
                     st.success(res_c["mensaje"])
                     st.rerun()
 
@@ -357,6 +365,9 @@ elif opcion == "✅ Aprobaciones Supervisores":
         if df_excepciones is not None and not df_excepciones.empty:
             st.subheader(f"Excepciones Detectadas ({periodo_sel})")
 
+            if not es_editable:
+                st.info("🔒 **Edición Bloqueada:** Para habilitar la modificación de decisiones, presione el botón **'▶️ Marcar EN PROCESO'** arriba.")
+
             col_f1, col_f2 = st.columns(2)
             with col_f1:
                 tipo_exc = ["Todos"] + list(df_excepciones['Tipo Excepción'].unique())
@@ -377,11 +388,17 @@ elif opcion == "✅ Aprobaciones Supervisores":
             m3.metric("Sol. Horas Extras / Dom", len(df_fil_exc[df_fil_exc['Tipo Excepción'].str.contains('Horas Extras')]))
             m4.metric("Desfases Ingreso", len(df_fil_exc[df_fil_exc['Tipo Excepción'] == 'Desfase Horario Ingreso']))
 
+            # Definición estricta de columnas deshabilitadas si no está EN PROCESO
+            if not es_editable:
+                cols_deshabilitadas_exc = list(df_fil_exc.columns)
+            else:
+                cols_deshabilitadas_exc = [c for c in ["Carnet_Identidad", "ID", "Nombre", "Fecha", "Tipo Excepción", "Detalle Excepción", "Valor a Revisar"] if c in df_fil_exc.columns]
+
             df_edited_exc = st.data_editor(
                 df_fil_exc,
                 use_container_width=True,
                 hide_index=True,
-                disabled=["ID", "Nombre", "Fecha", "Tipo Excepción", "Detalle Excepción", "Valor a Revisar"] if not es_editable else [],
+                disabled=cols_deshabilitadas_exc,
                 column_config={
                     "Decisión Supervisor": st.column_config.SelectboxColumn(
                         "Decisión",
@@ -400,14 +417,14 @@ elif opcion == "✅ Aprobaciones Supervisores":
             st.divider()
             st.subheader("📥 Exportación Profesional a Excel")
             
-            archivo_path = f"Aprobaciones_{periodo_sel}.xlsx"
+            archivo_path = f"Aprobaciones_{periodo_sel}_{usuario_actual}.xlsx"
             ExcelExporter.exportar_aprobaciones(df_edited_exc.to_dict('records'), periodo_sel, archivo_path)
             
             with open(archivo_path, "rb") as f:
                 st.download_button(
                     label="📥 Descargar Aprobaciones Procesadas (Excel)",
                     data=f,
-                    file_name=f"Aprobaciones_Supervisores_{periodo_sel}.xlsx",
+                    file_name=f"Aprobaciones_Supervisores_{periodo_sel}_{usuario_actual}.xlsx",
                     mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
                 )
         else:
@@ -417,12 +434,21 @@ elif opcion == "✅ Aprobaciones Supervisores":
     with tab_canje_masivo:
         st.subheader("⚖️ Canje Masivo de Horas Extras por Faltas")
         if df_canje_resumen is not None and not df_canje_resumen.empty:
+            if not es_editable:
+                st.info("🔒 **Edición Bloqueada:** Para realizar canjes, presione el botón **'▶️ Marcar EN PROCESO'** arriba.")
+
+            if not es_editable:
+                cols_deshabilitadas_canje = list(df_canje_resumen.columns)
+            else:
+                cols_deshabilitadas_canje = [c for c in ["Carnet_Identidad", "ID", "Nombre", "Turno Dominante", "Horas Costo por Día", "Bolsa HE Acumulada (hrs)", "Días Máx. Canjeables", "Faltas Registradas"] if c in df_canje_resumen.columns]
+
             df_edited_canje = st.data_editor(
                 df_canje_resumen,
                 use_container_width=True,
                 hide_index=True,
-                disabled=[] if es_editable else ["Días a Canjear (Aplicar)", "Estado Canje"],
+                disabled=cols_deshabilitadas_canje,
                 column_config={
+                    "Carnet_Identidad": st.column_config.Column(disabled=True),
                     "ID": st.column_config.Column(disabled=True),
                     "Nombre": st.column_config.Column(disabled=True),
                     "Turno Dominante": st.column_config.Column(disabled=True),
@@ -435,7 +461,7 @@ elif opcion == "✅ Aprobaciones Supervisores":
                 }
             )
 
-            dias_totales_canjeados = df_edited_canje['Días a Canjear (Aplicar)'].sum()
+            dias_totales_canjeados = df_edited_canje['Días a Canjear (Aplicar)'].sum() if 'Días a Canjear (Aplicar)' in df_edited_canje.columns else 0
             c_m1, c_m2 = st.columns(2)
             c_m1.metric("Personal con Bolsa HE / Faltas", len(df_edited_canje))
             c_m2.metric("Total Días Canjeados", f"{int(dias_totales_canjeados)} días")
@@ -461,7 +487,7 @@ elif opcion == "✅ Aprobaciones Supervisores":
                 if not id_emp_reg or not nombre_emp_reg or not motivo_reg:
                     st.warning("Por favor complete todos los campos obligatorios (*).")
                 elif not es_editable:
-                    st.error("No se pueden registrar regularizaciones en un período CERRADO.")
+                    st.error("No se pueden registrar regularizaciones cuando el período no está EN PROCESO.")
                 else:
                     audit_log.registrar_evento(
                         usuario_pin=usuario_actual,
