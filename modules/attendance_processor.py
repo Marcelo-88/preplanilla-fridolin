@@ -1,605 +1,281 @@
 import pandas as pd
 import numpy as np
-from datetime import datetime, time, timedelta
-
-TOLERANCIA_MINUTOS = 10
-DESCUENTO_COMIDA_HORAS = 0.5  # 30 minutos obligatorios de almuerzo/cena
-
-DIAS_ESPANOL = {
-    0: 'Lunes',
-    1: 'Martes',
-    2: 'Miércoles',
-    3: 'Jueves',
-    4: 'Viernes',
-    5: 'Sábado',
-    6: 'Domingo'
-}
-
-def clean_str(val) -> str:
-    if pd.isna(val) or val is None:
-        return ""
-    txt = str(val).strip().upper()
-    if txt.endswith('.0'):
-        txt = txt[:-2]
-    return txt
+from datetime import datetime, timedelta, time
 
 def process_attendance(df_bio, df_params=None, df_nov=None, df_emp=None, _nov_mgr=None):
+    """
+    Procesa las marcaciones biométricas considerando turnos diurnos y nocturnos
+    que cruzan la medianoche (Entrada Día N, Salida Día N+1).
+    """
     if df_bio is None or df_bio.empty:
-        return pd.DataFrame()
+        return _empty_attendance_df()
 
     df = df_bio.copy()
 
-    # 1. Identificación flexible de columnas en el Biométrico
-    cols = {str(c).strip().lower(): c for c in df.columns}
+    # 1. Normalización de columnas de fecha/hora
+    if 'FechaHora' not in df.columns:
+        if 'Fecha' in df.columns and 'Hora' in df.columns:
+            df['FechaHora'] = pd.to_datetime(df['Fecha'].astype(str) + ' ' + df['Hora'].astype(str), errors='coerce')
+        elif 'Fecha' in df.columns:
+            df['FechaHora'] = pd.to_datetime(df['Fecha'], errors='coerce')
+        else:
+            return _empty_attendance_df()
+    else:
+        df['FechaHora'] = pd.to_datetime(df['FechaHora'], errors='coerce')
+
+    df = df.dropna(subset=['FechaHora']).sort_values(by=['Carnet_Identidad', 'FechaHora']).reset_index(drop=True)
+
+    # Limpieza de duplicados o marcaciones hiper-cercanas (< 2 minutos)
+    df['Prev_Carnet'] = df['Carnet_Identidad'].shift(1)
+    df['Prev_Time'] = df['FechaHora'].shift(1)
+    df['Diff_Min'] = (df['FechaHora'] - df['Prev_Time']).dt.total_seconds() / 60.0
     
-    col_id = next((cols[k] for k in cols if any(x in k for x in ['id', 'carnet', 'ci', 'codigo'])), df.columns[0])
-    col_nombre = next((cols[k] for k in cols if any(x in k for x in ['nombre', 'empleado', 'trabajador'])), df.columns[1] if len(df.columns) > 1 else col_id)
-    col_fecha = next((cols[k] for k in cols if any(x in k for x in ['fecha', 'hora', 'marcacion', 'tiempo'])), df.columns[2] if len(df.columns) > 2 else col_id)
-    col_tipo = next((cols[k] for k in cols if any(x in k for x in ['tipo', 'movimiento', 'evento', 'estado'])), None)
+    # Filtrar marcas repetidas a menos de 2 minutos del mismo empleado
+    mask_duplicado = (df['Carnet_Identidad'] == df['Prev_Carnet']) & (df['Diff_Min'] < 2.0)
+    df = df[~mask_duplicado].copy()
 
-    # Parseo de fechas
-    df['dt_parsed'] = pd.to_datetime(df[col_fecha], dayfirst=True, errors='coerce')
-    df = df.dropna(subset=['dt_parsed']).sort_values([col_id, 'dt_parsed'])
+    # 2. Algoritmo de Emparejamiento por Ventana Flotante (Soporte Trasnoche)
+    registros_procesados = []
 
-    if df.empty:
-        return pd.DataFrame()
+    # Parámetros globales por defecto si no existen
+    hora_corte_nocturno = time(17, 0) # Entradas a partir de las 17:00 son candidatas a turno nocturno
+    max_duracion_turno = 16.0         # Horas máximas de un turno válido (ej. 21:00 a 06:00 = 9h)
 
-    df['raw_id_clean'] = df[col_id].apply(clean_str)
-    df['raw_nombre_clean'] = df[col_nombre].apply(clean_str) if col_nombre else df['raw_id_clean']
-    df['fecha_dt'] = df['dt_parsed'].dt.date
+    for carnet, group in df.groupby('Carnet_Identidad'):
+        punches = group.to_dict('records')
+        n = len(punches)
+        i = 0
 
-    # 2. Mapeo inteligente con el Maestro de Empleados para unificar CI y Nombres
-    dict_tipo_personal = {}
-    dict_turno_personal = {}
-    dict_nombres_master = {}
-    
-    mapping_bio_to_ci = {}
+        # Obtener tipo personal y nombre si existen
+        nombre_emp = punches[0].get('Nombre', 'Desconocido')
+        tipo_pers = punches[0].get('Tipo Personal', 'Fijo')
+        
+        if df_emp is not None and not df_emp.empty:
+            match_emp = df_emp[df_emp['Carnet_Identidad'].astype(str) == str(carnet)]
+            if not match_emp.empty:
+                nombre_emp = match_emp.iloc[0].get('Nombre', nombre_emp)
+                tipo_pers = match_emp.iloc[0].get('Tipo Personal', tipo_pers)
 
-    if df_emp is not None and not df_emp.empty:
-        emp_cols = {str(c).strip().lower(): c for c in df_emp.columns}
-        c_emp_id = next((emp_cols[k] for k in emp_cols if any(x in k for x in ['carnet', 'ci', 'id', 'codigo'])), None)
-        c_emp_nom = next((emp_cols[k] for k in emp_cols if any(x in k for x in ['nombre', 'empleado', 'trabajador'])), None)
-        c_emp_tipo = next((emp_cols[k] for k in emp_cols if any(x in k for x in ['tipo', 'modalidad', 'contrato'])), None)
-        c_emp_turno = next((emp_cols[k] for k in emp_cols if any(x in k for x in ['turno', 'horario'])), None)
-
-        name_to_ci_master = {}
-
-        for _, row in df_emp.iterrows():
-            if c_emp_id:
-                ci_official = clean_str(row[c_emp_id])
-                if not ci_official:
-                    continue
-                
-                nom_official = str(row[c_emp_nom]).strip() if c_emp_nom and pd.notna(row[c_emp_nom]) else ci_official
-                dict_nombres_master[ci_official] = nom_official
-                
-                if c_emp_nom:
-                    name_clean = clean_str(row[c_emp_nom])
-                    if name_clean:
-                        name_to_ci_master[name_clean] = ci_official
-
-                if c_emp_tipo and pd.notna(row[c_emp_tipo]):
-                    dict_tipo_personal[ci_official] = str(row[c_emp_tipo]).strip()
-                if c_emp_turno and pd.notna(row[c_emp_turno]):
-                    dict_turno_personal[ci_official] = str(row[c_emp_turno]).strip()
-
-        # Vincular marcaciones biométricas a su CI oficial del Maestro
-        for _, row in df[['raw_id_clean', 'raw_nombre_clean']].drop_duplicates().iterrows():
-            raw_id = row['raw_id_clean']
-            raw_name = row['raw_nombre_clean']
-
-            if raw_id in dict_nombres_master:
-                mapping_bio_to_ci[raw_id] = raw_id
-            elif raw_name in name_to_ci_master:
-                mapping_bio_to_ci[raw_id] = name_to_ci_master[raw_name]
-            elif raw_id in name_to_ci_master:
-                mapping_bio_to_ci[raw_id] = name_to_ci_master[raw_id]
-            else:
-                mapping_bio_to_ci[raw_id] = raw_id
-
-    # Asignar CI oficial unificado
-    df['emp_id_clean'] = df['raw_id_clean'].map(lambda x: mapping_bio_to_ci.get(x, x))
-
-    # Pre-agrupar marcaciones por (CI Unificado, fecha)
-    bio_by_emp_date = {}
-    for row in df.to_dict('records'):
-        key = (row['emp_id_clean'], row['fecha_dt'])
-        if key not in bio_by_emp_date:
-            bio_by_emp_date[key] = []
-        bio_by_emp_date[key].append(row)
-
-    min_date = df['dt_parsed'].min().date()
-    max_date = df['dt_parsed'].max().date()
-    rango_dias = pd.date_range(min_date, max_date)
-
-    # Lista total de empleados unificada sin duplicados
-    emp_ids_bio = list(set(df['emp_id_clean'].unique()))
-    emp_ids_master = list(dict_nombres_master.keys())
-    todos_emp_ids = sorted(list(set(emp_ids_bio + emp_ids_master)))
-
-    # Pre-cargar Novedades
-    nov_map = {}
-    if _nov_mgr:
-        try:
-            todas_nov = _nov_mgr.obtener_todas_novedades()
-            if isinstance(todas_nov, pd.DataFrame):
-                todas_nov = todas_nov.to_dict('records')
-            for n in todas_nov:
-                e_id = clean_str(n.get('empleado_id', ''))
-                f_ini_str = str(n.get('fecha_inicio', ''))
-                f_fin_str = str(n.get('fecha_fin', ''))
-                t_nov = n.get('tipo_novedad', '')
-                just = n.get('justificacion', '')
-                if e_id and f_ini_str and f_fin_str:
-                    try:
-                        d_start = datetime.strptime(f_ini_str[:10], '%Y-%m-%d').date()
-                        d_end = datetime.strptime(f_fin_str[:10], '%Y-%m-%d').date()
-                        curr = d_start
-                        while curr <= d_end:
-                            nov_map[(e_id, curr.strftime('%Y-%m-%d'))] = {
-                                "tipo_novedad": t_nov,
-                                "justificacion": just
-                            }
-                            curr += timedelta(days=1)
-                    except Exception:
-                        pass
-        except Exception:
-            pass
-
-    def obtener_novedad(e_id, f_str):
-        if (e_id, f_str) in nov_map:
-            return nov_map[(e_id, f_str)]
-        if _nov_mgr:
-            try:
-                return _nov_mgr.evaluar_impacto_dia(e_id, f_str)
-            except Exception:
-                return None
-        return None
-
-    bio_names_map = {}
-    for row in df[['emp_id_clean', 'raw_nombre_clean']].drop_duplicates('emp_id_clean').to_dict('records'):
-        bio_names_map[row['emp_id_clean']] = row['raw_nombre_clean']
-
-    registros = []
-
-    # 3. Iteración por Empleado Unificado y Día
-    for emp_id_str in todos_emp_ids:
-        emp_nombre = dict_nombres_master.get(emp_id_str) or bio_names_map.get(emp_id_str) or f"EMP-{emp_id_str}"
-        tipo_personal = dict_tipo_personal.get(emp_id_str, "Fijo").capitalize()
-        es_staff = "STAFF" in tipo_personal.upper()
-        turno_asignado_base = dict_turno_personal.get(emp_id_str, "Diurno").capitalize()
-
-        for single_date in rango_dias:
-            fecha_dt = single_date.date()
-            fecha_str = fecha_dt.strftime('%Y-%m-%d')
-            dia_semana = fecha_dt.weekday()
-            dia_nombre_esp = DIAS_ESPANOL.get(dia_semana, fecha_dt.strftime('%A'))
+        while i < n:
+            curr = punches[i]
+            curr_dt = curr['FechaHora']
             
-            es_domingo = (dia_semana == 6)
-            es_sabado = (dia_semana == 5)
-            es_viernes = (dia_semana == 4)
+            # Si hay un siguiente punch
+            if i + 1 < n:
+                next_punch = punches[i + 1]
+                next_dt = next_punch['FechaHora']
+                diff_hours = (next_dt - curr_dt).total_seconds() / 3600.0
 
-            nov_act = obtener_novedad(emp_id_str, fecha_str)
-            turno_asignado_dia = turno_asignado_base
-
-            if nov_act:
-                t_nov_type = str(nov_act.get("tipo_novedad", "")).upper()
-                just_txt = str(nov_act.get("justificacion", "")).upper()
-
-                if t_nov_type == "CAMBIO_TURNO_NOCTURNO" or (t_nov_type == "CAMBIO_TURNO" and "NOCTURNO" in just_txt):
-                    turno_asignado_dia = "Nocturno"
-                elif t_nov_type == "CAMBIO_TURNO_DIURNO" or (t_nov_type == "CAMBIO_TURNO" and "DIURNO" in just_txt):
-                    turno_asignado_dia = "Diurno"
-
-            es_turno_nocturno_fijo = "Nocturno" in turno_asignado_dia
-            punches_dia = bio_by_emp_date.get((emp_id_str, fecha_dt), [])
-
-            # --- CASO A: EMPLEADO TIENE MARCACIÓN ---
-            if punches_dia:
-                i = 0
-                while i < len(punches_dia):
-                    p_in = punches_dia[i]
-                    dt_in = p_in['dt_parsed']
-                    p_type = str(p_in.get(col_tipo, '')).strip().lower() if col_tipo else ''
-
-                    # Pareo Dinámico con Ventana Flotante de 18 Horas
-                    dt_out = None
-                    if 'salida' not in p_type:
-                        j = i + 1
-                        while j < len(punches_dia):
-                            next_dt = punches_dia[j]['dt_parsed']
-                            next_type = str(punches_dia[j].get(col_tipo, '')).strip().lower() if col_tipo else ''
-                            
-                            if (next_dt - dt_in).total_seconds() <= 18 * 3600:
-                                if 'salida' in next_type or j == len(punches_dia) - 1 or (punches_dia[j+1]['dt_parsed'] - next_dt).total_seconds() > 4 * 3600:
-                                    dt_out = next_dt
-                                    i = j
-                                    break
-                            j += 1
-
-                    hora_in_str = dt_in.strftime('%H:%M')
-                    hora_out_str = dt_out.strftime('%H:%M') if dt_out else 'Falta Marcación'
-
-                    es_ingreso_nocturno = (dt_in.hour >= 17 or dt_in.hour < 5)
-                    es_nocturno = es_turno_nocturno_fijo or es_ingreso_nocturno
-                    turno_label = 'Nocturno' if es_nocturno else 'Diurno'
-
-                    # Evaluaciones de Turno y Medio Nocturno
-                    es_turno_y_medio = False
-                    if es_nocturno and (es_viernes or es_domingo):
-                        # Si entra en ventana de 17:30 a 19:30 o está programado a las 18:00
-                        if (dt_in.hour == 17 and dt_in.minute >= 30) or (dt_in.hour in [18, 19]):
-                            es_turno_y_medio = True
-
-                    # Definición de Horarios Oficiales Esperados
-                    if es_nocturno:
-                        if es_turno_y_medio:
-                            hora_esperada_in = time(18, 0)
-                            dt_esperada_in = datetime.combine(dt_in.date(), hora_esperada_in)
-                            dt_salida_oficial = datetime.combine(dt_in.date() + timedelta(days=1), time(5, 30))
-                        else:
-                            hora_esperada_in = time(22, 0)
-                            dt_esperada_in = datetime.combine(dt_in.date(), hora_esperada_in)
-                            dt_salida_oficial = datetime.combine(dt_in.date() + timedelta(days=1), time(5, 30))
-                    else:
-                        hora_esperada_in = time(7, 0)  # Entrada Oficial Diurna
-                        dt_esperada_in = datetime.combine(dt_in.date(), hora_esperada_in)
-                        dt_salida_oficial = datetime.combine(dt_in.date(), time(15, 30)) # Salida Oficial Diurna
-
-                    # Lógica de Entrada/Salida Efectiva (Rechazo Implícito por Defecto)
-                    dt_in_efectiva = dt_in
-                    entrada_anticipada_flag = False
-                    if dt_in < dt_esperada_in:
-                        dif_min_anticipada = (dt_esperada_in - dt_in).total_seconds() / 60.0
-                        if dif_min_anticipada >= 30:
-                            entrada_anticipada_flag = True
-                        dt_in_efectiva = dt_esperada_in
-
-                    dt_out_efectiva = dt_out
-                    salida_tardia_flag = False
-                    minutos_extra_solicitados = 0.0
-                    if dt_out:
-                        if dt_out > dt_salida_oficial:
-                            dif_min_tardio = (dt_out - dt_salida_oficial).total_seconds() / 60.0
-                            if dif_min_tardio >= 30:
-                                salida_tardia_flag = True
-                                minutos_extra_solicitados = round(dif_min_tardio / 60.0, 2)
-                            dt_out_efectiva = dt_salida_oficial
-
-                    # Cálculo de Horas Trabajadas Efectivas
-                    if dt_out_efectiva and dt_out_efectiva > dt_in_efectiva:
-                        horas_brutas = (dt_out_efectiva - dt_in_efectiva).total_seconds() / 3600.0
-                    else:
-                        horas_brutas = 0.0
-
-                    horas_netas = max(0.0, round(horas_brutas - DESCUENTO_COMIDA_HORAS, 2)) if horas_brutas > 0 else 0.0
-
-                    # Tolerancia de Atraso (Todo o Nada: <=10min = 0, >10min = cobro completo)
-                    minutos_diferencia_atraso = (dt_in - dt_esperada_in).total_seconds() / 60.0
-                    if minutos_diferencia_atraso <= TOLERANCIA_MINUTOS:
-                        atraso_minutos = 0
-                    else:
-                        atraso_minutos = int(minutos_diferencia_atraso)
-
-                    # Inmunidad STAFF
-                    if es_staff:
-                        atraso_minutos = 0
-
-                    novedad_activa = None
-                    exento_faltas = False
-                    exento_atrasos = False
-
-                    if nov_act:
-                        novedad_activa = nov_act["tipo_novedad"]
-                        if novedad_activa in ["BAJA_MEDICA", "PERMISO_CON_GOCE", "VACACIONES", "LICENCIA_MATERNIDAD", "LICENCIA_PATERNIDAD", "DUELO_FAMILIAR"]:
-                            exento_faltas = True
-                            exento_atrasos = True
-                            atraso_minutos = 0
-                        elif novedad_activa in ["PERMISO_SIN_GOCE", "FALTA_JUSTIFICADA"]:
-                            exento_atrasos = True
-                            atraso_minutos = 0
-                        elif novedad_activa == "REDUCCION_LACTANCIA":
-                            exento_atrasos = True
-                            atraso_minutos = 0
-
-                    # Cómputo de Turnos y Horas Extras
-                    turnos_computados = 1.0
-                    horas_extras = 0.0
-                    horas_nocturnas = horas_netas if es_nocturno else 0.0
-
-                    if es_domingo:
-                        if es_nocturno and dt_in.hour >= 17:
-                            if es_turno_y_medio:
-                                turnos_computados = 1.5
-                            else:
-                                turnos_computados = 1.0
-                            horas_extras = 0.0
-                            if not novedad_activa:
-                                novedad_activa = 'Inicio Semana Nocturna'
-                        else:
-                            turnos_computados = 1.5
-                            if "Jornal" not in tipo_personal and not es_staff:
-                                horas_extras = horas_netas
-                            if not novedad_activa:
-                                novedad_activa = 'Trabajo Domingo / Temporada Alta'
-                    else:
-                        if "Jornal" in tipo_personal:
-                            turnos_computados = 1.5 if (es_nocturno and (es_viernes or es_turno_y_medio)) or horas_netas >= 11.0 else 1.0
-                            horas_extras = 0.0
-                        elif es_nocturno:
-                            if es_turno_y_medio:
-                                turnos_computados = 1.5
-                                horas_extras = 0.0
-                            elif es_viernes:
-                                turnos_computados = 1.5
-                                horas_extras = 0.0
-                            else:
-                                turnos_computados = 1.0
-                                jornada_limite = 7.0
-                                if horas_netas > jornada_limite and not es_staff:
-                                    horas_extras = round(horas_netas - jornada_limite, 2)
-                        else:
-                            turnos_computados = 1.0
-                            jornada_limite = 7.0 if novedad_activa == "REDUCCION_LACTANCIA" else 8.0
-                            if horas_netas > jornada_limite and not es_staff:
-                                horas_extras = round(horas_netas - jornada_limite, 2)
-
-                    if es_staff:
-                        horas_extras = 0.0
-
-                    es_falta = (not dt_out) and not exento_faltas and not es_staff
+                # Caso A: Emparejamiento Válido (Entrada -> Salida)
+                # Ocurre si la diferencia está entre 0.25h (15 min) y 16h
+                if 0.25 <= diff_hours <= max_duracion_turno:
+                    fecha_jornada = curr_dt.date() # La jornada pertenece al día de Entrada
                     
-                    falta_justificada = 0
-                    falta_injustificada = 0
-
-                    if es_falta:
-                        if novedad_activa in ["PERMISO_SIN_GOCE", "FALTA_JUSTIFICADA"]:
-                            falta_justificada = 1
-                        elif novedad_activa is None:
-                            falta_injustificada = 1
-
-                    desfase_ingreso = False
-                    if horas_netas >= 7.0 and minutos_diferencia_atraso > 45 and not exento_atrasos and not es_staff:
-                        desfase_ingreso = True
-
-                    registros.append({
-                        'Carnet_Identidad': emp_id_str,
-                        'Nombre': emp_nombre,
-                        'Tipo Personal': tipo_personal,
-                        'Fecha': fecha_str,
-                        'Día': dia_nombre_esp,
-                        'Entrada': hora_in_str,
-                        'Salida': hora_out_str,
-                        'Horas Trabajadas': horas_netas,
-                        'Atraso (Minutos)': atraso_minutos,
-                        'Falta Justificada': falta_justificada,
-                        'Falta Injustificada': falta_injustificada,
-                        'Horas Extras': horas_extras,
-                        'Horas Nocturnas': horas_nocturnas,
-                        'Turnos Computados': turnos_computados,
-                        'Turno Dominante': turno_label,
-                        'Novedad / Licencia': novedad_activa if novedad_activa else 'Ninguna',
-                        'Desfase Ingreso': desfase_ingreso,
-                        'Entrada Anticipada Flag': entrada_anticipada_flag,
-                        'Salida Tardia Flag': salida_tardia_flag,
-                        'HE Solicitadas': minutos_extra_solicitados,
-                        'Estado': 'OK' if dt_out or exento_faltas or es_staff else 'Revisar Marcación'
+                    registros_procesados.append({
+                        'Carnet_Identidad': carnet,
+                        'Nombre': nombre_emp,
+                        'Tipo Personal': tipo_pers,
+                        'Fecha': fecha_jornada,
+                        'Día': _traducir_dia(fecha_jornada.strftime('%A')),
+                        'Entrada': curr_dt.strftime('%H:%M'),
+                        'Salida': next_dt.strftime('%H:%M'),
+                        'Entrada_DT': curr_dt,
+                        'Salida_DT': next_dt,
+                        'Horas Trabajadas': round(diff_hours, 2),
+                        'Es_Trasnoche': curr_dt.date() != next_dt.date(),
+                        'Estado': 'Asistió'
                     })
-                    i += 1
+                    i += 2 # Consumimos Entrada y Salida
+                    continue
 
-            # --- CASO B: EMPLEADO NO TIENE MARCACIÓN ---
-            else:
-                novedad_activa = nov_act["tipo_novedad"] if nov_act else None
-
-                falta_injustificada = 0
-                falta_justificada = 0
-                estado_registro = 'OK'
-
-                es_licencia_pagada = novedad_activa in [
-                    "BAJA_MEDICA", "PERMISO_CON_GOCE", "VACACIONES",
-                    "LICENCIA_MATERNIDAD", "LICENCIA_PATERNIDAD", "DUELO_FAMILIAR"
-                ]
-
-                es_licencia_canjeable = novedad_activa in [
-                    "PERMISO_SIN_GOCE", "FALTA_JUSTIFICADA"
-                ]
-
-                if es_licencia_pagada:
-                    falta_justificada = 0
-                    falta_injustificada = 0
-                    estado_registro = f'Justificado ({novedad_activa})'
-                elif es_licencia_canjeable:
-                    falta_justificada = 1
-                    falta_injustificada = 0
-                    estado_registro = 'Permiso/Falta Justificada'
-                elif es_staff:
-                    falta_justificada = 0
-                    falta_injustificada = 0
-                    estado_registro = 'OK (Staff)'
-                else:
-                    if es_domingo:
-                        if es_turno_nocturno_fijo:
-                            falta_injustificada = 1
-                            estado_registro = 'Falta / Omisión Marcación'
-                        else:
-                            falta_injustificada = 0
-                            estado_registro = 'Descanso Semanal'
-                    elif es_sabado and es_turno_nocturno_fijo:
-                        falta_injustificada = 0
-                        estado_registro = 'Descanso Semanal'
-                    else:
-                        falta_injustificada = 1
-                        estado_registro = 'Falta / Omisión Marcación'
-
-                registros.append({
-                    'Carnet_Identidad': emp_id_str,
-                    'Nombre': emp_nombre,
-                    'Tipo Personal': tipo_personal,
-                    'Fecha': fecha_str,
-                    'Día': dia_nombre_esp,
-                    'Entrada': 'Sin Marcación',
-                    'Salida': 'Sin Marcación',
+            # Caso B: Marcación Huérfana (Sin Salida o Entrada Solitaria)
+            # Determinar si parece una Entrada o una Salida aislada según la hora
+            fecha_jornada = curr_dt.date()
+            if curr_dt.time() < time(12, 0) and i > 0:
+                # Es una marca mañanera aislada (posible salida no emparejada)
+                registros_procesados.append({
+                    'Carnet_Identidad': carnet,
+                    'Nombre': nombre_emp,
+                    'Tipo Personal': tipo_pers,
+                    'Fecha': fecha_jornada,
+                    'Día': _traducir_dia(fecha_jornada.strftime('%A')),
+                    'Entrada': 'Falta Marcación',
+                    'Salida': curr_dt.strftime('%H:%M'),
+                    'Entrada_DT': None,
+                    'Salida_DT': curr_dt,
                     'Horas Trabajadas': 0.0,
-                    'Atraso (Minutos)': 0,
-                    'Falta Justificada': falta_justificada,
-                    'Falta Injustificada': falta_injustificada,
-                    'Horas Extras': 0.0,
-                    'Horas Nocturnas': 0.0,
-                    'Turnos Computados': 0.0,
-                    'Turno Dominante': turno_asignado_dia,
-                    'Novedad / Licencia': novedad_activa if novedad_activa else ('Descanso Semanal' if estado_registro == 'Descanso Semanal' else 'Ninguna'),
-                    'Desfase Ingreso': False,
-                    'Entrada Anticipada Flag': False,
-                    'Salida Tardia Flag': False,
-                    'HE Solicitadas': 0.0,
-                    'Estado': estado_registro
+                    'Es_Trasnoche': False,
+                    'Estado': 'Incompleto'
                 })
+            else:
+                # Es una marca de entrada sin salida
+                registros_procesados.append({
+                    'Carnet_Identidad': carnet,
+                    'Nombre': nombre_emp,
+                    'Tipo Personal': tipo_pers,
+                    'Fecha': fecha_jornada,
+                    'Día': _traducir_dia(fecha_jornada.strftime('%A')),
+                    'Entrada': curr_dt.strftime('%H:%M'),
+                    'Salida': 'Falta Marcación',
+                    'Entrada_DT': curr_dt,
+                    'Salida_DT': None,
+                    'Horas Trabajadas': 0.0,
+                    'Es_Trasnoche': False,
+                    'Estado': 'Incompleto'
+                })
+            i += 1
 
-    return pd.DataFrame(registros)
+    df_res = pd.DataFrame(registros_procesados)
+
+    if df_res.empty:
+        return _empty_attendance_df()
+
+    # 3. Cálculo de Atrasos, Horas Extras, Banderas y Novedades
+    df_res['Atraso (Minutos)'] = 0
+    df_res['Horas Extras'] = 0.0
+    df_res['Turnos Computados'] = df_res['Horas Trabajadas'].apply(lambda x: 1.0 if x >= 4.0 else (0.5 if x > 0 else 0.0))
+    df_res['Entrada Anticipada Flag'] = False
+    df_res['Salida Tardia Flag'] = False
+    df_res['HE Solicitadas'] = False
+
+    # Evaluación contra parámetros y tolerancia (si están disponibles)
+    tolerancia_min = 10
+    if df_params is not None and not df_params.empty:
+        if 'Tolerancia_Minutos' in df_params.columns:
+            tolerancia_min = df_params['Tolerancia_Minutos'].iloc[0]
+
+    for idx, row in df_res.iterrows():
+        if row['Estado'] == 'Asistió':
+            # Ejemplo simplificado de regla de cálculo de atraso
+            # Para turnos nocturnos (21:00 nominal):
+            ent_dt = row['Entrada_DT']
+            if ent_dt:
+                hora_ent = ent_dt.time()
+                # Si entra de noche (~21:00) o de mañana (~06:00/07:00)
+                if hora_ent >= time(20, 0):
+                    hora_programada = time(21, 0)
+                    atraso = (ent_dt - datetime.combine(ent_dt.date(), hora_programada)).total_seconds() / 60.0
+                    if atraso > tolerancia_min:
+                        df_res.at[idx, 'Atraso (Minutos)'] = int(atraso)
+                elif time(5, 0) <= hora_ent <= time(9, 0):
+                    hora_programada = time(7, 0)
+                    atraso = (ent_dt - datetime.combine(ent_dt.date(), hora_programada)).total_seconds() / 60.0
+                    if atraso > tolerancia_min:
+                        df_res.at[idx, 'Atraso (Minutos)'] = int(atraso)
+
+            # Cálculo de Horas Extras si excede las 8 horas estándar
+            if row['Horas Trabajadas'] > 8.0:
+                df_res.at[idx, 'Horas Extras'] = round(row['Horas Trabajadas'] - 8.0, 2)
+                df_res.at[idx, 'HE Solicitadas'] = True
+
+    # Integración con Novedades / Permisos Justificados
+    if df_nov is not None and not df_nov.empty:
+        df_res = _aplicar_novedades(df_res, df_nov)
+
+    return df_res
 
 
 def detect_exceptions(df_resultado):
+    """
+    Detecta excepciones para la pantalla de Aprobaciones de Supervisores,
+    incluyendo omisiones de marcación, atrasos y horas extras.
+    """
     if df_resultado is None or df_resultado.empty:
-        return pd.DataFrame()
+        return pd.DataFrame(columns=[
+            'Carnet_Identidad', 'Nombre', 'Fecha', 'Tipo Excepción',
+            'Detalle Excepción', 'Valor a Revisar', 'Decisión Supervisor'
+        ])
 
     excepciones = []
 
-    df_temp = df_resultado.copy()
-    df_temp['dt_fecha'] = pd.to_datetime(df_temp['Fecha'])
-    df_temp['Semana'] = df_temp['dt_fecha'].dt.isocalendar().week
-
-    trabajados = df_temp[df_temp['Horas Trabajadas'] > 0]
-    col_id_key = 'Carnet_Identidad' if 'Carnet_Identidad' in df_temp.columns else 'ID'
-    
-    dias_por_semana = trabajados.groupby([col_id_key, 'Semana'])['Fecha'].nunique().reset_index()
-    semanas_7dias = set(
-        dias_por_semana[dias_por_semana['Fecha'] >= 7].set_index([col_id_key, 'Semana']).index
-    )
-
     for _, row in df_resultado.iterrows():
-        emp_id = row.get('Carnet_Identidad', row.get('ID', ''))
-        emp_nom = row['Nombre']
+        carnet = row['Carnet_Identidad']
+        nombre = row['Nombre']
         fecha = row['Fecha']
-        dt_f = pd.to_datetime(fecha)
-        semana = dt_f.isocalendar().week
 
-        # 1. Faltas u Omisión de Marcación
-        if row['Estado'] in ['Revisar Marcación', 'Falta / Omisión Marcación'] and row['Falta Injustificada'] == 1:
+        # 1. Omisión de Marcación
+        if row['Entrada'] == 'Falta Marcación' or row['Salida'] == 'Falta Marcación':
             excepciones.append({
-                'Carnet_Identidad': emp_id,
-                'Nombre': emp_nom,
+                'Carnet_Identidad': carnet,
+                'Nombre': nombre,
                 'Fecha': fecha,
                 'Tipo Excepción': 'Falta / Omisión Marcación',
                 'Detalle Excepción': f"Entrada: {row['Entrada']} | Salida: {row['Salida']}",
-                'Valor a Revisar': '1 Falta a Procesar',
-                'Decisión Supervisor': 'Pendiente',
-                'Tipo Falta': 'Injustificada',
-                'Observaciones': ''
+                'Valor a Revisar': 1,
+                'Decisión Supervisor': 'Pendiente'
             })
 
-        # 2. Horas Extras Automáticas / Dominicales
-        if row['Horas Extras'] > 0 or row.get('Novedad / Licencia') == 'Trabajo Domingo / Temporada Alta':
-            detalle_txt = f"Trabajo Domingo: {row['Horas Trabajadas']} hrs" if row.get('Novedad / Licencia') == 'Trabajo Domingo / Temporada Alta' else f"Marcación excedente: {row['Horas Extras']} hrs"
+        # 2. Atrasos Significativos
+        if row.get('Atraso (Minutos)', 0) > 0:
             excepciones.append({
-                'Carnet_Identidad': emp_id,
-                'Nombre': emp_nom,
+                'Carnet_Identidad': carnet,
+                'Nombre': nombre,
+                'Fecha': fecha,
+                'Tipo Excepción': 'Atraso',
+                'Detalle Excepción': f"Atraso registrado: {row['Atraso (Minutos)']} min",
+                'Valor a Revisar': row['Atraso (Minutos)'],
+                'Decisión Supervisor': 'Pendiente'
+            })
+
+        # 3. Horas Extras / Trabajo en Domingo
+        if row.get('HE Solicitadas', False) or row.get('Horas Extras', 0) > 0:
+            excepciones.append({
+                'Carnet_Identidad': carnet,
+                'Nombre': nombre,
                 'Fecha': fecha,
                 'Tipo Excepción': 'Horas Extras / Domingo',
-                'Detalle Excepción': detalle_txt,
-                'Valor a Revisar': f"{row['Horas Trabajadas'] if row['Horas Extras'] == 0 else row['Horas Extras']} hrs",
-                'Decisión Supervisor': 'Pendiente',
-                'Tipo Falta': 'N/A',
-                'Observaciones': ''
-            })
-
-        # 3. Salida Tardía (Horas Extras Solicitadas no Aprobadas)
-        if row.get('Salida Tardia Flag', False):
-            excepciones.append({
-                'Carnet_Identidad': emp_id,
-                'Nombre': emp_nom,
-                'Fecha': fecha,
-                'Tipo Excepción': 'Horas Extras Solicitadas (Salida Tardía)',
-                'Detalle Excepción': f"Salida marcada a las {row['Salida']} ({row.get('HE Solicitadas', 0)} hrs solicitadas)",
-                'Valor a Revisar': f"{row.get('HE Solicitadas', 0)} hrs",
-                'Decisión Supervisor': 'Pendiente',
-                'Tipo Falta': 'N/A',
-                'Observaciones': 'Rechazado por defecto. Apruebe para computar extras.'
-            })
-
-        # 4. Entrada Anticipada Pendiente
-        if row.get('Entrada Anticipada Flag', False):
-            excepciones.append({
-                'Carnet_Identidad': emp_id,
-                'Nombre': emp_nom,
-                'Fecha': fecha,
-                'Tipo Excepción': 'Entrada Anticipada Pendiente',
-                'Detalle Excepción': f"Ingresó a las {row['Entrada']} (antes del horario oficial)",
-                'Valor a Revisar': f"Entrada {row['Entrada']}",
-                'Decisión Supervisor': 'Pendiente',
-                'Tipo Falta': 'N/A',
-                'Observaciones': 'Computado desde hora oficial por defecto.'
-            })
-
-        # 5. Séptimo Día Laborado
-        if (emp_id, semana) in semanas_7dias:
-            excepciones.append({
-                'Carnet_Identidad': emp_id,
-                'Nombre': emp_nom,
-                'Fecha': fecha,
-                'Tipo Excepción': '7º Día Laborado',
-                'Detalle Excepción': f"Empleado registró asistencia los 7 días de la semana {semana}",
-                'Valor a Revisar': '1 Día Excedente',
-                'Decisión Supervisor': 'Pendiente',
-                'Tipo Falta': 'N/A',
-                'Observaciones': ''
-            })
-
-        # 6. Desfase de Horario de Ingreso
-        if row.get('Desfase Ingreso', False):
-            excepciones.append({
-                'Carnet_Identidad': emp_id,
-                'Nombre': emp_nom,
-                'Fecha': fecha,
-                'Tipo Excepción': 'Desfase Horario Ingreso',
-                'Detalle Excepción': f"Ingresó a las {row['Entrada']} completando {row['Horas Trabajadas']} hrs",
-                'Valor a Revisar': f"Entrada {row['Entrada']}",
-                'Decisión Supervisor': 'Pendiente',
-                'Tipo Falta': 'N/A',
-                'Observaciones': ''
+                'Detalle Excepción': f"Trabajo Extra: {row.get('Horas Extras', 0)} hrs",
+                'Valor a Revisar': row.get('Horas Extras', 0),
+                'Decisión Supervisor': 'Pendiente'
             })
 
     return pd.DataFrame(excepciones)
 
 
 def get_canje_summary(df_resultado):
+    """
+    Genera el resumen de horas extras acumuladas vs faltas para canjes de bolsa de horas.
+    """
     if df_resultado is None or df_resultado.empty:
-        return pd.DataFrame()
+        return pd.DataFrame(columns=['Carnet_Identidad', 'Nombre', 'Bolsa_HE', 'Faltas_Acumuladas', 'Saldo_Canjeable'])
 
-    resumen = []
-    col_id_key = 'Carnet_Identidad' if 'Carnet_Identidad' in df_resultado.columns else 'ID'
-    
-    for (emp_id, emp_nom), grp in df_resultado.groupby([col_id_key, 'Nombre']):
-        total_he = grp['Horas Extras'].sum()
-        
-        # Solo las Faltas Justificadas son canjeables
-        total_faltas_canjeables = grp['Falta Justificada'].sum()
-        
-        turno_dom = grp['Turno Dominante'].mode()[0] if not grp['Turno Dominante'].empty else 'Diurno'
-        costo_hora_dia = 7.0 if turno_dom == 'Nocturno' else 8.0
+    resumen = df_resultado.groupby(['Carnet_Identidad', 'Nombre']).agg(
+        Bolsa_HE=('Horas Extras', 'sum'),
+        Faltas_Acumuladas=('Estado', lambda x: (x == 'Incompleto').sum())
+    ).reset_index()
 
-        dias_canjeables_max = int(total_he // costo_hora_dia)
+    resumen['Saldo_Canjeable'] = resumen['Bolsa_HE'] - (resumen['Faltas_Acumuladas'] * 8.0)
+    return resumen
 
-        if total_he > 0 or total_faltas_canjeables > 0:
-            resumen.append({
-                'Carnet_Identidad': emp_id,
-                'Nombre': emp_nom,
-                'Turno Dominante': turno_dom,
-                'Horas Costo por Día': costo_hora_dia,
-                'Bolsa HE Acumulada (hrs)': round(total_he, 2),
-                'Días Máx. Canjeables': dias_canjeables_max,
-                'Faltas Registradas': int(total_faltas_canjeables),
-                'Días a Canjear (Aplicar)': 0,
-                'Estado Canje': 'Sin Aplicar'
-            })
 
-    return pd.DataFrame(resumen)
+def _traducir_dia(dia_en):
+    dias = {
+        'Monday': 'Lunes', 'Tuesday': 'Martes', 'Wednesday': 'Miércoles',
+        'Thursday': 'Jueves', 'Friday': 'Viernes', 'Saturday': 'Sábado', 'Sunday': 'Domingo'
+    }
+    return dias.get(dia_en, dia_en)
+
+
+def _aplicar_novedades(df_res, df_nov):
+    """
+    Cruza los registros con la tabla de Novedades y Permisos.
+    """
+    for idx, row in df_res.iterrows():
+        match = df_nov[
+            (df_nov['Carnet_Identidad'].astype(str) == str(row['Carnet_Identidad'])) &
+            (pd.to_datetime(df_nov['Fecha']).dt.date == row['Fecha'])
+        ]
+        if not match.empty:
+            tipo_nov = match.iloc[0].get('Tipo Novedad', 'Permiso Justificado')
+            if row['Estado'] == 'Incompleto':
+                df_res.at[idx, 'Estado'] = f"Justificado ({tipo_nov})"
+    return df_res
+
+
+def _empty_attendance_df():
+    return pd.DataFrame(columns=[
+        'Carnet_Identidad', 'Nombre', 'Tipo Personal', 'Fecha', 'Día',
+        'Entrada', 'Salida', 'Horas Trabajadas', 'Atraso (Minutos)',
+        'Horas Extras', 'Turnos Computados', 'Estado',
+        'Entrada Anticipada Flag', 'Salida Tardia Flag', 'HE Solicitadas'
+    ])
