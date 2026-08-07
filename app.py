@@ -150,7 +150,7 @@ elif opcion == "👥 Maestro de Empleados":
     st.header("Maestro de Empleados")
     try:
         df_emp = cached_load_sheet_data("01_Maestro_Empleados")
-        cols_sin_pin = [col for col in df_emp.columns if col.strip().upper() != "PIN"]
+        cols_sin_pin = [col for col in df_emp.columns if str(col).strip().upper() != "PIN"]
         df_emp_vista = df_emp[cols_sin_pin]
         st.dataframe(df_emp_vista, use_container_width=True, hide_index=True)
     except Exception as e:
@@ -214,8 +214,7 @@ elif opcion == "📝 Novedades y Permisos":
 
                 emp_seleccionado = st.selectbox("Seleccione Empleado:*", options=sorted(lista_emps))
                 
-                # Se utiliza directamente la propiedad de clase para omitir el objeto en caché
-                tipo_nov = st.selectbox("Tipo de Novedad / Licencia:*", options=NovedadesManager.TIPOS_NOVEDAD)
+                tipo_nov = st.selectbox("Tipo de Novedad / Licencia:*", options=nov_mgr.obtener_tipos_novedad())
                 
                 col_f1, col_f2 = st.columns(2)
                 with col_f1:
@@ -235,7 +234,7 @@ elif opcion == "📝 Novedades y Permisos":
                             row_e = df_emp[df_emp[col_nombre] == emp_seleccionado]
                             if not row_e.empty:
                                 col_id = 'Carnet_Identidad' if 'Carnet_Identidad' in df_emp.columns else ('ID' if 'ID' in df_emp.columns else None)
-                                if col_id:
+                                if col_id and col_id in row_e.columns:
                                     emp_id = str(row_e[col_id].values[0])
 
                         res_reg = nov_mgr.registrar_novedad(
@@ -388,7 +387,7 @@ elif opcion == "✅ Aprobaciones Supervisores":
             m3.metric("Sol. Horas Extras / Dom", len(df_fil_exc[df_fil_exc['Tipo Excepción'].str.contains('Horas Extras')]))
             m4.metric("Desfases Ingreso", len(df_fil_exc[df_fil_exc['Tipo Excepción'] == 'Desfase Horario Ingreso']))
 
-            # Definición estricta de columnas deshabilitadas si no está EN PROCESO
+            # Definición estricta de columnas deshabilitadas según estado
             if not es_editable:
                 cols_deshabilitadas_exc = list(df_fil_exc.columns)
             else:
