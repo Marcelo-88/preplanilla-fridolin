@@ -170,7 +170,6 @@ def process_attendance(df_bio, df_params=None, df_nov=None, df_emp=None, _nov_mg
         bio_names_map[row['emp_id_clean']] = row['raw_nombre_clean']
 
     # 3. Algoritmo de Emparejamiento Dinámico (Ventana Flotante de 18 Horas)
-    # Procesa todas las marcaciones continuas por empleado
     jornadas_procesadas = {} # Key: (emp_id, fecha_jornada) -> dict de jornada
 
     for emp_id_str, group in df.groupby('emp_id_clean'):
@@ -266,8 +265,8 @@ def process_attendance(df_bio, df_params=None, df_nov=None, df_emp=None, _nov_mg
                 hora_out_str = dt_out.strftime('%H:%M') if dt_out else 'Falta Marcación'
 
                 # Determinación del Tipo de Turno Oficial Ejecutado
-                # 1. Turno y Medio (Nocturno Especial): Entradas de 16:30 a 19:30 en Domingo o Viernes (soporta llegada anticipada)
-                es_turno_y_medio = (es_domingo or es_viernes) and (time(16, 30) <= dt_in.time() <= time(19, 30))
+                # 1. Turno y Medio (Nocturno Especial): Ampliado de 16:00 a 19:30 en Domingo o Viernes
+                es_turno_y_medio = (es_domingo or es_viernes) and (time(16, 0) <= dt_in.time() <= time(19, 30))
                 
                 # 2. Turno Nocturno Ordinario: Entrada >= 20:00 o < 05:00 o Turno Fijo Nocturno
                 es_nocturno_ordinario = not es_turno_y_medio and (
@@ -275,7 +274,7 @@ def process_attendance(df_bio, df_params=None, df_nov=None, df_emp=None, _nov_mg
                 )
 
                 if es_turno_y_medio:
-                    turno_label = 'Nocturno Especial (1.5 Turnos)'
+                    turno_label = 'Nocturno Especial'
                     hora_oficial_in = time(18, 0)
                     hora_oficial_out = time(5, 30)
                     jornada_horas_netas_std = 11.0
