@@ -53,7 +53,7 @@ class AuditLogger:
         except Exception:
             return False
 
-    def obtener_logs(self, limite: int = 1000) -> pd.DataFrame:
+    def obtener_logs(self, limite: int = 1000, *args, **kwargs) -> pd.DataFrame:
         try:
             with sqlite3.connect(self.db_path) as conn:
                 df = pd.read_sql_query(
@@ -82,12 +82,13 @@ except ImportError:
 
 
 # -----------------------------------------------------------------------------
-# CLASE LOCK MANAGER (Integrada de tu archivo original)
+# CLASE LOCK MANAGER (Con Persistencia Dual SQLite + JSON Antipérdida)
 # -----------------------------------------------------------------------------
 class LockManager:
     """
     Gestión de estado y cierre de períodos mensuales de asistencia con autonomía por supervisor.
     Clave de control: Periodo_Supervisor (ejemplo: 2026-07_CABRERA_YASMIN).
+    Soporta sincronización y respaldo en JSON para servidores efímeros (Streamlit Cloud).
     """
     ESTADO_PENDIENTE = "PENDIENTE"
     ESTADO_EN_PROCESO = "EN_PROCESO"
@@ -95,9 +96,11 @@ class LockManager:
 
     ROLES_SUPERUSUARIO = ["RESPONSABLE_OPERACIONES", "JEFE_PRODUCCION", "Jefe de Producción", "ADMINISTRADOR"]
 
-    def __init__(self, db_path: str = "period_locks.db"):
+    def __init__(self, db_path: str = "period_locks.db", json_path: str = "period_locks_backup.json"):
         self.db_path = db_path
+        self.json_path = json_path
         self._init_db()
+        self._sincronizar_desde_json()
 
     def _init_db(self):
         with sqlite3.connect(self.db_path) as conn:
@@ -118,6 +121,41 @@ class LockManager:
             usr_clean = str(usuario).strip().upper().replace(" ", "_")
             return f"{periodo}_{usr_clean}"
         return str(periodo)
+
+    def _guardar_json_local(self):
+        try:
+            with sqlite3.connect(self.db_path) as conn:
+                conn.row_factory = sqlite3.Row
+                rows = conn.cursor().execute("SELECT * FROM period_locks").fetchall()
+                data = [dict(r) for r in rows]
+                
+            with open(self.json_path, "w", encoding="utf-8") as f:
+                json.dump(data, f, ensure_ascii=False, indent=2)
+        except Exception as e:
+            print(f"Error respaldando a JSON: {e}")
+
+    def _sincronizar_desde_json(self):
+        if not os.path.exists(self.json_path):
+            return
+        try:
+            with open(self.json_path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            
+            with sqlite3.connect(self.db_path) as conn:
+                cursor = conn.cursor()
+                for reg in data:
+                    cursor.execute("""
+                        INSERT INTO period_locks (periodo, estado, cerrado_por, fecha_cierre, motivo_desbloqueo)
+                        VALUES (?, ?, ?, ?, ?)
+                        ON CONFLICT(periodo) DO UPDATE SET
+                            estado = excluded.estado,
+                            cerrado_por = excluded.cerrado_por,
+                            fecha_cierre = excluded.fecha_cierre,
+                            motivo_desbloqueo = excluded.motivo_desbloqueo
+                    """, (reg["periodo"], reg["estado"], reg.get("cerrado_por", ""), reg.get("fecha_cierre", ""), reg.get("motivo_desbloqueo", "")))
+                conn.commit()
+        except Exception as e:
+            print(f"Error restaurando desde JSON: {e}")
 
     def obtener_estado_periodo(self, periodo: str, usuario: Optional[str] = None, *args, **kwargs) -> str:
         if not usuario and args:
@@ -178,7 +216,36 @@ class LockManager:
             """, (clave, nuevo_estado, usuario_pin, fecha_actual, motivo or ""))
             conn.commit()
 
+        self._guardar_json_local()
+
         return {"exito": True, "mensaje": f"Estado del período {periodo} para {usuario_ref} actualizado a '{nuevo_estado}'."}
+
+    def exportar_respaldo_json(self) -> str:
+        with sqlite3.connect(self.db_path) as conn:
+            conn.row_factory = sqlite3.Row
+            rows = conn.cursor().execute("SELECT * FROM period_locks").fetchall()
+            return json.dumps([dict(r) for r in rows], ensure_ascii=False, indent=2)
+
+    def importar_respaldo_json(self, json_string: str) -> bool:
+        try:
+            data = json.loads(json_string)
+            with sqlite3.connect(self.db_path) as conn:
+                cursor = conn.cursor()
+                for reg in data:
+                    cursor.execute("""
+                        INSERT INTO period_locks (periodo, estado, cerrado_por, fecha_cierre, motivo_desbloqueo)
+                        VALUES (?, ?, ?, ?, ?)
+                        ON CONFLICT(periodo) DO UPDATE SET
+                            estado = excluded.estado,
+                            cerrado_por = excluded.cerrado_por,
+                            fecha_cierre = excluded.fecha_cierre,
+                            motivo_desbloqueo = excluded.motivo_desbloqueo
+                    """, (reg["periodo"], reg["estado"], reg.get("cerrado_por", ""), reg.get("fecha_cierre", ""), reg.get("motivo_desbloqueo", "")))
+                conn.commit()
+            self._guardar_json_local()
+            return True
+        except Exception:
+            return False
 
 
 # -----------------------------------------------------------------------------
@@ -538,6 +605,31 @@ elif opcion == "✅ Aprobaciones Supervisores":
                     audit_log.registrar_evento(usuario_actual, usuario_actual, "DESBLOQUEO_PERIODO", "Aprobaciones", {"periodo": periodo_sel, "supervisor": usuario_actual})
                     st.success(res_c["mensaje"])
                     st.rerun()
+
+    # --- BLOQUE DE RESPALDO Y RESTAURACIÓN ANTIPÉRDIDA ---
+    with st.expander("🛡️ Resguardo de Seguridad (Descargar / Restaurar Cierres)"):
+        st.caption("Si el servidor de Streamlit Cloud se reinicia y requiere recuperar el estado de los cierres, utilice estas funciones de respaldo:")
+        col_res1, col_res2 = st.columns(2)
+        
+        with col_res1:
+            json_data = lock_mgr.exportar_respaldo_json()
+            st.download_button(
+                label="📥 Descargar Respaldo de Cierres (.json)",
+                data=json_data,
+                file_name=f"period_locks_backup_{periodo_sel}.json",
+                mime="application/json",
+                help="Descargue este archivo al finalizar sus revisiones como copia de seguridad."
+            )
+            
+        with col_res2:
+            archivo_subido = st.file_uploader("📤 Restaurar Cierres desde Respaldo", type=["json"], key="uploader_lock_backup")
+            if archivo_subido is not None:
+                contenido = archivo_subido.read().decode("utf-8")
+                if lock_mgr.importar_respaldo_json(contenido):
+                    st.success("✅ Cierres restaurados exitosamente.")
+                    st.rerun()
+                else:
+                    st.error("❌ El archivo subido no es válido.")
 
     st.divider()
 
