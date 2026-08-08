@@ -74,7 +74,7 @@ class AuditLogger:
         except Exception:
             return pd.DataFrame(columns=['Fecha y Hora', 'Usuario', 'Acción', 'Módulo', 'Detalles / Datos'])
 
-# Importar o fallback de AuditLogger
+# Fallback o import de AuditLogger
 try:
     from modules.audit_logger import AuditLogger
 except ImportError:
@@ -103,18 +103,21 @@ class LockManager:
         self._sincronizar_desde_json()
 
     def _init_db(self):
-        with sqlite3.connect(self.db_path) as conn:
-            cursor = conn.cursor()
-            cursor.execute("""
-                CREATE TABLE IF NOT EXISTS period_locks (
-                    periodo TEXT PRIMARY KEY,
-                    estado TEXT NOT NULL DEFAULT 'PENDIENTE',
-                    cerrado_por TEXT,
-                    fecha_cierre TEXT,
-                    motivo_desbloqueo TEXT
-                )
-            """)
-            conn.commit()
+        try:
+            with sqlite3.connect(self.db_path) as conn:
+                cursor = conn.cursor()
+                cursor.execute("""
+                    CREATE TABLE IF NOT EXISTS period_locks (
+                        periodo TEXT PRIMARY KEY,
+                        estado TEXT NOT NULL DEFAULT 'PENDIENTE',
+                        cerrado_por TEXT,
+                        fecha_cierre TEXT,
+                        motivo_desbloqueo TEXT
+                    )
+                """)
+                conn.commit()
+        except Exception as e:
+            print(f"Error inicializando DB LockManager: {e}")
 
     def _construir_clave(self, periodo: str, usuario: Optional[str] = None) -> str:
         if usuario:
@@ -162,11 +165,14 @@ class LockManager:
             usuario = args[0]
 
         clave = self._construir_clave(periodo, usuario)
-        with sqlite3.connect(self.db_path) as conn:
-            cursor = conn.cursor()
-            res = cursor.execute("SELECT estado FROM period_locks WHERE periodo = ?", (clave,)).fetchone()
-            if res:
-                return res[0]
+        try:
+            with sqlite3.connect(self.db_path) as conn:
+                cursor = conn.cursor()
+                res = cursor.execute("SELECT estado FROM period_locks WHERE periodo = ?", (clave,)).fetchone()
+                if res:
+                    return res[0]
+        except Exception:
+            pass
         return self.ESTADO_PENDIENTE
 
     def es_editable(self, periodo: str, rol_usuario: str, usuario: Optional[str] = None) -> bool:
@@ -203,28 +209,36 @@ class LockManager:
                 }
 
         fecha_actual = datetime.now().isoformat()
-        with sqlite3.connect(self.db_path) as conn:
-            cursor = conn.cursor()
-            cursor.execute("""
-                INSERT INTO period_locks (periodo, estado, cerrado_por, fecha_cierre, motivo_desbloqueo)
-                VALUES (?, ?, ?, ?, ?)
-                ON CONFLICT(periodo) DO UPDATE SET
-                    estado = excluded.estado,
-                    cerrado_por = excluded.cerrado_por,
-                    fecha_cierre = excluded.fecha_cierre,
-                    motivo_desbloqueo = excluded.motivo_desbloqueo
-            """, (clave, nuevo_estado, usuario_pin, fecha_actual, motivo or ""))
-            conn.commit()
+        try:
+            with sqlite3.connect(self.db_path) as conn:
+                cursor = conn.cursor()
+                cursor.execute("""
+                    INSERT INTO period_locks (periodo, estado, cerrado_por, fecha_cierre, motivo_desbloqueo)
+                    VALUES (?, ?, ?, ?, ?)
+                    ON CONFLICT(periodo) DO UPDATE SET
+                        estado = excluded.estado,
+                        cerrado_por = excluded.cerrado_por,
+                        fecha_cierre = excluded.fecha_cierre,
+                        motivo_desbloqueo = excluded.motivo_desbloqueo
+                """, (clave, nuevo_estado, usuario_pin, fecha_actual, motivo or ""))
+                conn.commit()
 
-        self._guardar_json_local()
-
-        return {"exito": True, "mensaje": f"Estado del período {periodo} para {usuario_ref} actualizado a '{nuevo_estado}'."}
+            self._guardar_json_local()
+            return {"exito": True, "mensaje": f"Estado del período {periodo} para {usuario_ref} actualizado a '{nuevo_estado}'."}
+        except Exception as e:
+            return {"exito": False, "mensaje": f"Error actualizando estado en base de datos: {e}"}
 
     def exportar_respaldo_json(self) -> str:
-        with sqlite3.connect(self.db_path) as conn:
-            conn.row_factory = sqlite3.Row
-            rows = conn.cursor().execute("SELECT * FROM period_locks").fetchall()
-            return json.dumps([dict(r) for r in rows], ensure_ascii=False, indent=2)
+        try:
+            with sqlite3.connect(self.db_path) as conn:
+                conn.row_factory = sqlite3.Row
+                rows = conn.cursor().execute("SELECT * FROM period_locks").fetchall()
+                return json.dumps([dict(r) for r in rows], ensure_ascii=False, indent=2)
+        except Exception:
+            if os.path.exists(self.json_path):
+                with open(self.json_path, "r", encoding="utf-8") as f:
+                    return f.read()
+            return "[]"
 
     def importar_respaldo_json(self, json_string: str) -> bool:
         try:
@@ -291,7 +305,7 @@ except ImportError:
                 return {"exito": False, "mensaje": f"Error guardando novedad: {e}"}
 
 
-# --- INICIALIZACIÓN DE GESTORES ---
+# --- INICIALIZACIÓN DE GESTORES (Con Limpieza de Caché de Clases) ---
 @st.cache_resource
 def get_managers():
     audit = AuditLogger()
@@ -301,7 +315,12 @@ def get_managers():
 
 audit_log, lock_mgr, nov_mgr = get_managers()
 
-# Caching de Funciones
+# Verificación de integridad de objeto en memoria (evita AttributeError si la caché retenía una versión obsoleta)
+if not hasattr(lock_mgr, "exportar_respaldo_json"):
+    st.cache_resource.clear()
+    audit_log, lock_mgr, nov_mgr = get_managers()
+
+# Caching de Funciones de Datos
 @st.cache_data(ttl=300, show_spinner=False)
 def cached_load_sheet_data(sheet_name):
     return load_sheet_data(sheet_name)
