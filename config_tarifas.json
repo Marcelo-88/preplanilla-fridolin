@@ -1,0 +1,9 @@
+{
+  "tarifas_base": {
+    "diurno_normal_8h": 100.0,
+    "diurno_1_5_12h": 150.0,
+    "nocturno_normal_8h": 120.0,
+    "nocturno_1_5_12h": 180.0
+  },
+  "excepciones": {}
+}
