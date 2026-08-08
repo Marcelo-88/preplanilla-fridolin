@@ -12,10 +12,111 @@ from modules.data_loader import load_sheet_data
 from modules.attendance_processor import process_attendance, detect_exceptions, get_canje_summary
 from modules.auth_permissions import render_user_selector, filter_dataframe_by_supervisor
 from modules.excel_exporter import ExcelExporter
-from modules.tarifas_manager import (
-    cargar_tarifas, guardar_tarifas, actualizar_excepcion_empleado, eliminar_excepcion_empleado,
-    obtener_config_periodo, guardar_config_periodo, clean_ci
-)
+
+try:
+    from modules.tarifas_manager import (
+        cargar_tarifas, guardar_tarifas, actualizar_excepcion_empleado, eliminar_excepcion_empleado,
+        obtener_config_periodo, guardar_config_periodo, clean_ci
+    )
+except ImportError:
+    def clean_ci(val):
+        if val is None:
+            return ""
+        return str(val).split('.')[0].strip().upper()
+
+# -----------------------------------------------------------------------------
+# GESTOR PERSISTENTE DE TARIFAS Y EXCEPCIONES (DISCO / JSON)
+# -----------------------------------------------------------------------------
+TARIFAS_JSON_PATH = "tarifas_config.json"
+
+def cargar_todas_tarifas_json() -> dict:
+    if os.path.exists(TARIFAS_JSON_PATH):
+        try:
+            with open(TARIFAS_JSON_PATH, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except Exception:
+            return {}
+    return {}
+
+def guardar_todas_tarifas_json(data: dict) -> bool:
+    try:
+        with open(TARIFAS_JSON_PATH, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+        return True
+    except Exception as e:
+        print(f"Error guardando tarifas en JSON: {e}")
+        return False
+
+def obtener_config_periodo_persistent(periodo: str) -> dict:
+    all_data = cargar_todas_tarifas_json()
+    if periodo in all_data:
+        return all_data[periodo]
+    
+    # Intenta cargar de la función original si está disponible
+    try:
+        from modules.tarifas_manager import obtener_config_periodo as orig_obtener
+        cfg = orig_obtener(periodo)
+        if cfg and isinstance(cfg, dict):
+            all_data[periodo] = cfg
+            guardar_todas_tarifas_json(all_data)
+            return cfg
+    except Exception:
+        pass
+
+    default_cfg = {
+        "tarifas_base": {
+            "diurno_normal": 100.0,
+            "diurno_1_5": 150.0,
+            "nocturno_normal": 120.0,
+            "nocturno_1_5": 180.0
+        },
+        "excepciones": {}
+    }
+    all_data[periodo] = default_cfg
+    guardar_todas_tarifas_json(all_data)
+    return default_cfg
+
+def guardar_config_periodo_persistent(periodo: str, config: dict) -> bool:
+    all_data = cargar_todas_tarifas_json()
+    all_data[periodo] = config
+    res = guardar_todas_tarifas_json(all_data)
+    try:
+        from modules.tarifas_manager import guardar_config_periodo as orig_guardar
+        orig_guardar(periodo, config)
+    except Exception:
+        pass
+    return res
+
+def actualizar_excepcion_empleado_persistent(ci: str, tipo_turno: str, monto: float, periodo: str) -> bool:
+    config = obtener_config_periodo_persistent(periodo)
+    ci_clean = clean_ci(ci)
+    if "excepciones" not in config:
+        config["excepciones"] = {}
+    if ci_clean not in config["excepciones"]:
+        config["excepciones"][ci_clean] = {}
+    
+    config["excepciones"][ci_clean][tipo_turno] = float(monto)
+    res = guardar_config_periodo_persistent(periodo, config)
+    try:
+        from modules.tarifas_manager import actualizar_excepcion_empleado as orig_act
+        orig_act(ci, tipo_turno, monto, periodo=periodo)
+    except Exception:
+        pass
+    return res
+
+def eliminar_excepcion_empleado_persistent(ci: str, periodo: str) -> bool:
+    config = obtener_config_periodo_persistent(periodo)
+    ci_clean = clean_ci(ci)
+    if "excepciones" in config and ci_clean in config["excepciones"]:
+        del config["excepciones"][ci_clean]
+        res = guardar_config_periodo_persistent(periodo, config)
+        try:
+            from modules.tarifas_manager import eliminar_excepcion_empleado as orig_del
+            orig_del(ci, periodo=periodo)
+        except Exception:
+            pass
+        return res
+    return False
 
 # -----------------------------------------------------------------------------
 # CLASE AUDIT LOGGER (Garantiza funcionamiento de la Bitácora)
@@ -812,7 +913,7 @@ elif opcion == "✅ Aprobaciones Supervisores":
 # -----------------------------------------------------------------------------
 elif opcion == "💵 Valores Monetizados":
     st.header("💵 Gestión de Valores Monetizados y Tarifas de Jornaleros")
-    st.caption("Módulo exclusivo para Superusuarios. Permite configurar y aprobar tarifas de jornaleros.")
+    st.caption("Módulo exclusivo para Superusuarios. Permite configurar y aprobar tarifas de jornaleros con almacenamiento en disco.")
 
     # Verificación de Rol
     roles_super = ["RESPONSABLE_OPERACIONES", "JEFE_PRODUCCION", "Jefe de Producción", "ADMINISTRADOR", "Superusuario"]
@@ -831,19 +932,19 @@ elif opcion == "💵 Valores Monetizados":
     col_p_tarifa, _ = st.columns([2, 2])
     periodo_tarifa_sel = col_p_tarifa.selectbox("🗓️ Seleccionar Período/Gestión de Tarifas:", options=periodos_tarifas)
 
-    # Cargar Configuración del Período
-    config = obtener_config_periodo(periodo_tarifa_sel)
+    # Cargar Configuración del Período de Forma Persistente
+    config = obtener_config_periodo_persistent(periodo_tarifa_sel)
 
     st.subheader(f"1. Tarifas Base Globales ({periodo_tarifa_sel})")
     col1, col2 = st.columns(2)
 
     with col1:
-        diurno_norm = st.number_input("Diurno Normal [Bs]", value=float(config["tarifas_base"].get("diurno_normal", 100.0)), step=5.0)
-        diurno_15 = st.number_input("Diurno 1.5 [Bs]", value=float(config["tarifas_base"].get("diurno_1_5", 150.0)), step=5.0)
+        diurno_norm = st.number_input("Diurno Normal [Bs]", value=float(config.get("tarifas_base", {}).get("diurno_normal", 100.0)), step=5.0)
+        diurno_15 = st.number_input("Diurno 1.5 [Bs]", value=float(config.get("tarifas_base", {}).get("diurno_1_5", 150.0)), step=5.0)
 
     with col2:
-        nocturno_norm = st.number_input("Nocturno Normal [Bs]", value=float(config["tarifas_base"].get("nocturno_normal", 120.0)), step=5.0)
-        nocturno_15 = st.number_input("Nocturno 1.5 [Bs]", value=float(config["tarifas_base"].get("nocturno_1_5", 180.0)), step=5.0)
+        nocturno_norm = st.number_input("Nocturno Normal [Bs]", value=float(config.get("tarifas_base", {}).get("nocturno_normal", 120.0)), step=5.0)
+        nocturno_15 = st.number_input("Nocturno 1.5 [Bs]", value=float(config.get("tarifas_base", {}).get("nocturno_1_5", 180.0)), step=5.0)
 
     if st.button("💾 Guardar Tarifas Base", type="primary"):
         config["tarifas_base"] = {
@@ -852,9 +953,9 @@ elif opcion == "💵 Valores Monetizados":
             "nocturno_normal": nocturno_norm,
             "nocturno_1_5": nocturno_15
         }
-        if guardar_config_periodo(periodo_tarifa_sel, config):
+        if guardar_config_periodo_persistent(periodo_tarifa_sel, config):
             audit_log.registrar_evento(usuario_actual, usuario_actual, "ACTUALIZAR_TARIFAS_BASE", "Tarifas", {"periodo": periodo_tarifa_sel, "tarifas": config["tarifas_base"]})
-            st.success(f"✅ Tarifas base guardadas exitosamente para la gestión {periodo_tarifa_sel}")
+            st.success(f"✅ Tarifas base guardadas exitosamente en disco para la gestión {periodo_tarifa_sel}")
 
     st.divider()
 
@@ -891,13 +992,24 @@ elif opcion == "💵 Valores Monetizados":
         ("nocturno_normal", "Nocturno Normal"),
         ("nocturno_1_5", "Nocturno 1.5")
     ], format_func=lambda x: x[1])
-    monto_in = c_monto.number_input("Monto Personalizado [Bs]", min_value=0.0, step=5.0)
+
+    # Carga automática del monto guardado si existe previamente
+    excepciones_actuales = config.get("excepciones", {})
+    monto_guardado = excepciones_actuales.get(ci_vinculado, {}).get(tipo_in[0], 0.0)
+
+    monto_in = c_monto.number_input(
+        "Monto Personalizado [Bs]", 
+        min_value=0.0, 
+        value=float(monto_guardado), 
+        step=5.0,
+        key=f"monto_inp_{ci_vinculado}_{tipo_in[0]}"
+    )
 
     if st.button("➕ Registrar / Actualizar Excepción"):
         if ci_vinculado:
-            actualizar_excepcion_empleado(ci_vinculado, tipo_in[0], monto_in, periodo=periodo_tarifa_sel)
+            actualizar_excepcion_empleado_persistent(ci_vinculado, tipo_in[0], monto_in, periodo=periodo_tarifa_sel)
             audit_log.registrar_evento(usuario_actual, usuario_actual, "EXCEPCION_TARIFA", "Tarifas", {"periodo": periodo_tarifa_sel, "CI": ci_vinculado, "nombre": nombre_sel, "tipo": tipo_in[0], "monto": monto_in})
-            st.success(f"Excepción asignada correctamente a {nombre_sel} (CI: {ci_vinculado}) para {periodo_tarifa_sel}")
+            st.success(f"Excepción guardada en disco para {nombre_sel} (CI: {ci_vinculado}) con el monto {monto_in} Bs.")
             st.rerun()
         else:
             st.warning("No se pudo obtener el CI del jornalero seleccionado.")
@@ -920,9 +1032,35 @@ elif opcion == "💵 Valores Monetizados":
 
         if st.button("🗑️ Eliminar Excepción"):
             ci_del = clean_ci(emp_del_sel.split("(CI: ")[-1].replace(")", "").strip())
-            eliminar_excepcion_empleado(ci_del, periodo=periodo_tarifa_sel)
+            eliminar_excepcion_empleado_persistent(ci_del, periodo=periodo_tarifa_sel)
+            audit_log.registrar_evento(usuario_actual, usuario_actual, "ELIMINAR_EXCEPCION_TARIFA", "Tarifas", {"periodo": periodo_tarifa_sel, "CI": ci_del})
             st.info(f"Excepciones eliminadas para CI: {ci_del}")
             st.rerun()
+
+    # --- PANEL DE RESPALDO Y RESTAURACIÓN DE TARIFAS ---
+    with st.expander("🛡️ Resguardo y Respaldo de Tarifas (.json)"):
+        st.caption("Descargue o restaure la configuración de tarifas base y excepciones registradas en disco:")
+        c_tar_exp, c_tar_imp = st.columns(2)
+        
+        with c_tar_exp:
+            all_tarifas_json = json.dumps(cargar_todas_tarifas_json(), ensure_ascii=False, indent=2)
+            st.download_button(
+                label="📥 Descargar Respaldo de Tarifas (.json)",
+                data=all_tarifas_json,
+                file_name=f"tarifas_config_backup_{periodo_tarifa_sel}.json",
+                mime="application/json"
+            )
+
+        with c_tar_imp:
+            file_tar = st.file_uploader("📤 Restaurar Tarifas desde Respaldo", type=["json"], key="uploader_tarifas_backup")
+            if file_tar is not None:
+                try:
+                    data_rest = json.loads(file_tar.read().decode("utf-8"))
+                    if guardar_todas_tarifas_json(data_rest):
+                        st.success("✅ Tarifas y excepciones restauradas con éxito.")
+                        st.rerun()
+                except Exception as err:
+                    st.error(f"Error al restaurar archivo: {err}")
 
 # -----------------------------------------------------------------------------
 # 6. PRE-PLANILLA Y REPORTES
