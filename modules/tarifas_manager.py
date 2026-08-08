@@ -6,10 +6,10 @@ CONFIG_TARIFAS_PATH = "config_tarifas.json"
 
 DEFAULT_TARIFAS = {
     "tarifas_base": {
-        "diurno_normal_8h": 100.0,
-        "diurno_1_5_12h": 150.0,
-        "nocturno_normal_8h": 120.0,
-        "nocturno_1_5_12h": 180.0
+        "diurno_normal": 100.0,
+        "diurno_1_5": 150.0,
+        "nocturno_normal": 120.0,
+        "nocturno_1_5": 180.0
     },
     "excepciones": {}
 }
@@ -40,39 +40,76 @@ def guardar_tarifas(data: Dict[str, Any]) -> bool:
         return False
 
 
-def obtener_tarifa_empleado(ci: str, tipo_turno: str) -> float:
-    """Obtiene la tarifa para un jornalero (revisa si tiene excepción por CI o usa la base)."""
-    config = cargar_tarifas()
-    ci_str = str(ci).strip()
+def obtener_config_periodo(periodo: str) -> Dict[str, Any]:
+    """Obtiene la configuración específica para un período (ej: '2026-07'). Si no existe, retorna los valores por defecto."""
+    config_global = cargar_tarifas()
+    periodos = config_global.get("periodos", {})
+    if periodo in periodos:
+        return periodos[periodo]
+    return {
+        "tarifas_base": config_global.get("tarifas_base", DEFAULT_TARIFAS["tarifas_base"]),
+        "excepciones": {}
+    }
 
-    if ci_str in config.get("excepciones", {}):
-        exc = config["excepciones"][ci_str]
+
+def guardar_config_periodo(periodo: str, config_periodo: Dict[str, Any]) -> bool:
+    """Guarda la configuración específica de un período en el JSON global."""
+    config_global = cargar_tarifas()
+    if "periodos" not in config_global:
+        config_global["periodos"] = {}
+    config_global["periodos"][periodo] = config_periodo
+    return guardar_tarifas(config_global)
+
+
+def obtener_tarifa_empleado(ci: str, tipo_turno: str, periodo: str = "") -> float:
+    """Obtiene la tarifa para un jornalero (revisa si tiene excepción por CI o usa la base del período)."""
+    if periodo:
+        cfg = obtener_config_periodo(periodo)
+    else:
+        cfg = cargar_tarifas()
+
+    ci_str = str(ci).strip()
+    if ci_str in cfg.get("excepciones", {}):
+        exc = cfg["excepciones"][ci_str]
         if tipo_turno in exc and exc[tipo_turno] is not None:
             return float(exc[tipo_turno])
 
-    return float(config.get("tarifas_base", {}).get(tipo_turno, 0.0))
+    return float(cfg.get("tarifas_base", {}).get(tipo_turno, 0.0))
 
 
-def actualizar_excepcion_empleado(ci: str, tipo_turno: str, monto: float):
-    """Agrega o actualiza una tarifa excepcionada para un CI específico."""
-    config = cargar_tarifas()
-    ci_str = str(ci).strip()
-
-    if "excepciones" not in config:
-        config["excepciones"] = {}
-
-    if ci_str not in config["excepciones"]:
-        config["excepciones"][ci_str] = {}
-
-    config["excepciones"][ci_str][tipo_turno] = float(monto)
-    guardar_tarifas(config)
-
-
-def eliminar_excepcion_empleado(ci: str):
-    """Elimina las excepciones de un empleado por su CI."""
-    config = cargar_tarifas()
-    ci_str = str(ci).strip()
-
-    if "excepciones" in config and ci_str in config["excepciones"]:
-        del config["excepciones"][ci_str]
+def actualizar_excepcion_empleado(ci: str, tipo_turno: str, monto: float, periodo: str = ""):
+    """Agrega o actualiza una tarifa excepcionada para un CI específico en un período."""
+    if periodo:
+        cfg = obtener_config_periodo(periodo)
+        if "excepciones" not in cfg:
+            cfg["excepciones"] = {}
+        ci_str = str(ci).strip()
+        if ci_str not in cfg["excepciones"]:
+            cfg["excepciones"][ci_str] = {}
+        cfg["excepciones"][ci_str][tipo_turno] = float(monto)
+        guardar_config_periodo(periodo, cfg)
+    else:
+        config = cargar_tarifas()
+        ci_str = str(ci).strip()
+        if "excepciones" not in config:
+            config["excepciones"] = {}
+        if ci_str not in config["excepciones"]:
+            config["excepciones"][ci_str] = {}
+        config["excepciones"][ci_str][tipo_turno] = float(monto)
         guardar_tarifas(config)
+
+
+def eliminar_excepcion_empleado(ci: str, periodo: str = ""):
+    """Elimina las excepciones de un empleado por su CI en un período determinado."""
+    if periodo:
+        cfg = obtener_config_periodo(periodo)
+        ci_str = str(ci).strip()
+        if "excepciones" in cfg and ci_str in cfg["excepciones"]:
+            del cfg["excepciones"][ci_str]
+            guardar_config_periodo(periodo, cfg)
+    else:
+        config = cargar_tarifas()
+        ci_str = str(ci).strip()
+        if "excepciones" in config and ci_str in config["excepciones"]:
+            del config["excepciones"][ci_str]
+            guardar_tarifas(config)
