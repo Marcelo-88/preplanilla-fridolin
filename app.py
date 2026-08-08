@@ -15,7 +15,8 @@ from modules.excel_exporter import ExcelExporter
 from modules.lock_manager import LockManager
 from modules.audit_logger import AuditLogger
 from modules.tarifas_manager import (
-    cargar_tarifas, guardar_tarifas, actualizar_excepcion_empleado, eliminar_excepcion_empleado
+    cargar_tarifas, guardar_tarifas, actualizar_excepcion_empleado, eliminar_excepcion_empleado,
+    obtener_config_periodo, guardar_config_periodo
 )
 
 
@@ -115,7 +116,6 @@ st.sidebar.divider()
 
 opciones_menu = [
     "📊 Parámetros y Reglas",
-    "👥 Maestro de Empleados",
     "⏱️ Importación Biométrico",
     "📝 Novedades y Permisos",
     "✅ Aprobaciones Supervisores",
@@ -153,21 +153,7 @@ if opcion == "📊 Parámetros y Reglas":
 
 
 # -----------------------------------------------------------------------------
-# 2. MAESTRO DE EMPLEADOS
-# -----------------------------------------------------------------------------
-elif opcion == "👥 Maestro de Empleados":
-    st.header("Maestro de Empleados")
-    try:
-        df_emp = cached_load_sheet_data("01_Maestro_Empleados")
-        cols_sin_pin = [col for col in df_emp.columns if str(col).strip().upper() != "PIN"]
-        df_emp_vista = df_emp[cols_sin_pin]
-        st.dataframe(df_emp_vista, use_container_width=True, hide_index=True)
-    except Exception as e:
-        st.error(f"Error al cargar la pestaña: {e}")
-
-
-# -----------------------------------------------------------------------------
-# 3. IMPORTACIÓN BIOMÉTRICO
+# 2. IMPORTACIÓN BIOMÉTRICO
 # -----------------------------------------------------------------------------
 elif opcion == "⏱️ Importación Biométrico":
     st.header("Registros del Biométrico")
@@ -179,7 +165,7 @@ elif opcion == "⏱️ Importación Biométrico":
 
 
 # -----------------------------------------------------------------------------
-# 4. NOVEDADES Y PERMISOS
+# 3. NOVEDADES Y PERMISOS
 # -----------------------------------------------------------------------------
 elif opcion == "📝 Novedades y Permisos":
     st.header("Novedades, Licencias y Permisos Especiales")
@@ -230,7 +216,7 @@ elif opcion == "📝 Novedades y Permisos":
 
 
 # -----------------------------------------------------------------------------
-# 5. APROBACIONES SUPERVISORES
+# 4. APROBACIONES SUPERVISORES
 # -----------------------------------------------------------------------------
 elif opcion == "✅ Aprobaciones Supervisores":
     st.header("✅ Centro de Aprobaciones y Excepciones")
@@ -263,7 +249,7 @@ elif opcion == "✅ Aprobaciones Supervisores":
 
 
 # -----------------------------------------------------------------------------
-# 6. VALORES MONETIZADOS (PUNTO 3 - NUEVA VISTA)
+# 5. VALORES MONETIZADOS (PUNTO 3 - NUEVA VISTA)
 # -----------------------------------------------------------------------------
 elif opcion == "💵 Valores Monetizados (Punto 3)":
     st.header("💵 Gestión de Valores Monetizados y Tarifas de Jornaleros")
@@ -275,70 +261,112 @@ elif opcion == "💵 Valores Monetizados (Punto 3)":
         st.error("⛔ Acceso denegado: Esta pantalla requiere privilegios de Superusuario.")
         st.stop()
 
-    config = cargar_tarifas()
+    # Cargar Períodos Disponibles desde Biométrico o Default
+    try:
+        df_bio = cached_load_sheet_data("02_Importacion_Biometrico")
+        df_bio['dt_temp'] = pd.to_datetime(df_bio.iloc[:, 2], dayfirst=True, errors='coerce')
+        periodos_tarifas = sorted(df_bio['dt_temp'].dt.strftime('%Y-%m').dropna().unique().tolist(), reverse=True)
+    except Exception:
+        periodos_tarifas = [datetime.now().strftime('%Y-%m')]
 
-    st.subheader("1. Tarifas Base Globales (Aplica al 90% del Personal)")
+    col_p_tarifa, _ = st.columns([2, 2])
+    periodo_tarifa_sel = col_p_tarifa.selectbox("🗓️ Seleccionar Período/Gestión de Tarifas:", options=periodos_tarifas)
+
+    # Cargar Configuración del Período
+    config = obtener_config_periodo(periodo_tarifa_sel)
+
+    st.subheader(f"1. Tarifas Base Globales ({periodo_tarifa_sel})")
     col1, col2 = st.columns(2)
 
     with col1:
-        diurno_norm = st.number_input("Diurno Normal 8h [Bs]", value=float(config["tarifas_base"].get("diurno_normal_8h", 100.0)), step=5.0)
-        diurno_15 = st.number_input("Diurno 1.5 / 12h [Bs]", value=float(config["tarifas_base"].get("diurno_1_5_12h", 150.0)), step=5.0)
+        diurno_norm = st.number_input("Diurno Normal [Bs]", value=float(config["tarifas_base"].get("diurno_normal", 100.0)), step=5.0)
+        diurno_15 = st.number_input("Diurno 1.5 [Bs]", value=float(config["tarifas_base"].get("diurno_1_5", 150.0)), step=5.0)
 
     with col2:
-        nocturno_norm = st.number_input("Nocturno Normal 8h [Bs]", value=float(config["tarifas_base"].get("nocturno_normal_8h", 120.0)), step=5.0)
-        nocturno_15 = st.number_input("Nocturno 1.5 / 12h [Bs]", value=float(config["tarifas_base"].get("nocturno_1_5_12h", 180.0)), step=5.0)
+        nocturno_norm = st.number_input("Nocturno Normal [Bs]", value=float(config["tarifas_base"].get("nocturno_normal", 120.0)), step=5.0)
+        nocturno_15 = st.number_input("Nocturno 1.5 [Bs]", value=float(config["tarifas_base"].get("nocturno_1_5", 180.0)), step=5.0)
 
     if st.button("💾 Guardar Tarifas Base", type="primary"):
         config["tarifas_base"] = {
-            "diurno_normal_8h": diurno_norm,
-            "diurno_1_5_12h": diurno_15,
-            "nocturno_normal_8h": nocturno_norm,
-            "nocturno_1_5_12h": nocturno_15
+            "diurno_normal": diurno_norm,
+            "diurno_1_5": diurno_15,
+            "nocturno_normal": nocturno_norm,
+            "nocturno_1_5": nocturno_15
         }
-        if guardar_tarifas(config):
-            audit_log.registrar_evento(usuario_actual, usuario_actual, "ACTUALIZAR_TARIFAS_BASE", "Tarifas", config["tarifas_base"])
-            st.success("✅ Tarifas base guardadas exitosamente en config_tarifas.json")
+        if guardar_config_periodo(periodo_tarifa_sel, config):
+            audit_log.registrar_evento(usuario_actual, usuario_actual, "ACTUALIZAR_TARIFAS_BASE", "Tarifas", {"periodo": periodo_tarifa_sel, "tarifas": config["tarifas_base"]})
+            st.success(f"✅ Tarifas base guardadas exitosamente para la gestión {periodo_tarifa_sel}")
 
     st.divider()
 
-    st.subheader("2. Excepciones Tarifarias por Empleado")
-    c_ci, c_tipo, c_monto = st.columns([2, 3, 2])
-    ci_in = c_ci.text_input("Carnet de Identidad (CI)")
+    st.subheader(f"2. Excepciones Tarifarias por Empleado ({periodo_tarifa_sel})")
+
+    # Cargar Maestro de Empleados y Filtrar ÚNICAMENTE JORNALEROS
+    dict_jornaleros = {}
+    try:
+        df_emp_all = cached_load_sheet_data("01_Maestro_Empleados")
+        col_tipo = [c for c in df_emp_all.columns if str(c).strip().lower() in ['tipo_personal', 'tipo personal']][0]
+        col_nombre_emp = [c for c in df_emp_all.columns if str(c).strip().lower() in ['nombre_completo', 'nombre']][0]
+        col_ci_emp = [c for c in df_emp_all.columns if str(c).strip().lower() in ['carnet_identidad', 'ci', 'carnet']][0]
+
+        df_jornaleros = df_emp_all[df_emp_all[col_tipo].astype(str).str.strip().str.upper() == 'JORNALERO'].copy()
+        for _, row in df_jornaleros.iterrows():
+            nom = str(row[col_nombre_emp]).strip()
+            ci_val = str(row[col_ci_emp]).strip()
+            dict_jornaleros[nom] = ci_val
+    except Exception as e:
+        st.error(f"Error cargando lista de Jornaleros: {e}")
+
+    c_nom, c_tipo, c_monto = st.columns([3, 3, 2])
+
+    if dict_jornaleros:
+        nombre_sel = c_nom.selectbox("Seleccionar Jornalero (Por Nombre):", options=sorted(list(dict_jornaleros.keys())))
+        ci_vinculado = dict_jornaleros[nombre_sel]
+    else:
+        nombre_sel = c_nom.text_input("Nombre de Jornalero")
+        ci_vinculado = ""
+
     tipo_in = c_tipo.selectbox("Tipo de Turno", [
-        ("diurno_normal_8h", "Diurno Normal (8h)"),
-        ("diurno_1_5_12h", "Diurno 1.5 (12h)"),
-        ("nocturno_normal_8h", "Nocturno Normal (8h)"),
-        ("nocturno_1_5_12h", "Nocturno 1.5 (12h)")
+        ("diurno_normal", "Diurno Normal"),
+        ("diurno_1_5", "Diurno 1.5"),
+        ("nocturno_normal", "Nocturno Normal"),
+        ("nocturno_1_5", "Nocturno 1.5")
     ], format_func=lambda x: x[1])
     monto_in = c_monto.number_input("Monto Personalizado [Bs]", min_value=0.0, step=5.0)
 
     if st.button("➕ Registrar / Actualizar Excepción"):
-        if ci_in.strip():
-            actualizar_excepcion_empleado(ci_in.strip(), tipo_in[0], monto_in)
-            audit_log.registrar_evento(usuario_actual, usuario_actual, "EXCEPCION_TARIFA", "Tarifas", {"CI": ci_in, "tipo": tipo_in[0], "monto": monto_in})
-            st.success(f"Excepción asignada correctamente a CI: {ci_in}")
+        if ci_vinculado:
+            actualizar_excepcion_empleado(ci_vinculado, tipo_in[0], monto_in, periodo=periodo_tarifa_sel)
+            audit_log.registrar_evento(usuario_actual, usuario_actual, "EXCEPCION_TARIFA", "Tarifas", {"periodo": periodo_tarifa_sel, "CI": ci_vinculado, "nombre": nombre_sel, "tipo": tipo_in[0], "monto": monto_in})
+            st.success(f"Excepción asignada correctamente a {nombre_sel} (CI: {ci_vinculado}) para {periodo_tarifa_sel}")
             st.rerun()
         else:
-            st.warning("Ingrese un CI válido.")
+            st.warning("No se pudo obtener el CI del jornalero seleccionado.")
 
     excepciones = config.get("excepciones", {})
     if excepciones:
-        st.write("**Excepciones Registradas Actuales:**")
+        st.write(f"**Excepciones Registradas Actuales ({periodo_tarifa_sel}):**")
         list_e = []
+        mapa_ci_nombre = {v: k for k, v in dict_jornaleros.items()}
+
         for ci, t_dict in excepciones.items():
+            nom_mostrar = mapa_ci_nombre.get(ci, "Desconocido / No encontrado")
             for t_type, m in t_dict.items():
-                list_e.append({"Carnet_Identidad": ci, "Tipo_Turno": t_type, "Monto_Excepcion_Bs": m})
+                list_e.append({"Nombre_Empleado": nom_mostrar, "Carnet_Identidad": ci, "Tipo_Turno": t_type, "Monto_Excepcion_Bs": m})
         st.dataframe(pd.DataFrame(list_e), use_container_width=True)
 
-        ci_del = st.selectbox("Seleccionar CI para borrar excepciones:", list(excepciones.keys()))
+        list_opciones_del = [f"{mapa_ci_nombre.get(ci, ci)} (CI: {ci})" for ci in excepciones.keys()]
+        emp_del_sel = st.selectbox("Seleccionar Empleado para borrar excepciones:", list_opciones_del)
+
         if st.button("🗑️ Eliminar Excepción"):
-            eliminar_excepcion_empleado(ci_del)
-            st.info(f"Excepciones eliminadas para {ci_del}")
+            ci_del = emp_del_sel.split("(CI: ")[-1].replace(")", "").strip()
+            eliminar_excepcion_empleado(ci_del, periodo=periodo_tarifa_sel)
+            st.info(f"Excepciones eliminadas para CI: {ci_del}")
             st.rerun()
 
 
 # -----------------------------------------------------------------------------
-# 7. PRE-PLANILLA Y REPORTES
+# 6. PRE-PLANILLA Y REPORTES
 # -----------------------------------------------------------------------------
 elif opcion == "📑 Pre-Planilla y Reportes":
     st.header("Reporte Consolidado de Asistencia y Pre-Planilla Oficial")
@@ -398,7 +426,7 @@ elif opcion == "📑 Pre-Planilla y Reportes":
 
 
 # -----------------------------------------------------------------------------
-# 8. BITÁCORA DE AUDITORÍA
+# 7. BITÁCORA DE AUDITORÍA
 # -----------------------------------------------------------------------------
 elif opcion == "📜 Bitácora de Auditoría":
     st.header("📜 Bitácora de Auditoría e Historial de Cambios")
