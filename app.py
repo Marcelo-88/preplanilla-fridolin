@@ -14,7 +14,7 @@ from modules.auth_permissions import render_user_selector, filter_dataframe_by_s
 from modules.excel_exporter import ExcelExporter
 from modules.tarifas_manager import (
     cargar_tarifas, guardar_tarifas, actualizar_excepcion_empleado, eliminar_excepcion_empleado,
-    obtener_config_periodo, guardar_config_periodo
+    obtener_config_periodo, guardar_config_periodo, clean_ci
 )
 
 # -----------------------------------------------------------------------------
@@ -291,7 +291,7 @@ except ImportError:
         def registrar_novedad(self, empleado_id, empleado_nombre, tipo_novedad, fecha_inicio, fecha_fin, justificacion, registrado_por_pin):
             novs = self.obtener_todas_novedades()
             nueva = {
-                "ID": empleado_id,
+                "ID": clean_ci(empleado_id),
                 "Nombre_Completo": empleado_nombre,
                 "Tipo_Novedad": tipo_novedad,
                 "Fecha_Inicio": fecha_inicio,
@@ -523,7 +523,7 @@ elif opcion == "📝 Novedades y Permisos":
                             if not row_e.empty:
                                 col_id = 'Carnet_Identidad' if 'Carnet_Identidad' in row_e.columns else ('ID' if 'ID' in row_e.columns else None)
                                 if col_id and col_id in row_e.columns:
-                                    emp_id = str(row_e[col_id].values[0])
+                                    emp_id = clean_ci(row_e[col_id].values[0])
 
                         res_reg = nov_mgr.registrar_novedad(
                             empleado_id=emp_id,
@@ -783,7 +783,7 @@ elif opcion == "✅ Aprobaciones Supervisores":
         with st.form("form_regularizacion_panel"):
             r_col1, r_col2 = st.columns(2)
             with r_col1:
-                id_emp_reg = st.text_input("ID / Carnet Empleado:*")
+                id_emp_reg = clean_ci(st.text_input("ID / Carnet Empleado:*"))
                 nombre_emp_reg = st.text_input("Nombre Completo Empleado:*")
                 fecha_reg = st.date_input("Fecha de la Marcación Omisa:")
             with r_col2:
@@ -803,7 +803,7 @@ elif opcion == "✅ Aprobaciones Supervisores":
                         usuario_nombre=usuario_actual,
                         accion="REGULARIZACION_OMISION",
                         modulo="Aprobaciones",
-                        detalles={"empleado": nombre_emp_reg, "fecha": str(fecha_reg), "tipo": tipo_marcacion, "motivo": motivo_reg}
+                        detalles={"empleado": nombre_emp_reg, "ci": id_emp_reg, "fecha": str(fecha_reg), "tipo": tipo_marcacion, "motivo": motivo_reg}
                     )
                     st.success(f"Regularización registrada para {nombre_emp_reg} el día {fecha_reg}.")
 
@@ -871,7 +871,7 @@ elif opcion == "💵 Valores Monetizados":
         df_jornaleros = df_emp_all[df_emp_all[col_tipo].astype(str).str.strip().str.upper() == 'JORNALERO'].copy()
         for _, row in df_jornaleros.iterrows():
             nom = str(row[col_nombre_emp]).strip()
-            ci_val = str(row[col_ci_emp]).strip()
+            ci_val = clean_ci(row[col_ci_emp])
             dict_jornaleros[nom] = ci_val
     except Exception as e:
         st.error(f"Error cargando lista de Jornaleros: {e}")
@@ -908,17 +908,18 @@ elif opcion == "💵 Valores Monetizados":
         list_e = []
         mapa_ci_nombre = {v: k for k, v in dict_jornaleros.items()}
 
-        for ci, t_dict in excepciones.items():
-            nom_mostrar = mapa_ci_nombre.get(ci, "Desconocido / No encontrado")
+        for ci_raw, t_dict in excepciones.items():
+            ci_clean = clean_ci(ci_raw)
+            nom_mostrar = mapa_ci_nombre.get(ci_clean, "Desconocido / No encontrado")
             for t_type, m in t_dict.items():
-                list_e.append({"Nombre_Empleado": nom_mostrar, "Carnet_Identidad": ci, "Tipo_Turno": t_type, "Monto_Excepcion_Bs": m})
+                list_e.append({"Nombre_Empleado": nom_mostrar, "Carnet_Identidad": ci_clean, "Tipo_Turno": t_type, "Monto_Excepcion_Bs": m})
         st.dataframe(pd.DataFrame(list_e), use_container_width=True)
 
-        list_opciones_del = [f"{mapa_ci_nombre.get(ci, ci)} (CI: {ci})" for ci in excepciones.keys()]
+        list_opciones_del = [f"{mapa_ci_nombre.get(clean_ci(ci), ci)} (CI: {clean_ci(ci)})" for ci in excepciones.keys()]
         emp_del_sel = st.selectbox("Seleccionar Empleado para borrar excepciones:", list_opciones_del)
 
         if st.button("🗑️ Eliminar Excepción"):
-            ci_del = emp_del_sel.split("(CI: ")[-1].replace(")", "").strip()
+            ci_del = clean_ci(emp_del_sel.split("(CI: ")[-1].replace(")", "").strip())
             eliminar_excepcion_empleado(ci_del, periodo=periodo_tarifa_sel)
             st.info(f"Excepciones eliminadas para CI: {ci_del}")
             st.rerun()
@@ -1016,7 +1017,7 @@ elif opcion == "📜 Bitácora de Auditoría":
         st.dataframe(df_logs_fil, use_container_width=True, hide_index=True)
 
         buffer_log = io.BytesIO()
-        with pd.ExcelWriter(buffer_log, engine='xlsxwriter') as writer:
+        with pd.ExcelWriter(buffer_log, engine='openpyxl') as writer:
             df_logs_fil.to_excel(writer, sheet_name='Bitacora_Auditoria', index=False)
         
         st.download_button(
