@@ -279,19 +279,19 @@ elif opcion == "💵 Valores Monetizados (Punto 3)":
     col1, col2 = st.columns(2)
 
     with col1:
-        diurno_norm = st.number_input("Diurno Normal [Bs]", value=float(config["tarifas_base"].get("diurno_normal", 100.0)), step=5.0)
-        diurno_15 = st.number_input("Diurno 1.5 [Bs]", value=float(config["tarifas_base"].get("diurno_1_5", 150.0)), step=5.0)
+        diurno_norm = st.number_input("Diurno Normal [Bs]", value=float(config["tarifas_base"].get("diurno_normal_8h", 100.0)), step=5.0)
+        diurno_15 = st.number_input("Diurno 1.5 / 12h [Bs]", value=float(config["tarifas_base"].get("diurno_1_5_12h", 150.0)), step=5.0)
 
     with col2:
-        nocturno_norm = st.number_input("Nocturno Normal [Bs]", value=float(config["tarifas_base"].get("nocturno_normal", 120.0)), step=5.0)
-        nocturno_15 = st.number_input("Nocturno 1.5 [Bs]", value=float(config["tarifas_base"].get("nocturno_1_5", 180.0)), step=5.0)
+        nocturno_norm = st.number_input("Nocturno Normal [Bs]", value=float(config["tarifas_base"].get("nocturno_normal_8h", 120.0)), step=5.0)
+        nocturno_15 = st.number_input("Nocturno 1.5 / 12h [Bs]", value=float(config["tarifas_base"].get("nocturno_1_5_12h", 180.0)), step=5.0)
 
     if st.button("💾 Guardar Tarifas Base", type="primary"):
         config["tarifas_base"] = {
-            "diurno_normal": diurno_norm,
-            "diurno_1_5": diurno_15,
-            "nocturno_normal": nocturno_norm,
-            "nocturno_1_5": nocturno_15
+            "diurno_normal_8h": diurno_norm,
+            "diurno_1_5_12h": diurno_15,
+            "nocturno_normal_8h": nocturno_norm,
+            "nocturno_1_5_12h": nocturno_15
         }
         if guardar_config_periodo(periodo_tarifa_sel, config):
             audit_log.registrar_evento(usuario_actual, usuario_actual, "ACTUALIZAR_TARIFAS_BASE", "Tarifas", {"periodo": periodo_tarifa_sel, "tarifas": config["tarifas_base"]})
@@ -305,6 +305,7 @@ elif opcion == "💵 Valores Monetizados (Punto 3)":
     dict_jornaleros = {}
     try:
         df_emp_all = cached_load_sheet_data("01_Maestro_Empleados")
+        # Filtrar solo Tipo_Personal == 'Jornalero' (case insensitive)
         col_tipo = [c for c in df_emp_all.columns if str(c).strip().lower() in ['tipo_personal', 'tipo personal']][0]
         col_nombre_emp = [c for c in df_emp_all.columns if str(c).strip().lower() in ['nombre_completo', 'nombre']][0]
         col_ci_emp = [c for c in df_emp_all.columns if str(c).strip().lower() in ['carnet_identidad', 'ci', 'carnet']][0]
@@ -327,10 +328,10 @@ elif opcion == "💵 Valores Monetizados (Punto 3)":
         ci_vinculado = ""
 
     tipo_in = c_tipo.selectbox("Tipo de Turno", [
-        ("diurno_normal", "Diurno Normal"),
-        ("diurno_1_5", "Diurno 1.5"),
-        ("nocturno_normal", "Nocturno Normal"),
-        ("nocturno_1_5", "Nocturno 1.5")
+        ("diurno_normal_8h", "Diurno Normal"),
+        ("diurno_1_5_12h", "Diurno 1.5 / 12h"),
+        ("nocturno_normal_8h", "Nocturno Normal"),
+        ("nocturno_1_5_12h", "Nocturno 1.5 / 12h")
     ], format_func=lambda x: x[1])
     monto_in = c_monto.number_input("Monto Personalizado [Bs]", min_value=0.0, step=5.0)
 
@@ -347,6 +348,7 @@ elif opcion == "💵 Valores Monetizados (Punto 3)":
     if excepciones:
         st.write(f"**Excepciones Registradas Actuales ({periodo_tarifa_sel}):**")
         list_e = []
+        # Crear mapeo inverso de CI -> Nombre para mostrar nombres en la tabla
         mapa_ci_nombre = {v: k for k, v in dict_jornaleros.items()}
 
         for ci, t_dict in excepciones.items():
