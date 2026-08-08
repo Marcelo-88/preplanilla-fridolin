@@ -12,6 +12,10 @@ from modules.data_loader import load_sheet_data
 from modules.attendance_processor import process_attendance, detect_exceptions, get_canje_summary
 from modules.auth_permissions import render_user_selector, filter_dataframe_by_supervisor
 from modules.excel_exporter import ExcelExporter
+from modules.tarifas_manager import (
+    cargar_tarifas, guardar_tarifas, actualizar_excepcion_empleado, eliminar_excepcion_empleado,
+    obtener_config_periodo, guardar_config_periodo
+)
 
 # -----------------------------------------------------------------------------
 # CLASE AUDIT LOGGER (Garantiza funcionamiento de la Bitácora)
@@ -315,7 +319,7 @@ def get_managers():
 
 audit_log, lock_mgr, nov_mgr = get_managers()
 
-# Verificación de integridad de objeto en memoria (evita AttributeError si la caché retenía una versión obsoleta)
+# Verificación de integridad de objeto en memoria
 if not hasattr(lock_mgr, "exportar_respaldo_json"):
     st.cache_resource.clear()
     audit_log, lock_mgr, nov_mgr = get_managers()
@@ -363,17 +367,17 @@ opcion = st.sidebar.radio(
     "Seleccione una vista:",
     [
         "📊 Parámetros y Reglas",
-        "👥 Maestro de Empleados",
         "⏱️ Importación Biométrico",
         "📝 Novedades y Permisos",
         "✅ Aprobaciones Supervisores",
+        "💵 Valores Monetizados",
         "📑 Pre-Planilla y Reportes",
         "📜 Bitácora de Auditoría"
     ]
 )
 
 st.sidebar.divider()
-st.sidebar.caption("Sistema de Control de Asistencia v2.0")
+st.sidebar.caption("Sistema de Control de Asistencia v2.5")
 
 # -----------------------------------------------------------------------------
 # 1. PARÁMETROS Y REGLAS
@@ -441,20 +445,7 @@ if opcion == "📊 Parámetros y Reglas":
     """)
 
 # -----------------------------------------------------------------------------
-# 2. MAESTRO DE EMPLEADOS
-# -----------------------------------------------------------------------------
-elif opcion == "👥 Maestro de Empleados":
-    st.header("Maestro de Empleados")
-    try:
-        df_emp = cached_load_sheet_data("01_Maestro_Empleados")
-        cols_sin_pin = [col for col in df_emp.columns if str(col).strip().upper() != "PIN"]
-        df_emp_vista = df_emp[cols_sin_pin]
-        st.dataframe(df_emp_vista, use_container_width=True, hide_index=True)
-    except Exception as e:
-        st.error(f"Error al cargar la pestaña: {e}")
-
-# -----------------------------------------------------------------------------
-# 3. IMPORTACIÓN BIOMÉTRICO
+# 2. IMPORTACIÓN BIOMÉTRICO
 # -----------------------------------------------------------------------------
 elif opcion == "⏱️ Importación Biométrico":
     st.header("Registros del Biométrico")
@@ -465,7 +456,7 @@ elif opcion == "⏱️ Importación Biométrico":
         st.error(f"Error al cargar la pestaña: {e}")
 
 # -----------------------------------------------------------------------------
-# 4. NOVEDADES Y PERMISOS
+# 3. NOVEDADES Y PERMISOS
 # -----------------------------------------------------------------------------
 elif opcion == "📝 Novedades y Permisos":
     st.header("Novedades, Licencias y Permisos Especiales")
@@ -560,7 +551,7 @@ elif opcion == "📝 Novedades y Permisos":
                             st.error(res_reg["mensaje"])
 
 # -----------------------------------------------------------------------------
-# 5. APROBACIONES SUPERVISORES
+# 4. APROBACIONES SUPERVISORES
 # -----------------------------------------------------------------------------
 elif opcion == "✅ Aprobaciones Supervisores":
     st.header("✅ Centro de Aprobaciones y Excepciones")
@@ -815,6 +806,122 @@ elif opcion == "✅ Aprobaciones Supervisores":
                         detalles={"empleado": nombre_emp_reg, "fecha": str(fecha_reg), "tipo": tipo_marcacion, "motivo": motivo_reg}
                     )
                     st.success(f"Regularización registrada para {nombre_emp_reg} el día {fecha_reg}.")
+
+# -----------------------------------------------------------------------------
+# 5. VALORES MONETIZADOS
+# -----------------------------------------------------------------------------
+elif opcion == "💵 Valores Monetizados":
+    st.header("💵 Gestión de Valores Monetizados y Tarifas de Jornaleros")
+    st.caption("Módulo exclusivo para Superusuarios. Permite configurar y aprobar tarifas de jornaleros.")
+
+    # Verificación de Rol
+    roles_super = ["RESPONSABLE_OPERACIONES", "JEFE_PRODUCCION", "Jefe de Producción", "ADMINISTRADOR", "Superusuario"]
+    if rol_actual not in roles_super:
+        st.error("⛔ Acceso denegado: Esta pantalla requiere privilegios de Superusuario.")
+        st.stop()
+
+    # Cargar Períodos Disponibles desde Biométrico o Default
+    try:
+        df_bio = cached_load_sheet_data("02_Importacion_Biometrico")
+        df_bio['dt_temp'] = pd.to_datetime(df_bio.iloc[:, 2], dayfirst=True, errors='coerce')
+        periodos_tarifas = sorted(df_bio['dt_temp'].dt.strftime('%Y-%m').dropna().unique().tolist(), reverse=True)
+    except Exception:
+        periodos_tarifas = [datetime.now().strftime('%Y-%m')]
+
+    col_p_tarifa, _ = st.columns([2, 2])
+    periodo_tarifa_sel = col_p_tarifa.selectbox("🗓️ Seleccionar Período/Gestión de Tarifas:", options=periodos_tarifas)
+
+    # Cargar Configuración del Período
+    config = obtener_config_periodo(periodo_tarifa_sel)
+
+    st.subheader(f"1. Tarifas Base Globales ({periodo_tarifa_sel})")
+    col1, col2 = st.columns(2)
+
+    with col1:
+        diurno_norm = st.number_input("Diurno Normal [Bs]", value=float(config["tarifas_base"].get("diurno_normal", 100.0)), step=5.0)
+        diurno_15 = st.number_input("Diurno 1.5 [Bs]", value=float(config["tarifas_base"].get("diurno_1_5", 150.0)), step=5.0)
+
+    with col2:
+        nocturno_norm = st.number_input("Nocturno Normal [Bs]", value=float(config["tarifas_base"].get("nocturno_normal", 120.0)), step=5.0)
+        nocturno_15 = st.number_input("Nocturno 1.5 [Bs]", value=float(config["tarifas_base"].get("nocturno_1_5", 180.0)), step=5.0)
+
+    if st.button("💾 Guardar Tarifas Base", type="primary"):
+        config["tarifas_base"] = {
+            "diurno_normal": diurno_norm,
+            "diurno_1_5": diurno_15,
+            "nocturno_normal": nocturno_norm,
+            "nocturno_1_5": nocturno_15
+        }
+        if guardar_config_periodo(periodo_tarifa_sel, config):
+            audit_log.registrar_evento(usuario_actual, usuario_actual, "ACTUALIZAR_TARIFAS_BASE", "Tarifas", {"periodo": periodo_tarifa_sel, "tarifas": config["tarifas_base"]})
+            st.success(f"✅ Tarifas base guardadas exitosamente para la gestión {periodo_tarifa_sel}")
+
+    st.divider()
+
+    st.subheader(f"2. Excepciones Tarifarias por Empleado ({periodo_tarifa_sel})")
+
+    # Cargar Maestro de Empleados y Filtrar ÚNICAMENTE JORNALEROS
+    dict_jornaleros = {}
+    try:
+        df_emp_all = cached_load_sheet_data("01_Maestro_Empleados")
+        col_tipo = [c for c in df_emp_all.columns if str(c).strip().lower() in ['tipo_personal', 'tipo personal']][0]
+        col_nombre_emp = [c for c in df_emp_all.columns if str(c).strip().lower() in ['nombre_completo', 'nombre']][0]
+        col_ci_emp = [c for c in df_emp_all.columns if str(c).strip().lower() in ['carnet_identidad', 'ci', 'carnet']][0]
+
+        df_jornaleros = df_emp_all[df_emp_all[col_tipo].astype(str).str.strip().str.upper() == 'JORNALERO'].copy()
+        for _, row in df_jornaleros.iterrows():
+            nom = str(row[col_nombre_emp]).strip()
+            ci_val = str(row[col_ci_emp]).strip()
+            dict_jornaleros[nom] = ci_val
+    except Exception as e:
+        st.error(f"Error cargando lista de Jornaleros: {e}")
+
+    c_nom, c_tipo, c_monto = st.columns([3, 3, 2])
+
+    if dict_jornaleros:
+        nombre_sel = c_nom.selectbox("Seleccionar Jornalero (Por Nombre):", options=sorted(list(dict_jornaleros.keys())))
+        ci_vinculado = dict_jornaleros[nombre_sel]
+    else:
+        nombre_sel = c_nom.text_input("Nombre de Jornalero")
+        ci_vinculado = ""
+
+    tipo_in = c_tipo.selectbox("Tipo de Turno", [
+        ("diurno_normal", "Diurno Normal"),
+        ("diurno_1_5", "Diurno 1.5"),
+        ("nocturno_normal", "Nocturno Normal"),
+        ("nocturno_1_5", "Nocturno 1.5")
+    ], format_func=lambda x: x[1])
+    monto_in = c_monto.number_input("Monto Personalizado [Bs]", min_value=0.0, step=5.0)
+
+    if st.button("➕ Registrar / Actualizar Excepción"):
+        if ci_vinculado:
+            actualizar_excepcion_empleado(ci_vinculado, tipo_in[0], monto_in, periodo=periodo_tarifa_sel)
+            audit_log.registrar_evento(usuario_actual, usuario_actual, "EXCEPCION_TARIFA", "Tarifas", {"periodo": periodo_tarifa_sel, "CI": ci_vinculado, "nombre": nombre_sel, "tipo": tipo_in[0], "monto": monto_in})
+            st.success(f"Excepción asignada correctamente a {nombre_sel} (CI: {ci_vinculado}) para {periodo_tarifa_sel}")
+            st.rerun()
+        else:
+            st.warning("No se pudo obtener el CI del jornalero seleccionado.")
+
+    excepciones = config.get("excepciones", {})
+    if excepciones:
+        st.write(f"**Excepciones Registradas Actuales ({periodo_tarifa_sel}):**")
+        list_e = []
+        mapa_ci_nombre = {v: k for k, v in dict_jornaleros.items()}
+
+        for ci, t_dict in excepciones.items():
+            nom_mostrar = mapa_ci_nombre.get(ci, "Desconocido / No encontrado")
+            for t_type, m in t_dict.items():
+                list_e.append({"Nombre_Empleado": nom_mostrar, "Carnet_Identidad": ci, "Tipo_Turno": t_type, "Monto_Excepcion_Bs": m})
+        st.dataframe(pd.DataFrame(list_e), use_container_width=True)
+
+        list_opciones_del = [f"{mapa_ci_nombre.get(ci, ci)} (CI: {ci})" for ci in excepciones.keys()]
+        emp_del_sel = st.selectbox("Seleccionar Empleado para borrar excepciones:", list_opciones_del)
+
+        if st.button("🗑️ Eliminar Excepción"):
+            ci_del = emp_del_sel.split("(CI: ")[-1].replace(")", "").strip()
+            eliminar_excepcion_empleado(ci_del, periodo=periodo_tarifa_sel)
+            st.info(f"Excepciones eliminadas para CI: {ci_del}")
+            st.rerun()
 
 # -----------------------------------------------------------------------------
 # 6. PRE-PLANILLA Y REPORTES
