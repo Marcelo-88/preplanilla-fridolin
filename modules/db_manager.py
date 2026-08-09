@@ -1,43 +1,49 @@
 import streamlit as st
-from supabase import create_client, Client
+import httpx
 from datetime import datetime
 from typing import Dict, Any, List, Optional
-import time
-
-@st.cache_resource(show_spinner=False)
-def get_supabase_client() -> Client:
-    """Crea el cliente de Supabase de forma robusta."""
-    try:
-        url = st.secrets["supabase"]["url"].strip()
-        key = st.secrets["supabase"]["service_role_key"].strip()
-
-        if not url.startswith("https://"):
-            raise ValueError("La URL de Supabase debe empezar con https://")
-
-        client = create_client(url, key)
-        return client
-    except Exception as e:
-        st.error(f"Error al conectar con Supabase: {str(e)}")
-        raise e
-
+import json
 
 class DBManager:
-    """Capa de persistencia centralizada para Fridolin (Opción A - Supabase)."""
+    """Capa de persistencia usando llamadas HTTP directas a Supabase (más estable)."""
 
     def __init__(self):
-        self.client = get_supabase_client()
+        self.url = st.secrets["supabase"]["url"].rstrip("/")
+        self.key = st.secrets["supabase"]["service_role_key"]
+        self.headers = {
+            "apikey": self.key,
+            "Authorization": f"Bearer {self.key}",
+            "Content-Type": "application/json",
+            "Prefer": "return=representation"
+        }
+
+    def _request(self, method: str, path: str, json_data: dict = None, params: dict = None):
+        full_url = f"{self.url}/rest/v1/{path}"
+        try:
+            with httpx.Client(timeout=15.0) as client:
+                if method == "GET":
+                    r = client.get(full_url, headers=self.headers, params=params)
+                elif method == "POST":
+                    r = client.post(full_url, headers=self.headers, json=json_data)
+                elif method == "PATCH":
+                    r = client.patch(full_url, headers=self.headers, json=json_data, params=params)
+                else:
+                    raise ValueError("Método no soportado")
+                
+                if r.status_code >= 400:
+                    return {"error": f"HTTP {r.status_code}: {r.text}"}
+                return r.json() if r.text else []
+        except Exception as e:
+            return {"error": str(e)}
 
     # ------------------------------------------------------------------
     # PERIOD LOCKS
     # ------------------------------------------------------------------
     def obtener_estado_periodo(self, periodo: str, usuario: Optional[str] = None) -> str:
         clave = f"{periodo}_{str(usuario).strip().upper().replace(' ', '_')}" if usuario else periodo
-        try:
-            res = self.client.table("period_locks").select("estado").eq("periodo", clave).execute()
-            if res.data:
-                return res.data[0]["estado"]
-        except Exception:
-            pass
+        res = self._request("GET", "period_locks", params={"periodo": f"eq.{clave}", "select": "estado"})
+        if isinstance(res, list) and len(res) > 0:
+            return res[0].get("estado", "PENDIENTE")
         return "PENDIENTE"
 
     def cambiar_estado_periodo(
@@ -50,57 +56,56 @@ class DBManager:
     ) -> Dict[str, Any]:
         usuario_ref = usuario_nombre or usuario_pin
         clave = f"{periodo}_{str(usuario_ref).strip().upper().replace(' ', '_')}"
+        
+        data = {
+            "periodo": clave,
+            "estado": nuevo_estado,
+            "cerrado_por": usuario_pin,
+            "fecha_cierre": datetime.now().isoformat(),
+            "motivo_desbloqueo": motivo or ""
+        }
+        
+        # Intentamos upsert (on_conflict)
+        headers_upsert = self.headers.copy()
+        headers_upsert["Prefer"] = "resolution=merge-duplicates,return=representation"
+        
+        full_url = f"{self.url}/rest/v1/period_locks"
         try:
-            self.client.table("period_locks").upsert({
-                "periodo": clave,
-                "estado": nuevo_estado,
-                "cerrado_por": usuario_pin,
-                "fecha_cierre": datetime.now().isoformat(),
-                "motivo_desbloqueo": motivo or ""
-            }).execute()
-            return {"exito": True, "mensaje": f"Estado actualizado a {nuevo_estado}"}
+            with httpx.Client(timeout=15.0) as client:
+                r = client.post(full_url, headers=headers_upsert, json=data)
+                if r.status_code >= 400:
+                    return {"exito": False, "mensaje": f"Error HTTP {r.status_code}: {r.text}"}
+                return {"exito": True, "mensaje": f"Estado actualizado a {nuevo_estado}"}
         except Exception as e:
-            return {"exito": False, "mensaje": f"Error de conexión con la base de datos: {str(e)}"}
+            return {"exito": False, "mensaje": f"Error de conexión: {str(e)}"}
 
     # ------------------------------------------------------------------
     # NOVEDADES
     # ------------------------------------------------------------------
     def registrar_novedad(self, data: Dict[str, Any]) -> Dict[str, Any]:
-        try:
-            # Pequeño reintento en caso de fallo de red
-            for intento in range(2):
-                try:
-                    self.client.table("novedades").insert(data).execute()
-                    return {"exito": True, "mensaje": "Novedad registrada correctamente"}
-                except Exception as e:
-                    if intento == 0:
-                        time.sleep(1.5)
-                        continue
-                    raise e
-        except Exception as e:
-            return {"exito": False, "mensaje": f"Error al registrar novedad: {str(e)}"}
+        res = self._request("POST", "novedades", json_data=data)
+        if isinstance(res, dict) and "error" in res:
+            return {"exito": False, "mensaje": res["error"]}
+        return {"exito": True, "mensaje": "Novedad registrada correctamente"}
 
     def obtener_todas_novedades(self) -> List[Dict[str, Any]]:
-        try:
-            res = self.client.table("novedades").select("*").order("id", desc=True).execute()
-            return res.data or []
-        except Exception:
-            return []
+        res = self._request("GET", "novedades", params={"select": "*", "order": "id.desc"})
+        if isinstance(res, list):
+            return res
+        return []
 
     def evaluar_impacto_dia(self, empleado_id: str, fecha_str: str) -> Optional[Dict[str, Any]]:
-        try:
-            res = (
-                self.client.table("novedades")
-                .select("*")
-                .eq("empleado_id", empleado_id)
-                .lte("fecha_inicio", fecha_str)
-                .gte("fecha_fin", fecha_str)
-                .limit(1)
-                .execute()
-            )
-            return res.data[0] if res.data else None
-        except Exception:
-            return None
+        params = {
+            "empleado_id": f"eq.{empleado_id}",
+            "fecha_inicio": f"lte.{fecha_str}",
+            "fecha_fin": f"gte.{fecha_str}",
+            "select": "*",
+            "limit": "1"
+        }
+        res = self._request("GET", "novedades", params=params)
+        if isinstance(res, list) and len(res) > 0:
+            return res[0]
+        return None
 
     # ------------------------------------------------------------------
     # AUDIT LOG
@@ -113,27 +118,22 @@ class DBManager:
         modulo: str,
         detalles: Optional[Dict[str, Any]] = None
     ) -> bool:
-        try:
-            self.client.table("audit_logs").insert({
-                "usuario_pin": usuario_pin,
-                "usuario_nombre": usuario_nombre,
-                "accion": accion,
-                "modulo": modulo,
-                "detalles": detalles or {}
-            }).execute()
-            return True
-        except Exception:
-            return False
+        data = {
+            "usuario_pin": usuario_pin,
+            "usuario_nombre": usuario_nombre,
+            "accion": accion,
+            "modulo": modulo,
+            "detalles": detalles or {}
+        }
+        res = self._request("POST", "audit_logs", json_data=data)
+        return not (isinstance(res, dict) and "error" in res)
 
     def obtener_logs(self, limite: int = 500) -> List[Dict[str, Any]]:
-        try:
-            res = (
-                self.client.table("audit_logs")
-                .select("*")
-                .order("id", desc=True)
-                .limit(limite)
-                .execute()
-            )
-            return res.data or []
-        except Exception:
-            return []
+        res = self._request("GET", "audit_logs", params={
+            "select": "*",
+            "order": "id.desc",
+            "limit": str(limite)
+        })
+        if isinstance(res, list):
+            return res
+        return []
