@@ -41,15 +41,6 @@ def guardar_todas_tarifas_json(data):
     except:
         return False
 
-def obtener_config_periodo_persistent(periodo):
-    all_data = cargar_todas_tarifas_json()
-    if periodo in all_data:
-        return all_data[periodo]
-    default = {"tarifas_base": {"diurno_normal": 100.0, "diurno_1_5": 150.0, "nocturno_normal": 120.0, "nocturno_1_5": 180.0}, "excepciones": {}}
-    all_data[periodo] = default
-    guardar_todas_tarifas_json(all_data)
-    return default
-
 @st.cache_resource
 def get_managers():
     return AuditLogger(), LockManager(), NovedadesManager(), DBManager()
@@ -84,7 +75,7 @@ opcion = st.sidebar.radio("Seleccione una vista:", [
     "📜 Bitácora de Auditoría"
 ])
 st.sidebar.divider()
-st.sidebar.caption("Sistema de Control de Asistencia v2.5 - Temporal sin novedades en cálculo")
+st.sidebar.caption("v2.5 - Filtro restaurado + Guardado de decisiones")
 
 # 1. PARÁMETROS
 if opcion == "📊 Parámetros y Reglas":
@@ -148,10 +139,10 @@ elif opcion == "📝 Novedades y Permisos":
     todas = nov_mgr.obtener_todas_novedades()
     st.dataframe(pd.DataFrame(todas), use_container_width=True) if todas else st.info("Sin novedades")
 
-# 4. APROBACIONES (TEMPORAL SIN NOVEDADES EN CÁLCULO)
+# 4. APROBACIONES (CON FILTRO + GUARDADO)
 elif opcion == "✅ Aprobaciones Supervisores":
     st.header("✅ Panel de Aprobaciones de Supervisores")
-    st.caption("Modo temporal: el cálculo de excepciones no consulta novedades (para velocidad)")
+    st.caption("Modo temporal: cálculo sin consultar novedades (rápido)")
 
     try:
         df_bio = cached_load_sheet_data("02_Importacion_Biometrico")
@@ -179,12 +170,12 @@ elif opcion == "✅ Aprobaciones Supervisores":
         st.divider()
 
         if st.button("🔄 Cargar Excepciones del Período", type="primary"):
-            with st.spinner("Procesando marcaciones... (modo rápido)"):
+            with st.spinner("Procesando marcaciones..."):
                 df_params = cached_load_sheet_data("05_Parametros_y_Reglas")
                 df_emp = cached_load_sheet_data("01_Maestro_Empleados")
                 df_bio_p = df_bio[df_bio['dt_temp'].dt.strftime('%Y-%m') == periodo_sel].copy()
 
-                # TEMPORAL: pasamos None en lugar de nov_mgr para velocidad
+                # Temporal: sin novedades para velocidad
                 df_res = process_attendance(df_bio_p, df_params, None, df_emp, None)
                 df_exc = detect_exceptions(df_res)
 
@@ -196,28 +187,48 @@ elif opcion == "✅ Aprobaciones Supervisores":
 
                 st.session_state['df_exc'] = df_exc
                 st.session_state['periodo_cargado'] = periodo_sel
-                st.success("Excepciones cargadas.")
+                st.success(f"Se cargaron {len(df_exc) if df_exc is not None else 0} excepciones.")
 
         if 'df_exc' in st.session_state and st.session_state.get('periodo_cargado') == periodo_sel:
             df_exc = st.session_state['df_exc']
+
             if df_exc is not None and not df_exc.empty:
-                st.subheader(f"Excepciones ({periodo_sel})")
+                # Filtros
+                col_f1, col_f2 = st.columns(2)
+                with col_f1:
+                    tipos = ["Todos"] + sorted(df_exc.get("Tipo Excepción", pd.Series()).dropna().unique().tolist())
+                    sel_tipo = st.selectbox("Filtrar por Tipo:", tipos)
+                with col_f2:
+                    empleados = ["Todos"] + sorted(df_exc.get("Nombre", pd.Series()).dropna().unique().tolist())
+                    sel_emp = st.selectbox("Filtrar por Empleado:", empleados)
+
+                df_fil = df_exc.copy()
+                if sel_tipo != "Todos":
+                    df_fil = df_fil[df_fil["Tipo Excepción"] == sel_tipo]
+                if sel_emp != "Todos":
+                    df_fil = df_fil[df_fil["Nombre"] == sel_emp]
+
+                st.caption(f"Mostrando {len(df_fil)} de {len(df_exc)} excepciones")
+
                 df_edited = st.data_editor(
-                    df_exc,
+                    df_fil,
                     use_container_width=True,
                     hide_index=True,
                     disabled=not es_editable,
+                    key=f"editor_{periodo_sel}_{sel_emp}_{sel_tipo}",
                     column_config={
                         "Decisión Supervisor": st.column_config.SelectboxColumn(
-                            "Decisión", options=["Pendiente", "Aprobado (Pago)", "Acumular (Próx. Mes)", "Rechazado", "Justificado", "Canjeado"]
+                            "Decisión",
+                            options=["Pendiente", "Aprobado (Pago)", "Acumular (Próx. Mes)", "Rechazado", "Justificado", "Canjeado"]
                         ),
                         "Tipo Falta": st.column_config.SelectboxColumn(
-                            "Tipo Falta", options=["N/A", "Justificada", "Injustificada"]
+                            "Tipo Falta",
+                            options=["N/A", "Justificada", "Injustificada"]
                         )
                     }
                 )
 
-                if es_editable and st.button("💾 Guardar Decisiones"):
+                if es_editable and st.button("💾 Guardar Decisiones", type="primary"):
                     guardadas = 0
                     col_ci = next((c for c in df_edited.columns if 'carnet' in str(c).lower() or c == 'ID'), None)
                     col_nom = next((c for c in df_edited.columns if 'nombre' in str(c).lower()), None)
@@ -238,7 +249,7 @@ elif opcion == "✅ Aprobaciones Supervisores":
                         }
                         if db_mgr.guardar_decision(data).get("exito"):
                             guardadas += 1
-                    st.success(f"{guardadas} decisiones guardadas.")
+                    st.success(f"✅ {guardadas} decisiones guardadas correctamente.")
             else:
                 st.success("No hay excepciones en este período.")
         else:
