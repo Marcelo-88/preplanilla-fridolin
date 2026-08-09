@@ -84,7 +84,7 @@ opcion = st.sidebar.radio("Seleccione una vista:", [
     "📜 Bitácora de Auditoría"
 ])
 st.sidebar.divider()
-st.sidebar.caption("Sistema de Control de Asistencia v2.5")
+st.sidebar.caption("Sistema de Control de Asistencia v2.5 - Temporal sin novedades en cálculo")
 
 # 1. PARÁMETROS
 if opcion == "📊 Parámetros y Reglas":
@@ -148,9 +148,10 @@ elif opcion == "📝 Novedades y Permisos":
     todas = nov_mgr.obtener_todas_novedades()
     st.dataframe(pd.DataFrame(todas), use_container_width=True) if todas else st.info("Sin novedades")
 
-# 4. APROBACIONES (CON BOTÓN CARGAR)
+# 4. APROBACIONES (TEMPORAL SIN NOVEDADES EN CÁLCULO)
 elif opcion == "✅ Aprobaciones Supervisores":
     st.header("✅ Panel de Aprobaciones de Supervisores")
+    st.caption("Modo temporal: el cálculo de excepciones no consulta novedades (para velocidad)")
 
     try:
         df_bio = cached_load_sheet_data("02_Importacion_Biometrico")
@@ -178,12 +179,13 @@ elif opcion == "✅ Aprobaciones Supervisores":
         st.divider()
 
         if st.button("🔄 Cargar Excepciones del Período", type="primary"):
-            with st.spinner("Procesando marcaciones... esto puede tardar unos segundos"):
+            with st.spinner("Procesando marcaciones... (modo rápido)"):
                 df_params = cached_load_sheet_data("05_Parametros_y_Reglas")
                 df_emp = cached_load_sheet_data("01_Maestro_Empleados")
                 df_bio_p = df_bio[df_bio['dt_temp'].dt.strftime('%Y-%m') == periodo_sel].copy()
 
-                df_res = process_attendance(df_bio_p, df_params, None, df_emp, nov_mgr)
+                # TEMPORAL: pasamos None en lugar de nov_mgr para velocidad
+                df_res = process_attendance(df_bio_p, df_params, None, df_emp, None)
                 df_exc = detect_exceptions(df_res)
 
                 if empleados_permitidos and rol_actual != "Jefe de Producción":
