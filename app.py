@@ -75,7 +75,7 @@ opcion = st.sidebar.radio("Seleccione una vista:", [
     "📜 Bitácora de Auditoría"
 ])
 st.sidebar.divider()
-st.sidebar.caption("v2.5 - Decisiones se cargan y se muestran")
+st.sidebar.caption("v2.5 - Novedades corregido + Decisiones se muestran")
 
 # 1. PARÁMETROS
 if opcion == "📊 Parámetros y Reglas":
@@ -99,7 +99,7 @@ elif opcion == "⏱️ Importación Biométrico":
     except Exception as e:
         st.error(str(e))
 
-# 3. NOVEDADES
+# 3. NOVEDADES (CORREGIDO)
 elif opcion == "📝 Novedades y Permisos":
     st.header("📝 Novedades y Permisos")
     dict_nombre_ci = {}
@@ -133,11 +133,17 @@ elif opcion == "📝 Novedades y Permisos":
         if st.form_submit_button("Registrar"):
             if emp_id and emp_nombre:
                 res = nov_mgr.registrar_novedad(emp_id, emp_nombre, tipo, str(f_ini), str(f_fin), just, usuario_actual)
-                st.success(res["mensaje"]) if res.get("exito") else st.error(res.get("mensaje"))
+                if res.get("exito"):
+                    st.success(res["mensaje"])
+                else:
+                    st.error(res.get("mensaje"))
 
     st.subheader("Novedades Registradas")
     todas = nov_mgr.obtener_todas_novedades()
-    st.dataframe(pd.DataFrame(todas), use_container_width=True) if todas else st.info("Sin novedades")
+    if todas:
+        st.dataframe(pd.DataFrame(todas), use_container_width=True, hide_index=True)
+    else:
+        st.info("Sin novedades registradas")
 
 # 4. APROBACIONES (CON CARGA DE DECISIONES GUARDADAS)
 elif opcion == "✅ Aprobaciones Supervisores":
@@ -191,7 +197,6 @@ elif opcion == "✅ Aprobaciones Supervisores":
                     if decisiones:
                         df_dec = pd.DataFrame(decisiones)
 
-                        # Detectar columnas clave
                         col_ci = next((c for c in df_exc.columns if 'carnet' in str(c).lower() or c == 'ID'), None)
                         col_fecha = next((c for c in df_exc.columns if 'fecha' in str(c).lower()), None)
 
@@ -275,7 +280,6 @@ elif opcion == "✅ Aprobaciones Supervisores":
                         if db_mgr.guardar_decision(data).get("exito"):
                             guardadas += 1
                     st.success(f"✅ {guardadas} decisiones guardadas correctamente.")
-                    # Forzar recarga para ver los cambios
                     st.rerun()
             else:
                 st.success("No hay excepciones en este período.")
@@ -299,4 +303,7 @@ elif opcion == "📑 Pre-Planilla y Reportes":
 elif opcion == "📜 Bitácora de Auditoría":
     st.header("📜 Bitácora")
     logs = audit_log.obtener_logs(300)
-    st.dataframe(pd.DataFrame(logs), use_container_width=True) if logs else st.info("Sin registros")
+    if logs:
+        st.dataframe(pd.DataFrame(logs), use_container_width=True, hide_index=True)
+    else:
+        st.info("Sin registros")
