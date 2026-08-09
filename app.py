@@ -70,12 +70,13 @@ opcion = st.sidebar.radio("Seleccione una vista:", [
     "⏱️ Importación Biométrico",
     "📝 Novedades y Permisos",
     "✅ Aprobaciones Supervisores",
+    "🔄 Canje de Horas",
     "💵 Valores Monetizados",
     "📑 Pre-Planilla y Reportes",
     "📜 Bitácora de Auditoría"
 ])
 st.sidebar.divider()
-st.sidebar.caption("v2.5 - Novedades corregido + Decisiones se muestran")
+st.sidebar.caption("v2.6 - Canje de Horas agregado")
 
 # 1. PARÁMETROS
 if opcion == "📊 Parámetros y Reglas":
@@ -99,7 +100,7 @@ elif opcion == "⏱️ Importación Biométrico":
     except Exception as e:
         st.error(str(e))
 
-# 3. NOVEDADES (CORREGIDO)
+# 3. NOVEDADES
 elif opcion == "📝 Novedades y Permisos":
     st.header("📝 Novedades y Permisos")
     dict_nombre_ci = {}
@@ -145,7 +146,7 @@ elif opcion == "📝 Novedades y Permisos":
     else:
         st.info("Sin novedades registradas")
 
-# 4. APROBACIONES (CON CARGA DE DECISIONES GUARDADAS)
+# 4. APROBACIONES
 elif opcion == "✅ Aprobaciones Supervisores":
     st.header("✅ Panel de Aprobaciones de Supervisores")
     st.caption("Las decisiones guardadas se cargan y se muestran en la tabla")
@@ -191,12 +192,11 @@ elif opcion == "✅ Aprobaciones Supervisores":
                     except:
                         pass
 
-                # === CARGAR DECISIONES GUARDADAS Y FUSIONARLAS ===
+                # Cargar decisiones guardadas
                 if df_exc is not None and not df_exc.empty:
                     decisiones = db_mgr.obtener_decisiones_periodo(periodo_sel)
                     if decisiones:
                         df_dec = pd.DataFrame(decisiones)
-
                         col_ci = next((c for c in df_exc.columns if 'carnet' in str(c).lower() or c == 'ID'), None)
                         col_fecha = next((c for c in df_exc.columns if 'fecha' in str(c).lower()), None)
 
@@ -217,13 +217,12 @@ elif opcion == "✅ Aprobaciones Supervisores":
 
                 st.session_state['df_exc'] = df_exc
                 st.session_state['periodo_cargado'] = periodo_sel
-                st.success(f"Se cargaron {len(df_exc) if df_exc is not None else 0} excepciones (con decisiones guardadas).")
+                st.success(f"Se cargaron {len(df_exc) if df_exc is not None else 0} excepciones.")
 
         if 'df_exc' in st.session_state and st.session_state.get('periodo_cargado') == periodo_sel:
             df_exc = st.session_state['df_exc']
 
             if df_exc is not None and not df_exc.empty:
-                # Filtros
                 col_f1, col_f2 = st.columns(2)
                 with col_f1:
                     tipos = ["Todos"] + sorted(df_exc.get("Tipo Excepción", pd.Series()).dropna().unique().tolist())
@@ -289,17 +288,91 @@ elif opcion == "✅ Aprobaciones Supervisores":
     except Exception as e:
         st.error(str(e))
 
-# 5. VALORES
+# 5. CANJE DE HORAS (NUEVO)
+elif opcion == "🔄 Canje de Horas":
+    st.header("🔄 Canje de Horas Extras por Faltas")
+    st.caption("Solo se usan las horas **después del horario oficial** que el supervisor marcó como “Acumular (Próx. Mes)”")
+
+    try:
+        df_bio = cached_load_sheet_data("02_Importacion_Biometrico")
+        df_bio['dt_temp'] = pd.to_datetime(df_bio.iloc[:, 2], dayfirst=True, errors='coerce')
+        periodos = sorted(df_bio['dt_temp'].dt.strftime('%Y-%m').dropna().unique().tolist(), reverse=True) or [datetime.now().strftime('%Y-%m')]
+        periodo_sel = st.selectbox("Período:", periodos, key="canje_periodo")
+
+        # Cargar decisiones del período
+        decisiones = db_mgr.obtener_decisiones_periodo(periodo_sel)
+        canjes_existentes = db_mgr.obtener_canjes_periodo(periodo_sel)
+
+        if not decisiones:
+            st.warning("No hay decisiones guardadas para este período. Primero ve a **Aprobaciones** y guarda las decisiones “Acumular (Próx. Mes)”.")
+        else:
+            df_dec = pd.DataFrame(decisiones)
+
+            # Filtrar solo las que se acumulan
+            df_acum = df_dec[df_dec['decision'].str.contains("Acumular", case=False, na=False)].copy()
+
+            if df_acum.empty:
+                st.info("No hay horas marcadas como “Acumular (Próx. Mes)” en este período.")
+            else:
+                st.subheader("Horas disponibles para canje (Acumuladas)")
+                st.dataframe(df_acum[["nombre", "fecha", "tipo_excepcion", "decision"]], use_container_width=True, hide_index=True)
+
+                st.divider()
+                st.subheader("Registrar un Canje")
+
+                # Lista de empleados con horas acumuladas
+                empleados_con_he = sorted(df_acum['nombre'].dropna().unique().tolist())
+                emp_sel = st.selectbox("Empleado:", empleados_con_he)
+
+                # Horas aproximadas (por ahora usamos un valor de ejemplo; más adelante lo calculamos exacto)
+                horas_disponibles = len(df_acum[df_acum['nombre'] == emp_sel]) * 2.0  # placeholder temporal
+                st.info(f"Horas estimadas disponibles para {emp_sel}: **{horas_disponibles:.1f} hrs** (se ajustará con el cálculo real)")
+
+                dias_a_canjear = st.number_input("Días a canjear (1 día = 8 hrs diurnas):", min_value=0.0, max_value=10.0, step=0.5, value=0.0)
+
+                if st.button("💾 Guardar Canje", type="primary"):
+                    if dias_a_canjear <= 0:
+                        st.error("Debes indicar al menos 0.5 días.")
+                    else:
+                        horas_usadas = dias_a_canjear * 8.0
+                        data = {
+                            "periodo": periodo_sel,
+                            "carnet_identidad": str(df_acum[df_acum['nombre'] == emp_sel]['carnet_identidad'].iloc[0]),
+                            "nombre": emp_sel,
+                            "dias_canjeados": float(dias_a_canjear),
+                            "horas_usadas": float(horas_usadas),
+                            "faltas_afectadas": "",
+                            "registrado_por": usuario_actual
+                        }
+                        res = db_mgr.guardar_canje(data)
+                        if res.get("exito"):
+                            st.success(f"✅ Canje de {dias_a_canjear} día(s) guardado para {emp_sel}")
+                            st.rerun()
+                        else:
+                            st.error(res.get("mensaje", "Error al guardar"))
+
+        # Mostrar canjes ya realizados
+        st.divider()
+        st.subheader("Canjes realizados en este período")
+        if canjes_existentes:
+            st.dataframe(pd.DataFrame(canjes_existentes), use_container_width=True, hide_index=True)
+        else:
+            st.info("Aún no hay canjes registrados.")
+
+    except Exception as e:
+        st.error(str(e))
+
+# 6. VALORES
 elif opcion == "💵 Valores Monetizados":
     st.header("💵 Valores Monetizados")
     st.info("Módulo de tarifas.")
 
-# 6. PRE-PLANILLA
+# 7. PRE-PLANILLA
 elif opcion == "📑 Pre-Planilla y Reportes":
     st.header("📑 Pre-Planilla")
     st.info("Seleccione período y procese desde Aprobaciones primero.")
 
-# 7. BITÁCORA
+# 8. BITÁCORA
 elif opcion == "📜 Bitácora de Auditoría":
     st.header("📜 Bitácora")
     logs = audit_log.obtener_logs(300)
