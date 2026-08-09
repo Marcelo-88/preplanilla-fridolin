@@ -1,13 +1,10 @@
 import streamlit as st
 import pandas as pd
-import os
-import json
 from datetime import datetime
 
 from modules.data_loader import load_sheet_data
-from modules.attendance_processor import process_attendance, detect_exceptions, get_canje_summary
+from modules.attendance_processor import process_attendance, detect_exceptions
 from modules.auth_permissions import render_user_selector, filter_dataframe_by_supervisor
-from modules.excel_exporter import ExcelExporter
 
 from modules.audit_logger import AuditLogger
 from modules.lock_manager import LockManager
@@ -57,7 +54,7 @@ opcion = st.sidebar.radio("Seleccione una vista:", [
     "📜 Bitácora de Auditoría"
 ])
 st.sidebar.divider()
-st.sidebar.caption("v2.6.1 - Guardado de decisiones corregido")
+st.sidebar.caption("v2.6.2 - Guardado con formulario + depuración")
 
 # 1. PARÁMETROS
 if opcion == "📊 Parámetros y Reglas":
@@ -127,7 +124,7 @@ elif opcion == "📝 Novedades y Permisos":
     else:
         st.info("Sin novedades registradas")
 
-# 4. APROBACIONES (GUARDADO CORREGIDO)
+# 4. APROBACIONES
 elif opcion == "✅ Aprobaciones Supervisores":
     st.header("✅ Panel de Aprobaciones de Supervisores")
 
@@ -157,7 +154,7 @@ elif opcion == "✅ Aprobaciones Supervisores":
         st.divider()
 
         if st.button("🔄 Cargar Excepciones del Período", type="primary"):
-            with st.spinner("Procesando marcaciones y cargando decisiones..."):
+            with st.spinner("Procesando marcaciones..."):
                 df_params = cached_load_sheet_data("05_Parametros_y_Reglas")
                 df_emp = cached_load_sheet_data("01_Maestro_Empleados")
                 df_bio_p = df_bio[df_bio['dt_temp'].dt.strftime('%Y-%m') == periodo_sel].copy()
@@ -171,12 +168,12 @@ elif opcion == "✅ Aprobaciones Supervisores":
                     except:
                         pass
 
-                # Cargar decisiones ya guardadas
+                # Cargar decisiones previas
                 if df_exc is not None and not df_exc.empty:
                     decisiones = db_mgr.obtener_decisiones_periodo(periodo_sel)
                     if decisiones:
                         df_dec = pd.DataFrame(decisiones)
-                        col_ci = next((c for c in df_exc.columns if 'carnet' in str(c).lower() or str(c).upper() == 'ID'), None)
+                        col_ci = next((c for c in df_exc.columns if 'carnet' in str(c).lower() or str(c).upper() in ['ID','CI']), None)
                         col_fecha = next((c for c in df_exc.columns if 'fecha' in str(c).lower()), None)
 
                         if col_ci and col_fecha and 'carnet_identidad' in df_dec.columns:
@@ -187,14 +184,11 @@ elif opcion == "✅ Aprobaciones Supervisores":
                             mapa_dec = dict(zip(df_dec['_key'], df_dec.get('decision', '')))
                             mapa_tf = dict(zip(df_dec['_key'], df_dec.get('tipo_falta', '')))
 
-                            for col_dec in ['Decisión Supervisor', 'Decisión', 'decision']:
-                                if col_dec in df_exc.columns:
-                                    df_exc[col_dec] = df_exc['_key'].map(mapa_dec).fillna(df_exc[col_dec])
-                                    break
-                            for col_tf in ['Tipo Falta', 'Tipo Falta (Para Contabilidad)', 'tipo_falta']:
-                                if col_tf in df_exc.columns:
-                                    df_exc[col_tf] = df_exc['_key'].map(mapa_tf).fillna(df_exc[col_tf])
-                                    break
+                            for col in df_exc.columns:
+                                if 'decisión' in str(col).lower() or 'decision' in str(col).lower():
+                                    df_exc[col] = df_exc['_key'].map(mapa_dec).fillna(df_exc[col])
+                                if 'tipo falta' in str(col).lower() or 'tipo_falta' in str(col).lower():
+                                    df_exc[col] = df_exc['_key'].map(mapa_tf).fillna(df_exc[col])
 
                             df_exc.drop(columns=['_key'], inplace=True, errors='ignore')
 
@@ -222,87 +216,93 @@ elif opcion == "✅ Aprobaciones Supervisores":
 
                 st.caption(f"Mostrando {len(df_fil)} de {len(df_exc)} excepciones")
 
-                # Detectar nombres reales de columnas de decisión
-                col_decision = next((c for c in df_fil.columns if 'decisión' in str(c).lower() or 'decision' in str(c).lower()), None)
-                col_tipo_falta = next((c for c in df_fil.columns if 'tipo falta' in str(c).lower() or 'tipo_falta' in str(c).lower()), None)
+                # === FORMULARIO PARA GUARDAR (más estable) ===
+                with st.form("form_guardar_decisiones"):
+                    col_decision = next((c for c in df_fil.columns if 'decisión' in str(c).lower() or 'decision' in str(c).lower()), None)
+                    col_tipo_falta = next((c for c in df_fil.columns if 'tipo falta' in str(c).lower()), None)
 
-                column_config = {}
-                if col_decision:
-                    column_config[col_decision] = st.column_config.SelectboxColumn(
-                        "Decisión",
-                        options=["Pendiente", "Aprobado (Pago)", "Acumular (Próx. Mes)", "Rechazado", "Justificado", "Canjeado"]
+                    column_config = {}
+                    if col_decision:
+                        column_config[col_decision] = st.column_config.SelectboxColumn(
+                            "Decisión",
+                            options=["Pendiente", "Aprobado (Pago)", "Acumular (Próx. Mes)", "Rechazado", "Justificado", "Canjeado"]
+                        )
+                    if col_tipo_falta:
+                        column_config[col_tipo_falta] = st.column_config.SelectboxColumn(
+                            "Tipo Falta",
+                            options=["N/A", "Justificada", "Injustificada"]
+                        )
+
+                    df_edited = st.data_editor(
+                        df_fil,
+                        use_container_width=True,
+                        hide_index=True,
+                        disabled=not es_editable,
+                        column_config=column_config,
+                        key="editor_form"
                     )
-                if col_tipo_falta:
-                    column_config[col_tipo_falta] = st.column_config.SelectboxColumn(
-                        "Tipo Falta",
-                        options=["N/A", "Justificada", "Injustificada"]
-                    )
 
-                df_edited = st.data_editor(
-                    df_fil,
-                    use_container_width=True,
-                    hide_index=True,
-                    disabled=not es_editable,
-                    key=f"editor_{periodo_sel}_{sel_emp}_{sel_tipo}",
-                    column_config=column_config
-                )
+                    submitted = st.form_submit_button("💾 Guardar Decisiones", type="primary", disabled=not es_editable)
 
-                if es_editable and st.button("💾 Guardar Decisiones", type="primary"):
-                    # Detección robusta de columnas
-                    col_ci = next((c for c in df_edited.columns if 'carnet' in str(c).lower() or str(c).upper() in ['ID', 'CI']), None)
-                    col_nom = next((c for c in df_edited.columns if 'nombre' in str(c).lower()), None)
-                    col_fec = next((c for c in df_edited.columns if 'fecha' in str(c).lower()), None)
-                    col_tip = next((c for c in df_edited.columns if 'tipo excepción' in str(c).lower() or 'tipo_excepcion' in str(c).lower()), None)
-                    col_dec = next((c for c in df_edited.columns if 'decisión' in str(c).lower() or 'decision' in str(c).lower()), None)
-                    col_tf = next((c for c in df_edited.columns if 'tipo falta' in str(c).lower() or 'tipo_falta' in str(c).lower()), None)
+                    if submitted:
+                        st.write("⏳ Procesando guardado...")  # Mensaje de depuración
 
-                    if not col_ci or not col_fec:
-                        st.error(f"No se pudieron detectar columnas clave. Columnas disponibles: {list(df_edited.columns)}")
-                    else:
-                        guardadas = 0
-                        errores = []
+                        col_ci = next((c for c in df_edited.columns if 'carnet' in str(c).lower() or str(c).upper() in ['ID','CI']), None)
+                        col_nom = next((c for c in df_edited.columns if 'nombre' in str(c).lower()), None)
+                        col_fec = next((c for c in df_edited.columns if 'fecha' in str(c).lower()), None)
+                        col_tip = next((c for c in df_edited.columns if 'tipo excepción' in str(c).lower()), None)
+                        col_dec = next((c for c in df_edited.columns if 'decisión' in str(c).lower() or 'decision' in str(c).lower()), None)
+                        col_tf = next((c for c in df_edited.columns if 'tipo falta' in str(c).lower()), None)
 
-                        for idx, row in df_edited.iterrows():
-                            data = {
-                                "periodo": periodo_sel,
-                                "carnet_identidad": str(row.get(col_ci, "")).strip(),
-                                "nombre": str(row.get(col_nom, "")).strip() if col_nom else "",
-                                "fecha": str(row.get(col_fec, ""))[:10],
-                                "tipo_excepcion": str(row.get(col_tip, "")).strip() if col_tip else "",
-                                "decision": str(row.get(col_dec, "Pendiente")).strip() if col_dec else "Pendiente",
-                                "tipo_falta": str(row.get(col_tf, "N/A")).strip() if col_tf else "N/A",
-                                "observaciones": "",
-                                "registrado_por": usuario_actual
-                            }
+                        st.write(f"Columnas detectadas → CI: {col_ci} | Fecha: {col_fec} | Decisión: {col_dec}")
 
-                            if not data["carnet_identidad"] or data["carnet_identidad"] == "nan":
-                                continue
+                        if not col_ci or not col_fec:
+                            st.error(f"No se detectaron columnas clave. Columnas disponibles: {list(df_edited.columns)}")
+                        else:
+                            guardadas = 0
+                            errores = []
 
-                            res = db_mgr.guardar_decision(data)
-                            if res.get("exito"):
-                                guardadas += 1
+                            for _, row in df_edited.iterrows():
+                                ci_val = str(row.get(col_ci, "")).strip()
+                                if not ci_val or ci_val.lower() in ['nan', 'none', '']:
+                                    continue
+
+                                data = {
+                                    "periodo": periodo_sel,
+                                    "carnet_identidad": ci_val,
+                                    "nombre": str(row.get(col_nom, "")).strip() if col_nom else "",
+                                    "fecha": str(row.get(col_fec, ""))[:10],
+                                    "tipo_excepcion": str(row.get(col_tip, "")).strip() if col_tip else "",
+                                    "decision": str(row.get(col_dec, "Pendiente")).strip() if col_dec else "Pendiente",
+                                    "tipo_falta": str(row.get(col_tf, "N/A")).strip() if col_tf else "N/A",
+                                    "observaciones": "",
+                                    "registrado_por": usuario_actual
+                                }
+
+                                res = db_mgr.guardar_decision(data)
+                                if res.get("exito"):
+                                    guardadas += 1
+                                else:
+                                    errores.append(f"{data.get('nombre', ci_val)}: {res.get('mensaje', 'Error')}")
+
+                            if guardadas > 0:
+                                st.success(f"✅ Se guardaron {guardadas} decisiones correctamente.")
                             else:
-                                errores.append(f"{data['nombre']}: {res.get('mensaje', 'Error desconocido')}")
+                                st.warning("No se guardó ninguna decisión.")
 
-                        if guardadas > 0:
-                            st.success(f"✅ {guardadas} decisiones guardadas correctamente.")
-                        if errores:
-                            st.error("Errores al guardar:")
-                            for e in errores[:5]:
-                                st.write(f"- {e}")
-                        if guardadas == 0 and not errores:
-                            st.warning("No se guardó ninguna decisión. Revisa que haya cambios.")
-
-                        st.rerun()
+                            if errores:
+                                st.error("Detalle de errores:")
+                                for e in errores[:8]:
+                                    st.write(f"- {e}")
             else:
                 st.success("No hay excepciones en este período.")
         else:
             st.info("Haz clic en **Cargar Excepciones del Período** para ver las anomalías.")
 
     except Exception as e:
-        st.error(f"Error: {e}")
+        st.error(f"Error general: {e}")
 
-# 5. CANJE DE HORAS
+# 5. CANJE
 elif opcion == "🔄 Canje de Horas":
     st.header("🔄 Canje de Horas Extras por Faltas")
     st.caption("Solo se usan las horas después del horario oficial marcadas como “Acumular (Próx. Mes)”")
@@ -317,57 +317,52 @@ elif opcion == "🔄 Canje de Horas":
         canjes_existentes = db_mgr.obtener_canjes_periodo(periodo_sel)
 
         if not decisiones:
-            st.warning("No hay decisiones guardadas para este período. Primero ve a **Aprobaciones** y guarda las decisiones.")
+            st.warning("No hay decisiones guardadas. Primero guarda en Aprobaciones.")
         else:
             df_dec = pd.DataFrame(decisiones)
             df_acum = df_dec[df_dec['decision'].astype(str).str.contains("Acumular", case=False, na=False)].copy()
 
             if df_acum.empty:
-                st.info("No hay horas marcadas como “Acumular (Próx. Mes)” en este período.")
+                st.info("No hay horas marcadas como “Acumular (Próx. Mes)”.")
             else:
                 st.subheader("Horas disponibles para canje")
                 st.dataframe(df_acum[["nombre", "fecha", "tipo_excepcion", "decision"]], use_container_width=True, hide_index=True)
 
                 st.divider()
-                st.subheader("Registrar un Canje")
-
                 empleados_con_he = sorted(df_acum['nombre'].dropna().unique().tolist())
                 emp_sel = st.selectbox("Empleado:", empleados_con_he)
-
-                # Conteo simple de registros acumulados (placeholder)
                 cant = len(df_acum[df_acum['nombre'] == emp_sel])
-                st.info(f"Registros acumulados de {emp_sel}: **{cant}** (se calculará el valor real de horas más adelante)")
+                st.info(f"Registros acumulados de {emp_sel}: **{cant}**")
 
-                dias_a_canjear = st.number_input("Días a canjear (1 día ≈ 8 hrs):", min_value=0.0, max_value=10.0, step=0.5, value=0.0)
+                dias_a_canjear = st.number_input("Días a canjear:", min_value=0.0, max_value=10.0, step=0.5, value=0.0)
 
                 if st.button("💾 Guardar Canje", type="primary"):
                     if dias_a_canjear <= 0:
                         st.error("Indica al menos 0.5 días.")
                     else:
-                        horas_usadas = dias_a_canjear * 8.0
-                        ci_val = str(df_acum[df_acum['nombre'] == emp_sel]['carnet_identidad'].iloc[0]) if not df_acum[df_acum['nombre'] == emp_sel].empty else ""
+                        ci_val = str(df_acum[df_acum['nombre'] == emp_sel]['carnet_identidad'].iloc[0])
                         data = {
                             "periodo": periodo_sel,
                             "carnet_identidad": ci_val,
                             "nombre": emp_sel,
                             "dias_canjeados": float(dias_a_canjear),
-                            "horas_usadas": float(horas_usadas),
+                            "horas_usadas": float(dias_a_canjear * 8),
                             "faltas_afectadas": "",
                             "registrado_por": usuario_actual
                         }
                         res = db_mgr.guardar_canje(data)
                         if res.get("exito"):
-                            st.success(f"✅ Canje de {dias_a_canjear} día(s) guardado para {emp_sel}")
+                            st.success(f"✅ Canje guardado para {emp_sel}")
                             st.rerun()
                         else:
-                            st.error(res.get("mensaje", "Error al guardar canje"))
+                            st.error(res.get("mensaje"))
 
         st.divider()
-        st.subheader("Canjes realizados en este período")
+        st.subheader("Canjes realizados")
         if canjes_existentes:
             st.dataframe(pd.DataFrame(canjes_existentes), use_container_width=True, hide_index=True)
         else:
-            st.info("Aún no hay canjes registrados.")
+            st.info("Aún no hay canjes.")
 
     except Exception as e:
         st.error(str(e))
