@@ -2,14 +2,24 @@ import streamlit as st
 from supabase import create_client, Client
 from datetime import datetime
 from typing import Dict, Any, List, Optional
-import json
+import time
 
-@st.cache_resource
+@st.cache_resource(show_spinner=False)
 def get_supabase_client() -> Client:
-    """Crea y cachea el cliente de Supabase usando la service_role key."""
-    url = st.secrets["supabase"]["url"]
-    key = st.secrets["supabase"]["service_role_key"]
-    return create_client(url, key)
+    """Crea el cliente de Supabase de forma robusta."""
+    try:
+        url = st.secrets["supabase"]["url"].strip()
+        key = st.secrets["supabase"]["service_role_key"].strip()
+
+        if not url.startswith("https://"):
+            raise ValueError("La URL de Supabase debe empezar con https://")
+
+        client = create_client(url, key)
+        return client
+    except Exception as e:
+        st.error(f"Error al conectar con Supabase: {str(e)}")
+        raise e
+
 
 class DBManager:
     """Capa de persistencia centralizada para Fridolin (Opción A - Supabase)."""
@@ -50,17 +60,25 @@ class DBManager:
             }).execute()
             return {"exito": True, "mensaje": f"Estado actualizado a {nuevo_estado}"}
         except Exception as e:
-            return {"exito": False, "mensaje": str(e)}
+            return {"exito": False, "mensaje": f"Error de conexión con la base de datos: {str(e)}"}
 
     # ------------------------------------------------------------------
     # NOVEDADES
     # ------------------------------------------------------------------
     def registrar_novedad(self, data: Dict[str, Any]) -> Dict[str, Any]:
         try:
-            self.client.table("novedades").insert(data).execute()
-            return {"exito": True, "mensaje": "Novedad registrada correctamente"}
+            # Pequeño reintento en caso de fallo de red
+            for intento in range(2):
+                try:
+                    self.client.table("novedades").insert(data).execute()
+                    return {"exito": True, "mensaje": "Novedad registrada correctamente"}
+                except Exception as e:
+                    if intento == 0:
+                        time.sleep(1.5)
+                        continue
+                    raise e
         except Exception as e:
-            return {"exito": False, "mensaje": str(e)}
+            return {"exito": False, "mensaje": f"Error al registrar novedad: {str(e)}"}
 
     def obtener_todas_novedades(self) -> List[Dict[str, Any]]:
         try:
