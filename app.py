@@ -2,7 +2,6 @@ import streamlit as st
 import pandas as pd
 import io
 import os
-import sqlite3
 import json
 from datetime import datetime
 from typing import Dict, Any, Optional
@@ -12,6 +11,11 @@ from modules.data_loader import load_sheet_data
 from modules.attendance_processor import process_attendance, detect_exceptions, get_canje_summary
 from modules.auth_permissions import render_user_selector, filter_dataframe_by_supervisor
 from modules.excel_exporter import ExcelExporter
+
+# Importamos los managers nuevos (Supabase)
+from modules.audit_logger import AuditLogger
+from modules.lock_manager import LockManager
+from modules.novedades import NovedadesManager
 
 try:
     from modules.tarifas_manager import (
@@ -25,7 +29,7 @@ except ImportError:
         return str(val).split('.')[0].strip().upper()
 
 # -----------------------------------------------------------------------------
-# GESTOR PERSISTENTE DE TARIFAS Y EXCEPCIONES (DISCO / JSON)
+# GESTOR PERSISTENTE DE TARIFAS Y EXCEPCIONES (DISCO / JSON) - Se mantiene por ahora
 # -----------------------------------------------------------------------------
 TARIFAS_JSON_PATH = "tarifas_config.json"
 
@@ -52,7 +56,6 @@ def obtener_config_periodo_persistent(periodo: str) -> dict:
     if periodo in all_data:
         return all_data[periodo]
     
-    # Intenta cargar de la función original si está disponible
     try:
         from modules.tarifas_manager import obtener_config_periodo as orig_obtener
         cfg = orig_obtener(periodo)
@@ -118,299 +121,8 @@ def eliminar_excepcion_empleado_persistent(ci: str, periodo: str) -> bool:
         return res
     return False
 
-# -----------------------------------------------------------------------------
-# CLASE AUDIT LOGGER (Garantiza funcionamiento de la Bitácora)
-# -----------------------------------------------------------------------------
-class AuditLogger:
-    def __init__(self, db_path: str = "audit_log.db"):
-        self.db_path = db_path
-        self._init_db()
 
-    def _init_db(self):
-        try:
-            with sqlite3.connect(self.db_path) as conn:
-                conn.cursor().execute("""
-                    CREATE TABLE IF NOT EXISTS audit_logs (
-                        id INTEGER PRIMARY KEY AUTOINCREMENT,
-                        timestamp TEXT NOT NULL,
-                        usuario_pin TEXT,
-                        usuario_nombre TEXT,
-                        accion TEXT NOT NULL,
-                        modulo TEXT NOT NULL,
-                        detalles TEXT
-                    )
-                """)
-                conn.commit()
-        except Exception:
-            pass
-
-    def registrar_evento(self, usuario_pin: str, usuario_nombre: str, accion: str, modulo: str, detalles: Optional[Dict[str, Any]] = None) -> bool:
-        try:
-            ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-            det = json.dumps(detalles, ensure_ascii=False) if detalles else "{}"
-            with sqlite3.connect(self.db_path) as conn:
-                conn.cursor().execute(
-                    "INSERT INTO audit_logs (timestamp, usuario_pin, usuario_nombre, accion, modulo, detalles) VALUES (?, ?, ?, ?, ?, ?)",
-                    (ts, usuario_pin, usuario_nombre, accion, modulo, det)
-                )
-                conn.commit()
-            return True
-        except Exception:
-            return False
-
-    def obtener_logs(self, limite: int = 1000, *args, **kwargs) -> pd.DataFrame:
-        try:
-            with sqlite3.connect(self.db_path) as conn:
-                df = pd.read_sql_query(
-                    """
-                    SELECT 
-                        timestamp AS 'Fecha y Hora', 
-                        usuario_nombre AS 'Usuario', 
-                        accion AS 'Acción', 
-                        modulo AS 'Módulo', 
-                        detalles AS 'Detalles / Datos' 
-                    FROM audit_logs 
-                    ORDER BY id DESC 
-                    LIMIT ?
-                    """,
-                    conn, params=(limite,)
-                )
-                return df
-        except Exception:
-            return pd.DataFrame(columns=['Fecha y Hora', 'Usuario', 'Acción', 'Módulo', 'Detalles / Datos'])
-
-# Fallback o import de AuditLogger
-try:
-    from modules.audit_logger import AuditLogger
-except ImportError:
-    pass
-
-
-# -----------------------------------------------------------------------------
-# CLASE LOCK MANAGER (Con Persistencia Dual SQLite + JSON Antipérdida)
-# -----------------------------------------------------------------------------
-class LockManager:
-    """
-    Gestión de estado y cierre de períodos mensuales de asistencia con autonomía por supervisor.
-    Clave de control: Periodo_Supervisor (ejemplo: 2026-07_CABRERA_YASMIN).
-    Soporta sincronización y respaldo en JSON para servidores efímeros (Streamlit Cloud).
-    """
-    ESTADO_PENDIENTE = "PENDIENTE"
-    ESTADO_EN_PROCESO = "EN_PROCESO"
-    ESTADO_FINALIZADO = "FINALIZADO"
-
-    ROLES_SUPERUSUARIO = ["RESPONSABLE_OPERACIONES", "JEFE_PRODUCCION", "Jefe de Producción", "ADMINISTRADOR"]
-
-    def __init__(self, db_path: str = "period_locks.db", json_path: str = "period_locks_backup.json"):
-        self.db_path = db_path
-        self.json_path = json_path
-        self._init_db()
-        self._sincronizar_desde_json()
-
-    def _init_db(self):
-        try:
-            with sqlite3.connect(self.db_path) as conn:
-                cursor = conn.cursor()
-                cursor.execute("""
-                    CREATE TABLE IF NOT EXISTS period_locks (
-                        periodo TEXT PRIMARY KEY,
-                        estado TEXT NOT NULL DEFAULT 'PENDIENTE',
-                        cerrado_por TEXT,
-                        fecha_cierre TEXT,
-                        motivo_desbloqueo TEXT
-                    )
-                """)
-                conn.commit()
-        except Exception as e:
-            print(f"Error inicializando DB LockManager: {e}")
-
-    def _construir_clave(self, periodo: str, usuario: Optional[str] = None) -> str:
-        if usuario:
-            usr_clean = str(usuario).strip().upper().replace(" ", "_")
-            return f"{periodo}_{usr_clean}"
-        return str(periodo)
-
-    def _guardar_json_local(self):
-        try:
-            with sqlite3.connect(self.db_path) as conn:
-                conn.row_factory = sqlite3.Row
-                rows = conn.cursor().execute("SELECT * FROM period_locks").fetchall()
-                data = [dict(r) for r in rows]
-                
-            with open(self.json_path, "w", encoding="utf-8") as f:
-                json.dump(data, f, ensure_ascii=False, indent=2)
-        except Exception as e:
-            print(f"Error respaldando a JSON: {e}")
-
-    def _sincronizar_desde_json(self):
-        if not os.path.exists(self.json_path):
-            return
-        try:
-            with open(self.json_path, "r", encoding="utf-8") as f:
-                data = json.load(f)
-            
-            with sqlite3.connect(self.db_path) as conn:
-                cursor = conn.cursor()
-                for reg in data:
-                    cursor.execute("""
-                        INSERT INTO period_locks (periodo, estado, cerrado_por, fecha_cierre, motivo_desbloqueo)
-                        VALUES (?, ?, ?, ?, ?)
-                        ON CONFLICT(periodo) DO UPDATE SET
-                            estado = excluded.estado,
-                            cerrado_por = excluded.cerrado_por,
-                            fecha_cierre = excluded.fecha_cierre,
-                            motivo_desbloqueo = excluded.motivo_desbloqueo
-                    """, (reg["periodo"], reg["estado"], reg.get("cerrado_por", ""), reg.get("fecha_cierre", ""), reg.get("motivo_desbloqueo", "")))
-                conn.commit()
-        except Exception as e:
-            print(f"Error restaurando desde JSON: {e}")
-
-    def obtener_estado_periodo(self, periodo: str, usuario: Optional[str] = None, *args, **kwargs) -> str:
-        if not usuario and args:
-            usuario = args[0]
-
-        clave = self._construir_clave(periodo, usuario)
-        try:
-            with sqlite3.connect(self.db_path) as conn:
-                cursor = conn.cursor()
-                res = cursor.execute("SELECT estado FROM period_locks WHERE periodo = ?", (clave,)).fetchone()
-                if res:
-                    return res[0]
-        except Exception:
-            pass
-        return self.ESTADO_PENDIENTE
-
-    def es_editable(self, periodo: str, rol_usuario: str, usuario: Optional[str] = None) -> bool:
-        estado = self.obtener_estado_periodo(periodo, usuario=usuario)
-        if estado == self.ESTADO_EN_PROCESO:
-            return True
-        if estado == self.ESTADO_FINALIZADO:
-            rol_clean = str(rol_usuario).strip().upper().replace(" ", "_")
-            return rol_clean in self.ROLES_SUPERUSUARIO or rol_usuario in self.ROLES_SUPERUSUARIO
-        return False
-
-    def cambiar_estado(
-        self,
-        periodo: str,
-        nuevo_estado: str,
-        usuario_pin: str,
-        rol_usuario: str,
-        usuario_nombre: Optional[str] = None,
-        motivo: Optional[str] = None
-    ) -> Dict[str, Any]:
-        if nuevo_estado not in [self.ESTADO_PENDIENTE, self.ESTADO_EN_PROCESO, self.ESTADO_FINALIZADO]:
-            return {"exito": False, "mensaje": "Estado de período no válido."}
-
-        usuario_ref = usuario_nombre or usuario_pin
-        clave = self._construir_clave(periodo, usuario_ref)
-
-        estado_actual = self.obtener_estado_periodo(periodo, usuario=usuario_ref)
-        if estado_actual == self.ESTADO_FINALIZADO and nuevo_estado != self.ESTADO_FINALIZADO:
-            rol_clean = str(rol_usuario).strip().upper().replace(" ", "_")
-            if rol_clean not in self.ROLES_SUPERUSUARIO and rol_usuario not in self.ROLES_SUPERUSUARIO:
-                return {
-                    "exito": False,
-                    "mensaje": "Permiso denegado: Solo el Responsable de Operaciones o Jefe de Producción puede reabrir un período cerrado."
-                }
-
-        fecha_actual = datetime.now().isoformat()
-        try:
-            with sqlite3.connect(self.db_path) as conn:
-                cursor = conn.cursor()
-                cursor.execute("""
-                    INSERT INTO period_locks (periodo, estado, cerrado_por, fecha_cierre, motivo_desbloqueo)
-                    VALUES (?, ?, ?, ?, ?)
-                    ON CONFLICT(periodo) DO UPDATE SET
-                        estado = excluded.estado,
-                        cerrado_por = excluded.cerrado_por,
-                        fecha_cierre = excluded.fecha_cierre,
-                        motivo_desbloqueo = excluded.motivo_desbloqueo
-                """, (clave, nuevo_estado, usuario_pin, fecha_actual, motivo or ""))
-                conn.commit()
-
-            self._guardar_json_local()
-            return {"exito": True, "mensaje": f"Estado del período {periodo} para {usuario_ref} actualizado a '{nuevo_estado}'."}
-        except Exception as e:
-            return {"exito": False, "mensaje": f"Error actualizando estado en base de datos: {e}"}
-
-    def exportar_respaldo_json(self) -> str:
-        try:
-            with sqlite3.connect(self.db_path) as conn:
-                conn.row_factory = sqlite3.Row
-                rows = conn.cursor().execute("SELECT * FROM period_locks").fetchall()
-                return json.dumps([dict(r) for r in rows], ensure_ascii=False, indent=2)
-        except Exception:
-            if os.path.exists(self.json_path):
-                with open(self.json_path, "r", encoding="utf-8") as f:
-                    return f.read()
-            return "[]"
-
-    def importar_respaldo_json(self, json_string: str) -> bool:
-        try:
-            data = json.loads(json_string)
-            with sqlite3.connect(self.db_path) as conn:
-                cursor = conn.cursor()
-                for reg in data:
-                    cursor.execute("""
-                        INSERT INTO period_locks (periodo, estado, cerrado_por, fecha_cierre, motivo_desbloqueo)
-                        VALUES (?, ?, ?, ?, ?)
-                        ON CONFLICT(periodo) DO UPDATE SET
-                            estado = excluded.estado,
-                            cerrado_por = excluded.cerrado_por,
-                            fecha_cierre = excluded.fecha_cierre,
-                            motivo_desbloqueo = excluded.motivo_desbloqueo
-                    """, (reg["periodo"], reg["estado"], reg.get("cerrado_por", ""), reg.get("fecha_cierre", ""), reg.get("motivo_desbloqueo", "")))
-                conn.commit()
-            self._guardar_json_local()
-            return True
-        except Exception:
-            return False
-
-
-# -----------------------------------------------------------------------------
-# GESTOR DE NOVEDADES FALLBACK
-# -----------------------------------------------------------------------------
-try:
-    from modules.novedades import NovedadesManager
-except ImportError:
-    class NovedadesManager:
-        def __init__(self, json_path: str = "novedades_local.json"):
-            self.json_path = json_path
-
-        def obtener_tipos_novedad(self):
-            return ["Baja Médica", "Licencia por Paternidad", "Licencia por Luto", "Vacación", "Lactancia Maternidad", "Permiso Personal"]
-
-        def obtener_todas_novedades(self):
-            if os.path.exists(self.json_path):
-                try:
-                    with open(self.json_path, "r", encoding="utf-8") as f:
-                        return json.load(f)
-                except Exception:
-                    return []
-            return []
-
-        def registrar_novedad(self, empleado_id, empleado_nombre, tipo_novedad, fecha_inicio, fecha_fin, justificacion, registrado_por_pin):
-            novs = self.obtener_todas_novedades()
-            nueva = {
-                "ID": clean_ci(empleado_id),
-                "Nombre_Completo": empleado_nombre,
-                "Tipo_Novedad": tipo_novedad,
-                "Fecha_Inicio": fecha_inicio,
-                "Fecha_Fin": fecha_fin,
-                "Justificacion": justificacion,
-                "Registrado_Por": registrado_por_pin,
-                "Fecha_Registro": datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-            }
-            novs.append(nueva)
-            try:
-                with open(self.json_path, "w", encoding="utf-8") as f:
-                    json.dump(novs, f, ensure_ascii=False, indent=2)
-                return {"exito": True, "mensaje": "Novedad registrada exitosamente."}
-            except Exception as e:
-                return {"exito": False, "mensaje": f"Error guardando novedad: {e}"}
-
-
-# --- INICIALIZACIÓN DE GESTORES (Con Limpieza de Caché de Clases) ---
+# --- INICIALIZACIÓN DE GESTORES (Ahora usan Supabase) ---
 @st.cache_resource
 def get_managers():
     audit = AuditLogger()
@@ -420,10 +132,6 @@ def get_managers():
 
 audit_log, lock_mgr, nov_mgr = get_managers()
 
-# Verificación de integridad de objeto en memoria
-if not hasattr(lock_mgr, "exportar_respaldo_json"):
-    st.cache_resource.clear()
-    audit_log, lock_mgr, nov_mgr = get_managers()
 
 # Caching de Funciones de Datos
 @st.cache_data(ttl=300, show_spinner=False)
@@ -496,417 +204,279 @@ if opcion == "📊 Parámetros y Reglas":
         {"Parámetro / Regla": "Jornada_Nocturna_Base", "Valor": "7.0 hrs", "Descripción y Aplicación": "Horario oficial 22:00 a 05:30 (7.5h brutas - 0.5h cena) = 1.0 Turno."},
         {"Parámetro / Regla": "Jornada_Nocturna_Especial", "Valor": "11.0 hrs", "Descripción y Aplicación": "Viernes y Domingos (Ingreso 16:00 a 19:30, Oficial 18:00 a 05:30) = 1.5 Turnos."},
         {"Parámetro / Regla": "Umbral_Excepción_Horario", "Valor": "30 min", "Descripción y Aplicación": "Entradas/Salidas anticipadas o tardías >= 30 min generan Excepción Pendiente. Por defecto se truncan al horario oficial."},
-        {"Parámetro / Regla": "Alerta_7mo_Dia", "Valor": "7 días", "Descripción y Aplicación": "Genera alerta automática si un trabajador registra marcaciones los 7 días de una misma semana."}
+        {"Parámetro / Regla": "Alerta_7mo_Dia", "Valor": "7 días", "Descripción y Aplicación": "Genera alerta automática si un trabajador registra marcaciones los 7 días de una misma semana."},
     ]
-
-    df_reglas = pd.DataFrame(data_reglas)
-    st.dataframe(df_reglas, use_container_width=True, hide_index=True)
-
-    st.divider()
-
-    st.subheader("📖 Guía Operativa para Cierre Mensual (Paso a Paso)")
-    st.caption("Manual rápido de procedimiento obligatorio para supervisores al cierre de cada período.")
-
-    c_p1, c_p2 = st.columns(2)
-
-    with c_p1:
-        st.markdown("""
-        #### 📌 Procedimiento Paso a Paso
-        
-        * **Paso 1: Verificación de Datos Previos**  
-          Confirmar que la información del Google Drive esté completamente actualizada tanto en la lista **Maestro de Empleados** como en el extracto del biométrico dentro de la pestaña **Importación Biométrico**.
-        
-        * **Paso 2: Registro de Novedades y Permisos**  
-          Iniciar sesión y acceder a **Novedades y Permisos**. Cargar todas las novedades, licencias y permisos especiales correspondientes a su personal asignado presionando el botón **`+ Registrar una novedad`**. Verificar que todo esté completo.
-        
-        * **Paso 3: Aprobaciones y Excepciones**  
-          Ingresar a la vista **Aprobaciones Supervisores**, donde podrá visualizar e intervenir sobre las incoherencias de su personal asignado (faltas justificadas, faltas injustificadas, horas extras, etc.).
-        """)
-
-    with c_p2:
-        st.warning("""
-        ⚠️ **REGLA CRÍTICA DE PROCESAMIENTO:**
-        
-        1. Al ingresar en Aprobaciones, debe presionar **`MARCAR EN PROCESO`** para habilitar la edición de las tablas de su personal asignado.
-        2. Una vez concluida la revisión total, presione **`FINALIZAR Y CERRAR PERÍODO`**.
-        3. **Importante:** Cada supervisor gestiona su propia autonomía de revisión.
-        4. En caso de error tras finalizar, debe comunicarse con **Ever Medrano** para solicitar la reapertura.
-        """)
-
-    st.info("""
-    💡 **Consideraciones Operativas sobre Aprobaciones:**
-    * **Faltas:** Puede convertir una falta injustificada en justificada si cuenta con el respaldo correspondiente.
-    * **Canje de Horas Extras:** Puede canjear horas extras acumuladas por faltas justificadas. Estos canjes aplican únicamente por **jornadas completas** (no a medias).
-    * **Procesamiento por Defecto:** Si no aprueba una excepción u observación, el sistema la procesará automáticamente acorde a las reglas normativas establecidas (descuento de falta, truncamiento de horas extras no autorizadas, etc.).
-    """)
-
-    st.success("""
-    🏁 **Finalización del Proceso:**  
-    Una vez finalizado y cerrado el período de aprobaciones, puede acceder a **Pre-Planilla y Reportes** para generar y exportar la planilla oficial consolidada.
-    """)
+    
+    st.dataframe(pd.DataFrame(data_reglas), use_container_width=True, hide_index=True)
 
 # -----------------------------------------------------------------------------
 # 2. IMPORTACIÓN BIOMÉTRICO
 # -----------------------------------------------------------------------------
 elif opcion == "⏱️ Importación Biométrico":
-    st.header("Registros del Biométrico")
+    st.header("⏱️ Importación y Visualización de Marcaciones Biométricas")
+    st.info("Esta sección carga los datos desde el Google Sheet configurado. Los datos se procesan en tiempo real.")
+
     try:
         df_bio = cached_load_sheet_data("02_Importacion_Biometrico")
-        st.dataframe(df_bio, use_container_width=True, hide_index=True)
+        if df_bio is not None and not df_bio.empty:
+            st.success(f"✅ Se cargaron {len(df_bio)} registros biométricos.")
+            st.dataframe(df_bio.head(100), use_container_width=True)
+        else:
+            st.warning("No se encontraron datos en la hoja de biométrico.")
     except Exception as e:
-        st.error(f"Error al cargar la pestaña: {e}")
+        st.error(f"Error cargando biométrico: {e}")
 
 # -----------------------------------------------------------------------------
 # 3. NOVEDADES Y PERMISOS
 # -----------------------------------------------------------------------------
 elif opcion == "📝 Novedades y Permisos":
-    st.header("Novedades, Licencias y Permisos Especiales")
-    st.info("💡 Incluye licencias legales, bajas médicas, vacaciones y Reducción de Lactancia Maternidad (-1 hora diaria).")
+    st.header("📝 Gestión de Novedades, Permisos y Licencias")
 
-    tab_ver_nov, tab_crear_nov = st.tabs(["📋 Novedades Registradas", "➕ Registrar Nueva Novedad"])
+    with st.form("form_novedad"):
+        col1, col2 = st.columns(2)
+        with col1:
+            emp_id = st.text_input("CI / Carnet del Empleado*")
+            emp_nombre = st.text_input("Nombre Completo*")
+            tipo_nov = st.selectbox("Tipo de Novedad*", nov_mgr.obtener_tipos_novedad())
+        with col2:
+            f_ini = st.date_input("Fecha Inicio*")
+            f_fin = st.date_input("Fecha Fin*")
+            justificacion = st.text_area("Justificación / Observación")
 
-    with tab_ver_nov:
-        try:
-            df_nov_sheet = cached_load_sheet_data("04_Novedades_y_Permisos")
-        except Exception:
-            df_nov_sheet = pd.DataFrame()
+        submitted = st.form_submit_button("💾 Registrar Novedad")
+        if submitted:
+            if not emp_id or not emp_nombre:
+                st.warning("Complete los campos obligatorios.")
+            else:
+                resultado = nov_mgr.registrar_novedad(
+                    empleado_id=emp_id,
+                    empleado_nombre=emp_nombre,
+                    tipo_novedad=tipo_nov,
+                    fecha_inicio=str(f_ini),
+                    fecha_fin=str(f_fin),
+                    justificacion=justificacion,
+                    registrado_por_pin=usuario_actual
+                )
+                if resultado.get("exito"):
+                    st.success(resultado.get("mensaje"))
+                    audit_log.registrar_evento(
+                        usuario_pin=usuario_actual,
+                        usuario_nombre=usuario_actual,
+                        accion="REGISTRAR_NOVEDAD",
+                        modulo="Novedades",
+                        detalles={"empleado": emp_nombre, "tipo": tipo_nov, "desde": str(f_ini), "hasta": str(f_fin)}
+                    )
+                else:
+                    st.error(resultado.get("mensaje"))
 
-        df_nov_local = pd.DataFrame(nov_mgr.obtener_todas_novedades())
-        
-        if not df_nov_local.empty and not df_nov_sheet.empty:
-            df_nov_comb = pd.concat([df_nov_sheet, df_nov_local], ignore_index=True)
-        elif not df_nov_local.empty:
-            df_nov_comb = df_nov_local
-        else:
-            df_nov_comb = df_nov_sheet
-
-        st.dataframe(df_nov_comb, use_container_width=True, hide_index=True)
-
-    with tab_crear_nov:
-        if not pin_ok:
-            st.warning("🔒 Requiere ingresar su PIN de Supervisor en la barra lateral para registrar novedades.")
-        else:
-            st.subheader("Formulario de Registro de Novedad / Licencia")
-            with st.form("form_nueva_novedad"):
-                try:
-                    df_emp = cached_load_sheet_data("01_Maestro_Empleados")
-                    df_emp.columns = [str(col).strip() for col in df_emp.columns]
-                    col_nombre = 'Nombre_Completo' if 'Nombre_Completo' in df_emp.columns else ('Nombre' if 'Nombre' in df_emp.columns else None)
-                    
-                    if col_nombre:
-                        df_emp_fil = filter_dataframe_by_supervisor(df_emp, col_nombre, empleados_permitidos, rol_actual)
-                        lista_emps = df_emp_fil[col_nombre].dropna().unique().tolist()
-                    else:
-                        lista_emps = []
-                except Exception:
-                    lista_emps = []
-
-                emp_seleccionado = st.selectbox("Seleccione Empleado:*", options=sorted(lista_emps))
-                
-                tipo_nov = st.selectbox("Tipo de Novedad / Licencia:*", options=nov_mgr.obtener_tipos_novedad())
-                
-                col_f1, col_f2 = st.columns(2)
-                with col_f1:
-                    fecha_ini = st.date_input("Fecha Inicio:*")
-                with col_f2:
-                    fecha_fin = st.date_input("Fecha Fin:*")
-                
-                justificacion_txt = st.text_area("Justificación / Certificado Médico / Observaciones:*")
-
-                sub_nov = st.form_submit_button("✅ Guardar Novedad")
-                if sub_nov:
-                    if not emp_seleccionado or not justificacion_txt:
-                        st.error("Debe completar todos los campos obligatorios.")
-                    else:
-                        emp_id = "EMP-000"
-                        if col_nombre and col_nombre in df_emp.columns:
-                            row_e = df_emp[df_emp[col_nombre] == emp_seleccionado]
-                            if not row_e.empty:
-                                col_id = 'Carnet_Identidad' if 'Carnet_Identidad' in row_e.columns else ('ID' if 'ID' in row_e.columns else None)
-                                if col_id and col_id in row_e.columns:
-                                    emp_id = clean_ci(row_e[col_id].values[0])
-
-                        res_reg = nov_mgr.registrar_novedad(
-                            empleado_id=emp_id,
-                            empleado_nombre=emp_seleccionado,
-                            tipo_novedad=tipo_nov,
-                            fecha_inicio=fecha_ini.strftime("%Y-%m-%d"),
-                            fecha_fin=fecha_fin.strftime("%Y-%m-%d"),
-                            justificacion=justificacion_txt,
-                            registrado_por_pin=usuario_actual
-                        )
-
-                        if res_reg["exito"]:
-                            audit_log.registrar_evento(
-                                usuario_pin=usuario_actual,
-                                usuario_nombre=usuario_actual,
-                                accion="REGISTRO_NOVEDAD",
-                                modulo="Novedades",
-                                detalles={"empleado": emp_seleccionado, "tipo": tipo_nov, "inicio": str(fecha_ini), "fin": str(fecha_fin)}
-                            )
-                            st.cache_data.clear()
-                            st.cache_resource.clear()
-                            st.success(res_reg["mensaje"])
-                            st.rerun()
-                        else:
-                            st.error(res_reg["mensaje"])
+    st.divider()
+    st.subheader("📋 Novedades Registradas")
+    todas = nov_mgr.obtener_todas_novedades()
+    if todas:
+        st.dataframe(pd.DataFrame(todas), use_container_width=True, hide_index=True)
+    else:
+        st.info("Aún no hay novedades registradas.")
 
 # -----------------------------------------------------------------------------
 # 4. APROBACIONES SUPERVISORES
 # -----------------------------------------------------------------------------
 elif opcion == "✅ Aprobaciones Supervisores":
-    st.header("✅ Centro de Aprobaciones y Excepciones")
-
-    if not pin_ok:
-        st.warning("🔒 Ingrese su PIN de 4 dígitos en la barra lateral para desbloquear el módulo de Aprobaciones.")
-        st.stop()
+    st.header("✅ Panel de Aprobaciones de Supervisores")
 
     try:
         df_bio = cached_load_sheet_data("02_Importacion_Biometrico")
+        df_params = cached_load_sheet_data("05_Parametros_y_Reglas")
+        df_emp = cached_load_sheet_data("01_Maestro_Empleados")
+
         df_bio['dt_temp'] = pd.to_datetime(df_bio.iloc[:, 2], dayfirst=True, errors='coerce')
-        periodos_disponibles = sorted(df_bio['dt_temp'].dt.strftime('%Y-%m').dropna().unique().tolist(), reverse=True)
-    except Exception:
-        periodos_disponibles = [datetime.now().strftime('%Y-%m')]
-
-    col_p1, col_p2 = st.columns([2, 2])
-    with col_p1:
-        periodo_sel = st.selectbox("🗓️ Seleccionar Período de Revisión:", options=periodos_disponibles)
-
-    estado_periodo = lock_mgr.obtener_estado_periodo(periodo_sel, usuario=usuario_actual)
-    es_editable = lock_mgr.es_editable(periodo_sel, rol_actual, usuario=usuario_actual)
-
-    with col_p2:
-        st.subheader(f"Estado Período ({usuario_actual}): **{estado_periodo}**")
-        if estado_periodo == "PENDIENTE":
-            st.info("ℹ️ Para habilitar la edición de tablas y procesar las excepciones de su personal, presione **'▶️ Marcar EN PROCESO'**.")
-        elif estado_periodo == "EN_PROCESO":
-            st.warning("⚡ **EN PROCESO:** Edición habilitada. Revise a su personal y al terminar presione **'🔒 FINALIZAR y Cerrar Período'**.")
-        elif estado_periodo == "FINALIZADO":
-            if not es_editable:
-                st.success("🔒 Período FINALIZADO para su usuario. Las revisiones están guardadas y bloqueadas.")
-            else:
-                st.info("🔓 Período CERRADO, pero cuenta con permisos de Superusuario para modificar.")
-
-    col_rev1, col_rev2, col_rev3 = st.columns(3)
-    with col_rev1:
-        if st.button("▶️ Marcar EN PROCESO"):
-            res_c = lock_mgr.cambiar_estado(periodo_sel, lock_mgr.ESTADO_EN_PROCESO, usuario_actual, rol_actual, usuario_nombre=usuario_actual)
-            if res_c["exito"]:
-                audit_log.registrar_evento(usuario_actual, usuario_actual, "CAMBIO_ESTADO_PERIODO", "Aprobaciones", {"periodo": periodo_sel, "nuevo_estado": "EN_PROCESO", "supervisor": usuario_actual})
-                st.success(res_c["mensaje"])
-                st.rerun()
-            else:
-                st.error(res_c["mensaje"])
-
-    with col_rev2:
-        if st.button("🔒 FINALIZAR y Cerrar Período"):
-            res_c = lock_mgr.cambiar_estado(periodo_sel, lock_mgr.ESTADO_FINALIZADO, usuario_actual, rol_actual, usuario_nombre=usuario_actual)
-            if res_c["exito"]:
-                audit_log.registrar_evento(usuario_actual, usuario_actual, "CAMBIO_ESTADO_PERIODO", "Aprobaciones", {"periodo": periodo_sel, "nuevo_estado": "FINALIZADO", "supervisor": usuario_actual})
-                st.success(res_c["mensaje"])
-                st.rerun()
-            else:
-                st.error(res_c["mensaje"])
-
-    with col_rev3:
-        if estado_periodo == "FINALIZADO" and (rol_actual in LockManager.ROLES_SUPERUSUARIO):
-            if st.button("🔓 Desbloquear Período (Superusuario)"):
-                res_c = lock_mgr.cambiar_estado(periodo_sel, lock_mgr.ESTADO_PENDIENTE, usuario_actual, rol_actual, usuario_nombre=usuario_actual, motivo="Desbloqueo por Jefatura")
-                if res_c["exito"]:
-                    audit_log.registrar_evento(usuario_actual, usuario_actual, "DESBLOQUEO_PERIODO", "Aprobaciones", {"periodo": periodo_sel, "supervisor": usuario_actual})
-                    st.success(res_c["mensaje"])
-                    st.rerun()
-
-    # --- BLOQUE DE RESPALDO Y RESTAURACIÓN ANTIPÉRDIDA ---
-    with st.expander("🛡️ Resguardo de Seguridad (Descargar / Restaurar Cierres)"):
-        st.caption("Si el servidor de Streamlit Cloud se reinicia y requiere recuperar el estado de los cierres, utilice estas funciones de respaldo:")
-        col_res1, col_res2 = st.columns(2)
+        periodos = sorted(df_bio['dt_temp'].dt.strftime('%Y-%m').dropna().unique().tolist(), reverse=True)
         
-        with col_res1:
-            json_data = lock_mgr.exportar_respaldo_json()
-            st.download_button(
-                label="📥 Descargar Respaldo de Cierres (.json)",
-                data=json_data,
-                file_name=f"period_locks_backup_{periodo_sel}.json",
-                mime="application/json",
-                help="Descargue este archivo al finalizar sus revisiones como copia de seguridad."
-            )
-            
-        with col_res2:
-            archivo_subido = st.file_uploader("📤 Restaurar Cierres desde Respaldo", type=["json"], key="uploader_lock_backup")
-            if archivo_subido is not None:
-                contenido = archivo_subido.read().decode("utf-8")
-                if lock_mgr.importar_respaldo_json(contenido):
-                    st.success("✅ Cierres restaurados exitosamente.")
+        if not periodos:
+            periodos = [datetime.now().strftime('%Y-%m')]
+
+        periodo_sel = st.selectbox("🗓️ Seleccionar Período:", periodos)
+
+        # Estado del período
+        estado_actual = lock_mgr.obtener_estado_periodo(periodo_sel, usuario=usuario_actual)
+        es_editable = lock_mgr.es_editable(periodo_sel, rol_actual, usuario=usuario_actual)
+
+        col_est1, col_est2, col_est3 = st.columns([2, 2, 3])
+        col_est1.metric("Estado Actual", estado_actual)
+
+        with col_est2:
+            if st.button("▶️ Marcar EN PROCESO"):
+                res = lock_mgr.cambiar_estado(periodo_sel, "EN_PROCESO", usuario_actual, rol_actual, usuario_actual)
+                if res["exito"]:
+                    st.success(res["mensaje"])
                     st.rerun()
                 else:
-                    st.error("❌ El archivo subido no es válido.")
+                    st.error(res["mensaje"])
 
-    st.divider()
+        with col_est3:
+            if st.button("🔒 FINALIZAR Período", type="primary"):
+                res = lock_mgr.cambiar_estado(periodo_sel, "FINALIZADO", usuario_actual, rol_actual, usuario_actual)
+                if res["exito"]:
+                    audit_log.registrar_evento(usuario_actual, usuario_actual, "FINALIZAR_PERIODO", "Aprobaciones", {"periodo": periodo_sel})
+                    st.success(res["mensaje"])
+                    st.rerun()
+                else:
+                    st.error(res["mensaje"])
 
-    tab_excepciones, tab_canje_masivo, tab_regularizar = st.tabs([
-        "🚨 Excepciones Automáticas", 
-        "⚖️ Canje Masivo (Bolsa HE x Faltas)", 
-        "➕ Regularizar Olvido Marcación"
-    ])
+        # Procesamiento
+        df_bio_periodo = df_bio[df_bio['dt_temp'].dt.strftime('%Y-%m') == periodo_sel].copy()
+        df_resultado = run_cached_attendance_processing(df_bio_periodo, df_params, df_emp, nov_mgr)
+        df_excepciones = run_cached_exceptions(df_resultado)
+        df_canje_resumen = run_cached_canje(df_resultado)
 
-    try:
-        df_params = cached_load_sheet_data("05_Parametros_y_Reglas")
-        try:
-            df_emp = cached_load_sheet_data("01_Maestro_Empleados")
-        except Exception:
-            df_emp = None
+        # Filtrar por supervisor si aplica
+        if empleados_permitidos:
+            df_resultado = filter_dataframe_by_supervisor(df_resultado, empleados_permitidos)
+            if not df_excepciones.empty:
+                df_excepciones = filter_dataframe_by_supervisor(df_excepciones, empleados_permitidos)
+            if df_canje_resumen is not None and not df_canje_resumen.empty:
+                df_canje_resumen = filter_dataframe_by_supervisor(df_canje_resumen, empleados_permitidos)
 
-        df_bio_periodo = df_bio[df_bio['dt_temp'].dt.strftime('%Y-%m') == periodo_sel].copy() if 'dt_temp' in df_bio.columns else df_bio
+        tab_exc, tab_canje_masivo, tab_regularizar = st.tabs(["📋 Excepciones", "⚖️ Canje Masivo", "🛠️ Regularización"])
 
-        df_res = run_cached_attendance_processing(df_bio_periodo, df_params, df_emp, nov_mgr)
-        df_excepciones = run_cached_exceptions(df_res)
-        df_canje_resumen = run_cached_canje(df_res)
-
-        df_excepciones = filter_dataframe_by_supervisor(df_excepciones, 'Nombre', empleados_permitidos, rol_actual)
-        df_canje_resumen = filter_dataframe_by_supervisor(df_canje_resumen, 'Nombre', empleados_permitidos, rol_actual)
-
-    except Exception as e:
-        df_excepciones = pd.DataFrame()
-        df_canje_resumen = pd.DataFrame()
-        st.warning(f"No se pudieron procesar las excepciones para el período {periodo_sel}: {e}")
-
-    # TAB 1: EXCEPCIONES AUTOMÁTICAS
-    with tab_excepciones:
-        if df_excepciones is not None and not df_excepciones.empty:
+        # TAB 1: EXCEPCIONES
+        with tab_exc:
             st.subheader(f"Excepciones Detectadas ({periodo_sel})")
 
             if not es_editable:
                 st.info("🔒 **Edición Bloqueada:** Para habilitar la modificación de decisiones, presione el botón **'▶️ Marcar EN PROCESO'** arriba.")
 
-            col_f1, col_f2 = st.columns(2)
-            with col_f1:
-                tipo_exc = ["Todos"] + list(df_excepciones['Tipo Excepción'].unique())
-                sel_tipo = st.selectbox("Filtrar por Tipo de Excepción:", tipo_exc)
-            with col_f2:
-                emps = ["Todos"] + list(df_excepciones['Nombre'].unique())
-                sel_emp_exc = st.selectbox("Filtrar por Empleado:", emps)
+            if not df_excepciones.empty:
+                col_f1, col_f2 = st.columns(2)
+                with col_f1:
+                    tipo_exc = ["Todos"] + list(df_excepciones['Tipo Excepción'].unique())
+                    sel_tipo = st.selectbox("Filtrar por Tipo de Excepción:", tipo_exc)
+                with col_f2:
+                    emps = ["Todos"] + list(df_excepciones['Nombre'].unique())
+                    sel_emp_exc = st.selectbox("Filtrar por Empleado:", emps)
 
-            df_fil_exc = df_excepciones.copy()
-            if sel_tipo != "Todos":
-                df_fil_exc = df_fil_exc[df_fil_exc['Tipo Excepción'] == sel_tipo]
-            if sel_emp_exc != "Todos":
-                df_fil_exc = df_fil_exc[df_fil_exc['Nombre'] == sel_emp_exc]
+                df_fil_exc = df_excepciones.copy()
+                if sel_tipo != "Todos":
+                    df_fil_exc = df_fil_exc[df_fil_exc['Tipo Excepción'] == sel_tipo]
+                if sel_emp_exc != "Todos":
+                    df_fil_exc = df_fil_exc[df_fil_exc['Nombre'] == sel_emp_exc]
 
-            m1, m2, m3, m4 = st.columns(4)
-            m1.metric("Excepciones Totales", len(df_fil_exc))
-            m2.metric("Faltas Totales", len(df_fil_exc[df_fil_exc['Tipo Excepción'] == 'Falta / Omisión Marcación']))
-            m3.metric("Sol. Horas Extras / Dom", len(df_fil_exc[df_fil_exc['Tipo Excepción'].str.contains('Horas Extras')]))
-            m4.metric("Desfases Ingreso", len(df_fil_exc[df_fil_exc['Tipo Excepción'] == 'Desfase Horario Ingreso']))
+                m1, m2, m3, m4 = st.columns(4)
+                m1.metric("Excepciones Totales", len(df_fil_exc))
+                m2.metric("Faltas Totales", len(df_fil_exc[df_fil_exc['Tipo Excepción'] == 'Falta / Omisión Marcación']))
+                m3.metric("Sol. Horas Extras / Dom", len(df_fil_exc[df_fil_exc['Tipo Excepción'].str.contains('Horas Extras', na=False)]))
+                m4.metric("Desfases Ingreso", len(df_fil_exc[df_fil_exc['Tipo Excepción'] == 'Desfase Horario Ingreso']))
 
-            if not es_editable:
-                cols_deshabilitadas_exc = list(df_fil_exc.columns)
-            else:
-                cols_deshabilitadas_exc = [c for c in ["Carnet_Identidad", "ID", "Nombre", "Fecha", "Tipo Excepción", "Detalle Excepción", "Valor a Revisar"] if c in df_fil_exc.columns]
-
-            df_edited_exc = st.data_editor(
-                df_fil_exc,
-                use_container_width=True,
-                hide_index=True,
-                disabled=cols_deshabilitadas_exc,
-                column_config={
-                    "Decisión Supervisor": st.column_config.SelectboxColumn(
-                        "Decisión",
-                        options=["Pendiente", "Aprobado (Pago)", "Acumular (Próx. Mes)", "Rechazado", "Justificado", "Canjeado"],
-                        required=True
-                    ),
-                    "Tipo Falta": st.column_config.SelectboxColumn(
-                        "Tipo Falta (Para Contabilidad)",
-                        options=["N/A", "Justificada", "Injustificada"],
-                        required=True
-                    ),
-                    "Observaciones": st.column_config.TextColumn("Observaciones / Motivo", width="medium")
-                }
-            )
-
-            st.divider()
-            st.subheader("📥 Exportación Profesional a Excel")
-            
-            archivo_path = f"Aprobaciones_{periodo_sel}_{usuario_actual}.xlsx"
-            ExcelExporter.exportar_aprobaciones(df_edited_exc.to_dict('records'), periodo_sel, archivo_path)
-            
-            with open(archivo_path, "rb") as f:
-                st.download_button(
-                    label="📥 Descargar Aprobaciones Procesadas (Excel)",
-                    data=f,
-                    file_name=f"Aprobaciones_Supervisores_{periodo_sel}_{usuario_actual}.xlsx",
-                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-                )
-        else:
-            st.success("🎉 No se detectaron excepciones pendientes para el personal asignado en este período.")
-
-    # TAB 2: CANJE MASIVO
-    with tab_canje_masivo:
-        st.subheader("⚖️ Canje Masivo de Horas Extras por Faltas")
-        if df_canje_resumen is not None and not df_canje_resumen.empty:
-            if not es_editable:
-                st.info("🔒 **Edición Bloqueada:** Para realizar canjes, presione el botón **'▶️ Marcar EN PROCESO'** arriba.")
-
-            if not es_editable:
-                cols_deshabilitadas_canje = list(df_canje_resumen.columns)
-            else:
-                cols_deshabilitadas_canje = [c for c in ["Carnet_Identidad", "ID", "Nombre", "Turno Dominante", "Horas Costo por Día", "Bolsa HE Acumulada (hrs)", "Días Máx. Canjeables", "Faltas Registradas"] if c in df_canje_resumen.columns]
-
-            df_edited_canje = st.data_editor(
-                df_canje_resumen,
-                use_container_width=True,
-                hide_index=True,
-                disabled=cols_deshabilitadas_canje,
-                column_config={
-                    "Carnet_Identidad": st.column_config.Column(disabled=True),
-                    "ID": st.column_config.Column(disabled=True),
-                    "Nombre": st.column_config.Column(disabled=True),
-                    "Turno Dominante": st.column_config.Column(disabled=True),
-                    "Horas Costo por Día": st.column_config.NumberColumn("Costo Día (hrs)", disabled=True, format="%.0f hrs"),
-                    "Bolsa HE Acumulada (hrs)": st.column_config.NumberColumn("Bolsa HE (hrs)", disabled=True, format="%.2f hrs"),
-                    "Días Máx. Canjeables": st.column_config.NumberColumn("Días Máx.", disabled=True, format="%d días"),
-                    "Faltas Registradas": st.column_config.NumberColumn("Faltas Reg.", disabled=True, format="%d días"),
-                    "Días a Canjear (Aplicar)": st.column_config.NumberColumn("Días a Canjear", min_value=0, max_value=10, step=1),
-                    "Estado Canje": st.column_config.SelectboxColumn("Estado Canje", options=["Sin Aplicar", "Canje Aplicado", "Rechazado por Supervisor"], required=True)
-                }
-            )
-
-            dias_totales_canjeados = df_edited_canje['Días a Canjear (Aplicar)'].sum() if 'Días a Canjear (Aplicar)' in df_edited_canje.columns else 0
-            c_m1, c_m2 = st.columns(2)
-            c_m1.metric("Personal con Bolsa HE / Faltas", len(df_edited_canje))
-            c_m2.metric("Total Días Canjeados", f"{int(dias_totales_canjeados)} días")
-        else:
-            st.info("No hay empleados a su cargo con saldo de horas extras o faltas en este período.")
-
-    # TAB 3: REGULARIZACIÓN MANUAL
-    with tab_regularizar:
-        st.subheader("Regularizar Marcación Faltante u Olvido")
-        with st.form("form_regularizacion_panel"):
-            r_col1, r_col2 = st.columns(2)
-            with r_col1:
-                id_emp_reg = clean_ci(st.text_input("ID / Carnet Empleado:*"))
-                nombre_emp_reg = st.text_input("Nombre Completo Empleado:*")
-                fecha_reg = st.date_input("Fecha de la Marcación Omisa:")
-            with r_col2:
-                tipo_marcacion = st.selectbox("Tipo de Marcación Faltante:", ["Entrada Omisa", "Salida Omisa", "Jornada Completa Omisa"])
-                hora_reg = st.time_input("Hora Aprobada de Marcación:")
-                motivo_reg = st.text_area("Motivo / Justificación del Supervisor:*")
-
-            submitted = st.form_submit_button("✅ Registrar Regularización")
-            if submitted:
-                if not id_emp_reg or not nombre_emp_reg or not motivo_reg:
-                    st.warning("Por favor complete todos los campos obligatorios (*).")
-                elif not es_editable:
-                    st.error("No se pueden registrar regularizaciones cuando el período no está EN PROCESO.")
+                if not es_editable:
+                    cols_deshabilitadas_exc = list(df_fil_exc.columns)
                 else:
-                    audit_log.registrar_evento(
-                        usuario_pin=usuario_actual,
-                        usuario_nombre=usuario_actual,
-                        accion="REGULARIZACION_OMISION",
-                        modulo="Aprobaciones",
-                        detalles={"empleado": nombre_emp_reg, "ci": id_emp_reg, "fecha": str(fecha_reg), "tipo": tipo_marcacion, "motivo": motivo_reg}
+                    cols_deshabilitadas_exc = [c for c in ["Carnet_Identidad", "ID", "Nombre", "Fecha", "Tipo Excepción", "Detalle Excepción", "Valor a Revisar"] if c in df_fil_exc.columns]
+
+                df_edited_exc = st.data_editor(
+                    df_fil_exc,
+                    use_container_width=True,
+                    hide_index=True,
+                    disabled=cols_deshabilitadas_exc,
+                    column_config={
+                        "Decisión Supervisor": st.column_config.SelectboxColumn(
+                            "Decisión",
+                            options=["Pendiente", "Aprobado (Pago)", "Acumular (Próx. Mes)", "Rechazado", "Justificado", "Canjeado"],
+                            required=True
+                        ),
+                        "Tipo Falta": st.column_config.SelectboxColumn(
+                            "Tipo Falta (Para Contabilidad)",
+                            options=["N/A", "Justificada", "Injustificada"],
+                            required=True
+                        ),
+                        "Observaciones": st.column_config.TextColumn("Observaciones / Motivo", width="medium")
+                    }
+                )
+
+                st.divider()
+                st.subheader("📥 Exportación Profesional a Excel")
+                
+                archivo_path = f"Aprobaciones_{periodo_sel}_{usuario_actual}.xlsx"
+                ExcelExporter.exportar_aprobaciones(df_edited_exc.to_dict('records'), periodo_sel, archivo_path)
+                
+                with open(archivo_path, "rb") as f:
+                    st.download_button(
+                        label="📥 Descargar Aprobaciones Procesadas (Excel)",
+                        data=f,
+                        file_name=f"Aprobaciones_Supervisores_{periodo_sel}_{usuario_actual}.xlsx",
+                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
                     )
-                    st.success(f"Regularización registrada para {nombre_emp_reg} el día {fecha_reg}.")
+            else:
+                st.success("🎉 No se detectaron excepciones pendientes para el personal asignado en este período.")
+
+        # TAB 2: CANJE MASIVO
+        with tab_canje_masivo:
+            st.subheader("⚖️ Canje Masivo de Horas Extras por Faltas")
+            if df_canje_resumen is not None and not df_canje_resumen.empty:
+                if not es_editable:
+                    st.info("🔒 **Edición Bloqueada:** Para realizar canjes, presione el botón **'▶️ Marcar EN PROCESO'** arriba.")
+
+                if not es_editable:
+                    cols_deshabilitadas_canje = list(df_canje_resumen.columns)
+                else:
+                    cols_deshabilitadas_canje = [c for c in ["Carnet_Identidad", "ID", "Nombre", "Turno Dominante", "Horas Costo por Día", "Bolsa HE Acumulada (hrs)", "Días Máx. Canjeables", "Faltas Registradas"] if c in df_canje_resumen.columns]
+
+                df_edited_canje = st.data_editor(
+                    df_canje_resumen,
+                    use_container_width=True,
+                    hide_index=True,
+                    disabled=cols_deshabilitadas_canje,
+                    column_config={
+                        "Carnet_Identidad": st.column_config.Column(disabled=True),
+                        "ID": st.column_config.Column(disabled=True),
+                        "Nombre": st.column_config.Column(disabled=True),
+                        "Turno Dominante": st.column_config.Column(disabled=True),
+                        "Horas Costo por Día": st.column_config.NumberColumn("Costo Día (hrs)", disabled=True, format="%.0f hrs"),
+                        "Bolsa HE Acumulada (hrs)": st.column_config.NumberColumn("Bolsa HE (hrs)", disabled=True, format="%.2f hrs"),
+                        "Días Máx. Canjeables": st.column_config.NumberColumn("Días Máx.", disabled=True, format="%d días"),
+                        "Faltas Registradas": st.column_config.NumberColumn("Faltas Reg.", disabled=True, format="%d días"),
+                        "Días a Canjear (Aplicar)": st.column_config.NumberColumn("Días a Canjear", min_value=0, max_value=10, step=1),
+                        "Estado Canje": st.column_config.SelectboxColumn("Estado Canje", options=["Sin Aplicar", "Canje Aplicado", "Rechazado por Supervisor"], required=True)
+                    }
+                )
+
+                dias_totales_canjeados = df_edited_canje['Días a Canjear (Aplicar)'].sum() if 'Días a Canjear (Aplicar)' in df_edited_canje.columns else 0
+                c_m1, c_m2 = st.columns(2)
+                c_m1.metric("Personal con Bolsa HE / Faltas", len(df_edited_canje))
+                c_m2.metric("Total Días Canjeados", f"{int(dias_totales_canjeados)} días")
+            else:
+                st.info("No hay empleados a su cargo con saldo de horas extras o faltas en este período.")
+
+        # TAB 3: REGULARIZACIÓN MANUAL
+        with tab_regularizar:
+            st.subheader("Regularizar Marcación Faltante u Olvido")
+            with st.form("form_regularizacion_panel"):
+                r_col1, r_col2 = st.columns(2)
+                with r_col1:
+                    id_emp_reg = clean_ci(st.text_input("ID / Carnet Empleado:*"))
+                    nombre_emp_reg = st.text_input("Nombre Completo Empleado:*")
+                    fecha_reg = st.date_input("Fecha de la Marcación Omisa:")
+                with r_col2:
+                    tipo_marcacion = st.selectbox("Tipo de Marcación Faltante:", ["Entrada Omisa", "Salida Omisa", "Jornada Completa Omisa"])
+                    hora_reg = st.time_input("Hora Aprobada de Marcación:")
+                    motivo_reg = st.text_area("Motivo / Justificación del Supervisor:*")
+
+                submitted = st.form_submit_button("✅ Registrar Regularización")
+                if submitted:
+                    if not id_emp_reg or not nombre_emp_reg or not motivo_reg:
+                        st.warning("Por favor complete todos los campos obligatorios (*).")
+                    elif not es_editable:
+                        st.error("No se pueden registrar regularizaciones cuando el período no está EN PROCESO.")
+                    else:
+                        audit_log.registrar_evento(
+                            usuario_pin=usuario_actual,
+                            usuario_nombre=usuario_actual,
+                            accion="REGULARIZACION_OMISION",
+                            modulo="Aprobaciones",
+                            detalles={"empleado": nombre_emp_reg, "ci": id_emp_reg, "fecha": str(fecha_reg), "tipo": tipo_marcacion, "motivo": motivo_reg}
+                        )
+                        st.success(f"Regularización registrada para {nombre_emp_reg} el día {fecha_reg}.")
+
+    except Exception as e:
+        st.error(f"Error en el módulo de Aprobaciones: {e}")
 
 # -----------------------------------------------------------------------------
 # 5. VALORES MONETIZADOS
