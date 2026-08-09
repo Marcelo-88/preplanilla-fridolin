@@ -227,7 +227,7 @@ elif opcion == "⏱️ Importación Biométrico":
         st.error(f"Error cargando biométrico: {e}")
 
 # -----------------------------------------------------------------------------
-# 3. NOVEDADES Y PERMISOS  (CORREGIDO - Lista desplegable)
+# 3. NOVEDADES Y PERMISOS
 # -----------------------------------------------------------------------------
 elif opcion == "📝 Novedades y Permisos":
     st.header("📝 Gestión de Novedades, Permisos y Licencias")
@@ -241,7 +241,6 @@ elif opcion == "📝 Novedades y Permisos":
         c_ci = next((cols[k] for k in cols if any(x in k for x in ['carnet', 'ci', 'id'])), None)
 
         if c_nombre and c_ci:
-            # Solo personal asignado al supervisor (o todos si es jefe)
             if empleados_permitidos:
                 df_filtrado = df_emp[df_emp[c_nombre].astype(str).str.strip().isin(empleados_permitidos)]
             else:
@@ -307,7 +306,7 @@ elif opcion == "📝 Novedades y Permisos":
         st.info("Aún no hay novedades registradas.")
 
 # -----------------------------------------------------------------------------
-# 4. APROBACIONES SUPERVISORES
+# 4. APROBACIONES SUPERVISORES (CORREGIDO)
 # -----------------------------------------------------------------------------
 elif opcion == "✅ Aprobaciones Supervisores":
     st.header("✅ Panel de Aprobaciones de Supervisores")
@@ -357,13 +356,13 @@ elif opcion == "✅ Aprobaciones Supervisores":
         df_excepciones = run_cached_exceptions(df_resultado)
         df_canje_resumen = run_cached_canje(df_resultado)
 
-        # Filtrar por supervisor si aplica
-        if empleados_permitidos:
-            df_resultado = filter_dataframe_by_supervisor(df_resultado, empleados_permitidos)
-            if not df_excepciones.empty:
-                df_excepciones = filter_dataframe_by_supervisor(df_excepciones, empleados_permitidos)
+        # Filtrar por supervisor (CORREGIDO - parámetros correctos)
+        if empleados_permitidos and rol_actual != "Jefe de Producción":
+            df_resultado = filter_dataframe_by_supervisor(df_resultado, "Nombre", empleados_permitidos, rol_actual)
+            if df_excepciones is not None and not df_excepciones.empty:
+                df_excepciones = filter_dataframe_by_supervisor(df_excepciones, "Nombre", empleados_permitidos, rol_actual)
             if df_canje_resumen is not None and not df_canje_resumen.empty:
-                df_canje_resumen = filter_dataframe_by_supervisor(df_canje_resumen, empleados_permitidos)
+                df_canje_resumen = filter_dataframe_by_supervisor(df_canje_resumen, "Nombre", empleados_permitidos, rol_actual)
 
         tab_exc, tab_canje_masivo, tab_regularizar = st.tabs(["📋 Excepciones", "⚖️ Canje Masivo", "🛠️ Regularización"])
 
@@ -374,7 +373,7 @@ elif opcion == "✅ Aprobaciones Supervisores":
             if not es_editable:
                 st.info("🔒 **Edición Bloqueada:** Para habilitar la modificación de decisiones, presione el botón **'▶️ Marcar EN PROCESO'** arriba.")
 
-            if not df_excepciones.empty:
+            if df_excepciones is not None and not df_excepciones.empty:
                 col_f1, col_f2 = st.columns(2)
                 with col_f1:
                     tipo_exc = ["Todos"] + list(df_excepciones['Tipo Excepción'].unique())
@@ -514,13 +513,11 @@ elif opcion == "💵 Valores Monetizados":
     st.header("💵 Gestión de Valores Monetizados y Tarifas de Jornaleros")
     st.caption("Módulo exclusivo para Superusuarios. Permite configurar y aprobar tarifas de jornaleros con almacenamiento en disco.")
 
-    # Verificación de Rol
     roles_super = ["RESPONSABLE_OPERACIONES", "JEFE_PRODUCCION", "Jefe de Producción", "ADMINISTRADOR", "Superusuario"]
     if rol_actual not in roles_super:
         st.error("⛔ Acceso denegado: Esta pantalla requiere privilegios de Superusuario.")
         st.stop()
 
-    # Cargar Períodos Disponibles desde Biométrico o Default
     try:
         df_bio = cached_load_sheet_data("02_Importacion_Biometrico")
         df_bio['dt_temp'] = pd.to_datetime(df_bio.iloc[:, 2], dayfirst=True, errors='coerce')
@@ -531,7 +528,6 @@ elif opcion == "💵 Valores Monetizados":
     col_p_tarifa, _ = st.columns([2, 2])
     periodo_tarifa_sel = col_p_tarifa.selectbox("🗓️ Seleccionar Período/Gestión de Tarifas:", options=periodos_tarifas)
 
-    # Cargar Configuración del Período de Forma Persistente
     config = obtener_config_periodo_persistent(periodo_tarifa_sel)
 
     st.subheader(f"1. Tarifas Base Globales ({periodo_tarifa_sel})")
@@ -554,13 +550,12 @@ elif opcion == "💵 Valores Monetizados":
         }
         if guardar_config_periodo_persistent(periodo_tarifa_sel, config):
             audit_log.registrar_evento(usuario_actual, usuario_actual, "ACTUALIZAR_TARIFAS_BASE", "Tarifas", {"periodo": periodo_tarifa_sel, "tarifas": config["tarifas_base"]})
-            st.success(f"✅ Tarifas base guardadas exitosamente en disco para la gestión {periodo_tarifa_sel}")
+            st.success(f"✅ Tarifas base guardadas exitosamente para la gestión {periodo_tarifa_sel}")
 
     st.divider()
 
     st.subheader(f"2. Excepciones Tarifarias por Empleado ({periodo_tarifa_sel})")
 
-    # Cargar Maestro de Empleados y Filtrar ÚNICAMENTE JORNALEROS
     dict_jornaleros = {}
     try:
         df_emp_all = cached_load_sheet_data("01_Maestro_Empleados")
@@ -592,7 +587,6 @@ elif opcion == "💵 Valores Monetizados":
         ("nocturno_1_5", "Nocturno 1.5")
     ], format_func=lambda x: x[1])
 
-    # Carga automática del monto guardado si existe previamente
     excepciones_actuales = config.get("excepciones", {})
     monto_guardado = excepciones_actuales.get(ci_vinculado, {}).get(tipo_in[0], 0.0)
 
@@ -608,7 +602,7 @@ elif opcion == "💵 Valores Monetizados":
         if ci_vinculado:
             actualizar_excepcion_empleado_persistent(ci_vinculado, tipo_in[0], monto_in, periodo=periodo_tarifa_sel)
             audit_log.registrar_evento(usuario_actual, usuario_actual, "EXCEPCION_TARIFA", "Tarifas", {"periodo": periodo_tarifa_sel, "CI": ci_vinculado, "nombre": nombre_sel, "tipo": tipo_in[0], "monto": monto_in})
-            st.success(f"Excepción guardada en disco para {nombre_sel} (CI: {ci_vinculado}) con el monto {monto_in} Bs.")
+            st.success(f"Excepción guardada para {nombre_sel} (CI: {ci_vinculado}) con el monto {monto_in} Bs.")
             st.rerun()
         else:
             st.warning("No se pudo obtener el CI del jornalero seleccionado.")
@@ -636,9 +630,8 @@ elif opcion == "💵 Valores Monetizados":
             st.info(f"Excepciones eliminadas para CI: {ci_del}")
             st.rerun()
 
-    # --- PANEL DE RESPALDO Y RESTAURACIÓN DE TARIFAS ---
     with st.expander("🛡️ Resguardo y Respaldo de Tarifas (.json)"):
-        st.caption("Descargue o restaure la configuración de tarifas base y excepciones registradas en disco:")
+        st.caption("Descargue o restaure la configuración de tarifas base y excepciones:")
         c_tar_exp, c_tar_imp = st.columns(2)
         
         with c_tar_exp:
