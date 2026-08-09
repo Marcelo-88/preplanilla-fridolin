@@ -1,6 +1,6 @@
 import streamlit as st
 import pandas as pd
-from datetime import datetime
+from datetime import datetime, time
 
 from modules.data_loader import load_sheet_data
 from modules.attendance_processor import process_attendance, detect_exceptions
@@ -54,7 +54,7 @@ opcion = st.sidebar.radio("Seleccione una vista:", [
     "📜 Bitácora de Auditoría"
 ])
 st.sidebar.divider()
-st.sidebar.caption("v2.6.2 - Guardado con formulario + depuración")
+st.sidebar.caption("v2.7 - Regularización de marcaciones agregada")
 
 # 1. PARÁMETROS
 if opcion == "📊 Parámetros y Reglas":
@@ -124,7 +124,7 @@ elif opcion == "📝 Novedades y Permisos":
     else:
         st.info("Sin novedades registradas")
 
-# 4. APROBACIONES
+# 4. APROBACIONES + REGULARIZACIÓN
 elif opcion == "✅ Aprobaciones Supervisores":
     st.header("✅ Panel de Aprobaciones de Supervisores")
 
@@ -153,6 +153,7 @@ elif opcion == "✅ Aprobaciones Supervisores":
 
         st.divider()
 
+        # ---------- CARGAR EXCEPCIONES ----------
         if st.button("🔄 Cargar Excepciones del Período", type="primary"):
             with st.spinner("Procesando marcaciones..."):
                 df_params = cached_load_sheet_data("05_Parametros_y_Reglas")
@@ -187,7 +188,7 @@ elif opcion == "✅ Aprobaciones Supervisores":
                             for col in df_exc.columns:
                                 if 'decisión' in str(col).lower() or 'decision' in str(col).lower():
                                     df_exc[col] = df_exc['_key'].map(mapa_dec).fillna(df_exc[col])
-                                if 'tipo falta' in str(col).lower() or 'tipo_falta' in str(col).lower():
+                                if 'tipo falta' in str(col).lower():
                                     df_exc[col] = df_exc['_key'].map(mapa_tf).fillna(df_exc[col])
 
                             df_exc.drop(columns=['_key'], inplace=True, errors='ignore')
@@ -196,6 +197,7 @@ elif opcion == "✅ Aprobaciones Supervisores":
                 st.session_state['periodo_cargado'] = periodo_sel
                 st.success(f"Se cargaron {len(df_exc) if df_exc is not None else 0} excepciones.")
 
+        # ---------- TABLA DE EXCEPCIONES + GUARDADO ----------
         if 'df_exc' in st.session_state and st.session_state.get('periodo_cargado') == periodo_sel:
             df_exc = st.session_state['df_exc']
 
@@ -216,7 +218,6 @@ elif opcion == "✅ Aprobaciones Supervisores":
 
                 st.caption(f"Mostrando {len(df_fil)} de {len(df_exc)} excepciones")
 
-                # === FORMULARIO PARA GUARDAR (más estable) ===
                 with st.form("form_guardar_decisiones"):
                     col_decision = next((c for c in df_fil.columns if 'decisión' in str(c).lower() or 'decision' in str(c).lower()), None)
                     col_tipo_falta = next((c for c in df_fil.columns if 'tipo falta' in str(c).lower()), None)
@@ -245,7 +246,7 @@ elif opcion == "✅ Aprobaciones Supervisores":
                     submitted = st.form_submit_button("💾 Guardar Decisiones", type="primary", disabled=not es_editable)
 
                     if submitted:
-                        st.write("⏳ Procesando guardado...")  # Mensaje de depuración
+                        st.write("⏳ Procesando guardado...")
 
                         col_ci = next((c for c in df_edited.columns if 'carnet' in str(c).lower() or str(c).upper() in ['ID','CI']), None)
                         col_nom = next((c for c in df_edited.columns if 'nombre' in str(c).lower()), None)
@@ -254,10 +255,8 @@ elif opcion == "✅ Aprobaciones Supervisores":
                         col_dec = next((c for c in df_edited.columns if 'decisión' in str(c).lower() or 'decision' in str(c).lower()), None)
                         col_tf = next((c for c in df_edited.columns if 'tipo falta' in str(c).lower()), None)
 
-                        st.write(f"Columnas detectadas → CI: {col_ci} | Fecha: {col_fec} | Decisión: {col_dec}")
-
                         if not col_ci or not col_fec:
-                            st.error(f"No se detectaron columnas clave. Columnas disponibles: {list(df_edited.columns)}")
+                            st.error(f"No se detectaron columnas clave. Columnas: {list(df_edited.columns)}")
                         else:
                             guardadas = 0
                             errores = []
@@ -299,8 +298,65 @@ elif opcion == "✅ Aprobaciones Supervisores":
         else:
             st.info("Haz clic en **Cargar Excepciones del Período** para ver las anomalías.")
 
+        # ---------- REGULARIZACIÓN (Método 2) ----------
+        st.divider()
+        st.subheader("🛠️ Regularización de Marcaciones Faltantes")
+        st.caption("Use esta sección cuando el trabajador sí asistió pero faltó una o ambas marcaciones.")
+
+        # Lista de empleados del supervisor
+        lista_empleados = empleados_permitidos if empleados_permitidos else []
+        if not lista_empleados:
+            try:
+                df_emp = cached_load_sheet_data("01_Maestro_Empleados")
+                col_nom = next((c for c in df_emp.columns if 'nombre' in str(c).lower()), None)
+                if col_nom:
+                    lista_empleados = sorted(df_emp[col_nom].astype(str).str.strip().unique().tolist())
+            except:
+                lista_empleados = []
+
+        with st.form("form_regularizacion"):
+            col1, col2 = st.columns(2)
+            with col1:
+                emp_reg = st.selectbox("Empleado*", options=lista_empleados if lista_empleados else ["(Cargar empleados)"])
+                fecha_reg = st.date_input("Fecha de la marcación omisa*")
+                tipo_reg = st.selectbox("Tipo de marcación faltante*", [
+                    "Entrada Omisa",
+                    "Salida Omisa",
+                    "Jornada Completa Omisa (Entrada + Salida)"
+                ])
+            with col2:
+                hora_entrada = st.time_input("Hora real de Entrada", value=time(7, 0))
+                hora_salida = st.time_input("Hora real de Salida", value=time(15, 30))
+                motivo_reg = st.text_area("Motivo / Justificación del Supervisor*")
+
+            submitted_reg = st.form_submit_button("✅ Registrar Regularización", type="primary")
+
+            if submitted_reg:
+                if not emp_reg or not motivo_reg:
+                    st.warning("Complete los campos obligatorios (*).")
+                elif not es_editable:
+                    st.error("El período debe estar EN PROCESO para regularizar.")
+                else:
+                    # Registrar en bitácora
+                    audit_log.registrar_evento(
+                        usuario_actual,
+                        usuario_actual,
+                        "REGULARIZACION_OMISION",
+                        "Aprobaciones",
+                        {
+                            "empleado": emp_reg,
+                            "fecha": str(fecha_reg),
+                            "tipo": tipo_reg,
+                            "hora_entrada": str(hora_entrada),
+                            "hora_salida": str(hora_salida),
+                            "motivo": motivo_reg
+                        }
+                    )
+                    st.success(f"✅ Regularización registrada para **{emp_reg}** el {fecha_reg}.")
+                    st.info("La regularización quedó en la bitácora. En la próxima versión se recalculará automáticamente la jornada.")
+
     except Exception as e:
-        st.error(f"Error general: {e}")
+        st.error(f"Error: {e}")
 
 # 5. CANJE
 elif opcion == "🔄 Canje de Horas":
