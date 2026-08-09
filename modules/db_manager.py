@@ -5,7 +5,7 @@ from typing import Dict, Any, List, Optional
 import json
 
 class DBManager:
-    """Capa de persistencia usando llamadas HTTP directas a Supabase (más estable)."""
+    """Capa de persistencia usando llamadas HTTP directas a Supabase."""
 
     def __init__(self):
         self.url = st.secrets["supabase"]["url"].rstrip("/")
@@ -20,7 +20,7 @@ class DBManager:
     def _request(self, method: str, path: str, json_data: dict = None, params: dict = None):
         full_url = f"{self.url}/rest/v1/{path}"
         try:
-            with httpx.Client(timeout=15.0) as client:
+            with httpx.Client(timeout=20.0) as client:
                 if method == "GET":
                     r = client.get(full_url, headers=self.headers, params=params)
                 elif method == "POST":
@@ -65,13 +65,12 @@ class DBManager:
             "motivo_desbloqueo": motivo or ""
         }
         
-        # Intentamos upsert (on_conflict)
         headers_upsert = self.headers.copy()
         headers_upsert["Prefer"] = "resolution=merge-duplicates,return=representation"
         
         full_url = f"{self.url}/rest/v1/period_locks"
         try:
-            with httpx.Client(timeout=15.0) as client:
+            with httpx.Client(timeout=20.0) as client:
                 r = client.post(full_url, headers=headers_upsert, json=data)
                 if r.status_code >= 400:
                     return {"exito": False, "mensaje": f"Error HTTP {r.status_code}: {r.text}"}
@@ -133,6 +132,33 @@ class DBManager:
             "select": "*",
             "order": "id.desc",
             "limit": str(limite)
+        })
+        if isinstance(res, list):
+            return res
+        return []
+
+    # ------------------------------------------------------------------
+    # DECISIONES DEL SUPERVISOR (NUEVO)
+    # ------------------------------------------------------------------
+    def guardar_decision(self, data: Dict[str, Any]) -> Dict[str, Any]:
+        """Guarda o actualiza una decisión del supervisor (upsert)."""
+        headers_upsert = self.headers.copy()
+        headers_upsert["Prefer"] = "resolution=merge-duplicates,return=representation"
+        
+        full_url = f"{self.url}/rest/v1/decisiones_supervisor"
+        try:
+            with httpx.Client(timeout=20.0) as client:
+                r = client.post(full_url, headers=headers_upsert, json=data)
+                if r.status_code >= 400:
+                    return {"exito": False, "mensaje": f"Error HTTP {r.status_code}: {r.text}"}
+                return {"exito": True, "mensaje": "Decisión guardada"}
+        except Exception as e:
+            return {"exito": False, "mensaje": str(e)}
+
+    def obtener_decisiones_periodo(self, periodo: str) -> List[Dict[str, Any]]:
+        res = self._request("GET", "decisiones_supervisor", params={
+            "periodo": f"eq.{periodo}",
+            "select": "*"
         })
         if isinstance(res, list):
             return res
