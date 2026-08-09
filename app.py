@@ -1,11 +1,12 @@
 import streamlit as st
 import pandas as pd
 from datetime import datetime, time
-import re
+import io
 
 from modules.data_loader import load_sheet_data
 from modules.attendance_processor import process_attendance, detect_exceptions
 from modules.auth_permissions import render_user_selector, filter_dataframe_by_supervisor
+from modules.excel_exporter import ExcelExporter
 
 from modules.audit_logger import AuditLogger
 from modules.lock_manager import LockManager
@@ -55,7 +56,7 @@ opcion = st.sidebar.radio("Seleccione una vista:", [
     "📜 Bitácora de Auditoría"
 ])
 st.sidebar.divider()
-st.sidebar.caption("v2.10 - Pre-Planilla básica")
+st.sidebar.caption("v2.11 - Exportación Excel oficial")
 
 # 1. PARÁMETROS
 if opcion == "📊 Parámetros y Reglas":
@@ -170,7 +171,6 @@ elif opcion == "✅ Aprobaciones Supervisores":
                         pass
 
                 if df_exc is not None and not df_exc.empty:
-                    # Filtrar regularizaciones
                     regs = db_mgr.obtener_regularizaciones_periodo(periodo_sel)
                     if regs:
                         df_reg = pd.DataFrame(regs)
@@ -183,7 +183,6 @@ elif opcion == "✅ Aprobaciones Supervisores":
                             df_exc = df_exc[~df_exc['_key'].isin(keys_reg)].copy()
                             df_exc.drop(columns=['_key'], inplace=True, errors='ignore')
 
-                    # Decisiones + Método 1
                     decisiones = db_mgr.obtener_decisiones_periodo(periodo_sel)
                     if decisiones and not df_exc.empty:
                         df_dec = pd.DataFrame(decisiones)
@@ -316,7 +315,6 @@ elif opcion == "✅ Aprobaciones Supervisores":
         else:
             st.info("Haz clic en **Cargar Excepciones del Período**.")
 
-        # Regularización Método 2
         st.divider()
         st.subheader("🛠️ Regularización de Marcaciones Faltantes")
         lista_empleados = empleados_permitidos if empleados_permitidos else []
@@ -440,10 +438,9 @@ elif opcion == "💵 Valores Monetizados":
     st.header("💵 Valores Monetizados")
     st.info("Módulo de tarifas.")
 
-# 7. PRE-PLANILLA (NUEVA)
+# 7. PRE-PLANILLA + EXPORTACIÓN EXCEL
 elif opcion == "📑 Pre-Planilla y Reportes":
     st.header("📑 Pre-Planilla Consolidada")
-    st.caption("Resumen de decisiones, regularizaciones y canjes del período")
 
     try:
         df_bio = cached_load_sheet_data("02_Importacion_Biometrico")
@@ -451,61 +448,86 @@ elif opcion == "📑 Pre-Planilla y Reportes":
         periodos = sorted(df_bio['dt_temp'].dt.strftime('%Y-%m').dropna().unique().tolist(), reverse=True) or [datetime.now().strftime('%Y-%m')]
         periodo_sel = st.selectbox("Período:", periodos, key="preplanilla_periodo")
 
-        # Cargar datos
+        estado = lock_mgr.obtener_estado_periodo(periodo_sel, usuario=usuario_actual)
+        st.info(f"**Estado del período:** {estado}")
+
+        # Resumen rápido
         decisiones = db_mgr.obtener_decisiones_periodo(periodo_sel)
         regularizaciones = db_mgr.obtener_regularizaciones_periodo(periodo_sel)
         canjes = db_mgr.obtener_canjes_periodo(periodo_sel)
-        novedades = nov_mgr.obtener_todas_novedades()
 
-        # Filtrar novedades del período (aproximado por fecha)
-        if novedades:
-            df_nov = pd.DataFrame(novedades)
-            # Filtro simple por mes si hay fechas
-            if 'fecha_inicio' in df_nov.columns:
-                df_nov = df_nov[df_nov['fecha_inicio'].astype(str).str.startswith(periodo_sel)]
-        else:
-            df_nov = pd.DataFrame()
-
-        st.subheader(f"Resumen del período {periodo_sel}")
-
-        col1, col2, col3, col4 = st.columns(4)
-        col1.metric("Decisiones guardadas", len(decisiones) if decisiones else 0)
+        col1, col2, col3 = st.columns(3)
+        col1.metric("Decisiones", len(decisiones) if decisiones else 0)
         col2.metric("Regularizaciones", len(regularizaciones) if regularizaciones else 0)
         col3.metric("Canjes", len(canjes) if canjes else 0)
-        col4.metric("Novedades", len(df_nov) if not df_nov.empty else 0)
 
         st.divider()
 
-        # Decisiones
-        st.subheader("1. Decisiones del Supervisor")
+        # Botón de descarga
+        st.subheader("Descargar Pre-Planilla Oficial (3 pestañas)")
+        st.caption("Se exportan solo los empleados de tu área (si eres supervisor) o todos (si eres superusuario).")
+
+        if st.button("📥 Generar y Descargar Excel Oficial", type="primary"):
+            with st.spinner("Procesando marcaciones y generando Excel..."):
+                df_params = cached_load_sheet_data("05_Parametros_y_Reglas")
+                df_emp = cached_load_sheet_data("01_Maestro_Empleados")
+                df_bio_p = df_bio[df_bio['dt_temp'].dt.strftime('%Y-%m') == periodo_sel].copy()
+
+                # Procesar asistencia
+                df_res = process_attendance(df_bio_p, df_params, None, df_emp, None)
+
+                # Filtrar por supervisor si corresponde
+                if empleados_permitidos and rol_actual != "Jefe de Producción":
+                    try:
+                        col_nom = next((c for c in df_res.columns if 'nombre' in str(c).lower()), None)
+                        if col_nom:
+                            df_res = df_res[df_res[col_nom].astype(str).str.strip().isin(empleados_permitidos)]
+                    except:
+                        pass
+
+                # Preparar datos para el exporter
+                datos_asistencia = df_res.to_dict('records') if df_res is not None and not df_res.empty else []
+                maestro = df_emp.to_dict('records') if df_emp is not None else []
+
+                # Generar Excel
+                nombre_archivo = f"PrePlanilla_Fridolin_{periodo_sel}_{usuario_actual.replace(' ', '_')}.xlsx"
+                
+                # El exporter escribe el archivo y devuelve el nombre
+                resultado = ExcelExporter.exportar_preplanilla_oficial(
+                    datos_asistencia=datos_asistencia,
+                    maestro_empleados=maestro,
+                    periodo=periodo_sel,
+                    nombre_archivo=nombre_archivo
+                )
+
+                # Leer el archivo generado para descargarlo
+                try:
+                    with open(resultado, "rb") as f:
+                        excel_bytes = f.read()
+                    
+                    st.success(f"✅ Excel generado correctamente ({len(datos_asistencia)} registros procesados).")
+                    st.download_button(
+                        label="⬇️ Descargar Pre-Planilla Oficial",
+                        data=excel_bytes,
+                        file_name=nombre_archivo,
+                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+                    )
+                except Exception as e_file:
+                    st.error(f"Excel generado pero no se pudo leer el archivo: {e_file}")
+                    st.info(f"Archivo generado como: {resultado}")
+
+        st.divider()
+        st.subheader("Resumen de datos guardados")
+        
         if decisiones:
-            st.dataframe(pd.DataFrame(decisiones), use_container_width=True, hide_index=True)
-        else:
-            st.info("Sin decisiones registradas.")
-
-        # Regularizaciones
-        st.subheader("2. Regularizaciones de Marcaciones")
+            with st.expander("Decisiones del Supervisor"):
+                st.dataframe(pd.DataFrame(decisiones), use_container_width=True, hide_index=True)
         if regularizaciones:
-            st.dataframe(pd.DataFrame(regularizaciones), use_container_width=True, hide_index=True)
-        else:
-            st.info("Sin regularizaciones.")
-
-        # Canjes
-        st.subheader("3. Canjes de Horas Extras")
+            with st.expander("Regularizaciones"):
+                st.dataframe(pd.DataFrame(regularizaciones), use_container_width=True, hide_index=True)
         if canjes:
-            st.dataframe(pd.DataFrame(canjes), use_container_width=True, hide_index=True)
-        else:
-            st.info("Sin canjes.")
-
-        # Novedades del período
-        st.subheader("4. Novedades del Período")
-        if not df_nov.empty:
-            st.dataframe(df_nov, use_container_width=True, hide_index=True)
-        else:
-            st.info("Sin novedades en este período.")
-
-        st.divider()
-        st.success("Esta es la base de la Pre-Planilla. Los datos ya están consolidados y listos para exportación o revisión final.")
+            with st.expander("Canjes"):
+                st.dataframe(pd.DataFrame(canjes), use_container_width=True, hide_index=True)
 
     except Exception as e:
         st.error(f"Error: {e}")
