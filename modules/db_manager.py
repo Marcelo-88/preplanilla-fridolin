@@ -2,7 +2,6 @@ import streamlit as st
 import httpx
 from datetime import datetime
 from typing import Dict, Any, List, Optional
-import json
 
 class DBManager:
     """Capa de persistencia usando llamadas HTTP directas a Supabase."""
@@ -46,17 +45,10 @@ class DBManager:
             return res[0].get("estado", "PENDIENTE")
         return "PENDIENTE"
 
-    def cambiar_estado_periodo(
-        self,
-        periodo: str,
-        nuevo_estado: str,
-        usuario_pin: str,
-        usuario_nombre: Optional[str] = None,
-        motivo: Optional[str] = None
-    ) -> Dict[str, Any]:
+    def cambiar_estado_periodo(self, periodo: str, nuevo_estado: str, usuario_pin: str,
+                               usuario_nombre: Optional[str] = None, motivo: Optional[str] = None) -> Dict[str, Any]:
         usuario_ref = usuario_nombre or usuario_pin
         clave = f"{periodo}_{str(usuario_ref).strip().upper().replace(' ', '_')}"
-        
         data = {
             "periodo": clave,
             "estado": nuevo_estado,
@@ -64,10 +56,8 @@ class DBManager:
             "fecha_cierre": datetime.now().isoformat(),
             "motivo_desbloqueo": motivo or ""
         }
-        
         headers_upsert = self.headers.copy()
         headers_upsert["Prefer"] = "resolution=merge-duplicates,return=representation"
-        
         full_url = f"{self.url}/rest/v1/period_locks"
         try:
             with httpx.Client(timeout=20.0) as client:
@@ -76,7 +66,7 @@ class DBManager:
                     return {"exito": False, "mensaje": f"Error HTTP {r.status_code}: {r.text}"}
                 return {"exito": True, "mensaje": f"Estado actualizado a {nuevo_estado}"}
         except Exception as e:
-            return {"exito": False, "mensaje": f"Error de conexión: {str(e)}"}
+            return {"exito": False, "mensaje": str(e)}
 
     # ------------------------------------------------------------------
     # NOVEDADES
@@ -89,9 +79,7 @@ class DBManager:
 
     def obtener_todas_novedades(self) -> List[Dict[str, Any]]:
         res = self._request("GET", "novedades", params={"select": "*", "order": "id.desc"})
-        if isinstance(res, list):
-            return res
-        return []
+        return res if isinstance(res, list) else []
 
     def evaluar_impacto_dia(self, empleado_id: str, fecha_str: str) -> Optional[Dict[str, Any]]:
         params = {
@@ -109,14 +97,8 @@ class DBManager:
     # ------------------------------------------------------------------
     # AUDIT LOG
     # ------------------------------------------------------------------
-    def registrar_evento(
-        self,
-        usuario_pin: str,
-        usuario_nombre: str,
-        accion: str,
-        modulo: str,
-        detalles: Optional[Dict[str, Any]] = None
-    ) -> bool:
+    def registrar_evento(self, usuario_pin: str, usuario_nombre: str, accion: str,
+                         modulo: str, detalles: Optional[Dict[str, Any]] = None) -> bool:
         data = {
             "usuario_pin": usuario_pin,
             "usuario_nombre": usuario_nombre,
@@ -128,23 +110,15 @@ class DBManager:
         return not (isinstance(res, dict) and "error" in res)
 
     def obtener_logs(self, limite: int = 500) -> List[Dict[str, Any]]:
-        res = self._request("GET", "audit_logs", params={
-            "select": "*",
-            "order": "id.desc",
-            "limit": str(limite)
-        })
-        if isinstance(res, list):
-            return res
-        return []
+        res = self._request("GET", "audit_logs", params={"select": "*", "order": "id.desc", "limit": str(limite)})
+        return res if isinstance(res, list) else []
 
     # ------------------------------------------------------------------
-    # DECISIONES DEL SUPERVISOR (NUEVO)
+    # DECISIONES DEL SUPERVISOR
     # ------------------------------------------------------------------
     def guardar_decision(self, data: Dict[str, Any]) -> Dict[str, Any]:
-        """Guarda o actualiza una decisión del supervisor (upsert)."""
         headers_upsert = self.headers.copy()
         headers_upsert["Prefer"] = "resolution=merge-duplicates,return=representation"
-        
         full_url = f"{self.url}/rest/v1/decisiones_supervisor"
         try:
             with httpx.Client(timeout=20.0) as client:
@@ -156,10 +130,25 @@ class DBManager:
             return {"exito": False, "mensaje": str(e)}
 
     def obtener_decisiones_periodo(self, periodo: str) -> List[Dict[str, Any]]:
-        res = self._request("GET", "decisiones_supervisor", params={
-            "periodo": f"eq.{periodo}",
-            "select": "*"
-        })
-        if isinstance(res, list):
-            return res
-        return []
+        res = self._request("GET", "decisiones_supervisor", params={"periodo": f"eq.{periodo}", "select": "*"})
+        return res if isinstance(res, list) else []
+
+    # ------------------------------------------------------------------
+    # CANJES (NUEVO)
+    # ------------------------------------------------------------------
+    def guardar_canje(self, data: Dict[str, Any]) -> Dict[str, Any]:
+        headers_upsert = self.headers.copy()
+        headers_upsert["Prefer"] = "resolution=merge-duplicates,return=representation"
+        full_url = f"{self.url}/rest/v1/canjes"
+        try:
+            with httpx.Client(timeout=20.0) as client:
+                r = client.post(full_url, headers=headers_upsert, json=data)
+                if r.status_code >= 400:
+                    return {"exito": False, "mensaje": f"Error HTTP {r.status_code}: {r.text}"}
+                return {"exito": True, "mensaje": "Canje guardado"}
+        except Exception as e:
+            return {"exito": False, "mensaje": str(e)}
+
+    def obtener_canjes_periodo(self, periodo: str) -> List[Dict[str, Any]]:
+        res = self._request("GET", "canjes", params={"periodo": f"eq.{periodo}", "select": "*"})
+        return res if isinstance(res, list) else []
