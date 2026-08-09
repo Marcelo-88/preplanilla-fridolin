@@ -114,16 +114,12 @@ class DBManager:
         return res if isinstance(res, list) else []
 
     # ------------------------------------------------------------------
-    # DECISIONES DEL SUPERVISOR (UPSERT CORREGIDO)
+    # DECISIONES DEL SUPERVISOR
     # ------------------------------------------------------------------
     def guardar_decision(self, data: Dict[str, Any]) -> Dict[str, Any]:
-        """Guarda o actualiza una decisión (upsert real)."""
         headers_upsert = self.headers.copy()
         headers_upsert["Prefer"] = "resolution=merge-duplicates,return=representation"
-        
-        # on_conflict con las columnas de la unique constraint
         full_url = f"{self.url}/rest/v1/decisiones_supervisor?on_conflict=periodo,carnet_identidad,fecha,tipo_excepcion"
-        
         try:
             with httpx.Client(timeout=20.0) as client:
                 r = client.post(full_url, headers=headers_upsert, json=data)
@@ -155,4 +151,24 @@ class DBManager:
 
     def obtener_canjes_periodo(self, periodo: str) -> List[Dict[str, Any]]:
         res = self._request("GET", "canjes", params={"periodo": f"eq.{periodo}", "select": "*"})
+        return res if isinstance(res, list) else []
+
+    # ------------------------------------------------------------------
+    # REGULARIZACIONES (NUEVO)
+    # ------------------------------------------------------------------
+    def guardar_regularizacion(self, data: Dict[str, Any]) -> Dict[str, Any]:
+        headers_upsert = self.headers.copy()
+        headers_upsert["Prefer"] = "resolution=merge-duplicates,return=representation"
+        full_url = f"{self.url}/rest/v1/regularizaciones?on_conflict=periodo,nombre,fecha"
+        try:
+            with httpx.Client(timeout=20.0) as client:
+                r = client.post(full_url, headers=headers_upsert, json=data)
+                if r.status_code >= 400:
+                    return {"exito": False, "mensaje": f"Error HTTP {r.status_code}: {r.text}"}
+                return {"exito": True, "mensaje": "Regularización guardada"}
+        except Exception as e:
+            return {"exito": False, "mensaje": str(e)}
+
+    def obtener_regularizaciones_periodo(self, periodo: str) -> List[Dict[str, Any]]:
+        res = self._request("GET", "regularizaciones", params={"periodo": f"eq.{periodo}", "select": "*"})
         return res if isinstance(res, list) else []
