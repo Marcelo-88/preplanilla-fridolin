@@ -227,16 +227,45 @@ elif opcion == "⏱️ Importación Biométrico":
         st.error(f"Error cargando biométrico: {e}")
 
 # -----------------------------------------------------------------------------
-# 3. NOVEDADES Y PERMISOS
+# 3. NOVEDADES Y PERMISOS  (CORREGIDO - Lista desplegable)
 # -----------------------------------------------------------------------------
 elif opcion == "📝 Novedades y Permisos":
     st.header("📝 Gestión de Novedades, Permisos y Licencias")
 
+    # Crear diccionario Nombre → CI del personal asignado
+    dict_nombre_ci = {}
+    try:
+        df_emp = cached_load_sheet_data("01_Maestro_Empleados")
+        cols = {str(c).strip().lower(): c for c in df_emp.columns}
+        c_nombre = next((cols[k] for k in cols if 'nombre' in k), None)
+        c_ci = next((cols[k] for k in cols if any(x in k for x in ['carnet', 'ci', 'id'])), None)
+
+        if c_nombre and c_ci:
+            # Solo personal asignado al supervisor (o todos si es jefe)
+            if empleados_permitidos:
+                df_filtrado = df_emp[df_emp[c_nombre].astype(str).str.strip().isin(empleados_permitidos)]
+            else:
+                df_filtrado = df_emp
+
+            for _, row in df_filtrado.iterrows():
+                nom = str(row[c_nombre]).strip()
+                ci = clean_ci(row[c_ci])
+                if nom and ci:
+                    dict_nombre_ci[nom] = ci
+    except Exception as e:
+        st.warning(f"No se pudo cargar lista de personal: {e}")
+
     with st.form("form_novedad"):
         col1, col2 = st.columns(2)
         with col1:
-            emp_id = st.text_input("CI / Carnet del Empleado*")
-            emp_nombre = st.text_input("Nombre Completo*")
+            if dict_nombre_ci:
+                emp_nombre = st.selectbox("Nombre Completo*", options=sorted(dict_nombre_ci.keys()))
+                emp_id = dict_nombre_ci.get(emp_nombre, "")
+                st.text_input("CI / Carnet del Empleado*", value=emp_id, disabled=True)
+            else:
+                emp_id = st.text_input("CI / Carnet del Empleado*")
+                emp_nombre = st.text_input("Nombre Completo*")
+
             tipo_nov = st.selectbox("Tipo de Novedad*", nov_mgr.obtener_tipos_novedad())
         with col2:
             f_ini = st.date_input("Fecha Inicio*")
