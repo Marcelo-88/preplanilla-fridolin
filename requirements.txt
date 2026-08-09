@@ -3,3 +3,4 @@ pandas
 google-auth
 gspread
 openpyxl
+supabase>=2.0.0
