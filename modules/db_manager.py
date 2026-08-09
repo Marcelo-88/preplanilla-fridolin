@@ -58,7 +58,7 @@ class DBManager:
         }
         headers_upsert = self.headers.copy()
         headers_upsert["Prefer"] = "resolution=merge-duplicates,return=representation"
-        full_url = f"{self.url}/rest/v1/period_locks"
+        full_url = f"{self.url}/rest/v1/period_locks?on_conflict=periodo"
         try:
             with httpx.Client(timeout=20.0) as client:
                 r = client.post(full_url, headers=headers_upsert, json=data)
@@ -114,18 +114,22 @@ class DBManager:
         return res if isinstance(res, list) else []
 
     # ------------------------------------------------------------------
-    # DECISIONES DEL SUPERVISOR
+    # DECISIONES DEL SUPERVISOR (UPSERT CORREGIDO)
     # ------------------------------------------------------------------
     def guardar_decision(self, data: Dict[str, Any]) -> Dict[str, Any]:
+        """Guarda o actualiza una decisión (upsert real)."""
         headers_upsert = self.headers.copy()
         headers_upsert["Prefer"] = "resolution=merge-duplicates,return=representation"
-        full_url = f"{self.url}/rest/v1/decisiones_supervisor"
+        
+        # on_conflict con las columnas de la unique constraint
+        full_url = f"{self.url}/rest/v1/decisiones_supervisor?on_conflict=periodo,carnet_identidad,fecha,tipo_excepcion"
+        
         try:
             with httpx.Client(timeout=20.0) as client:
                 r = client.post(full_url, headers=headers_upsert, json=data)
                 if r.status_code >= 400:
                     return {"exito": False, "mensaje": f"Error HTTP {r.status_code}: {r.text}"}
-                return {"exito": True, "mensaje": "Decisión guardada"}
+                return {"exito": True, "mensaje": "Decisión guardada/actualizada"}
         except Exception as e:
             return {"exito": False, "mensaje": str(e)}
 
@@ -134,12 +138,12 @@ class DBManager:
         return res if isinstance(res, list) else []
 
     # ------------------------------------------------------------------
-    # CANJES (NUEVO)
+    # CANJES
     # ------------------------------------------------------------------
     def guardar_canje(self, data: Dict[str, Any]) -> Dict[str, Any]:
         headers_upsert = self.headers.copy()
         headers_upsert["Prefer"] = "resolution=merge-duplicates,return=representation"
-        full_url = f"{self.url}/rest/v1/canjes"
+        full_url = f"{self.url}/rest/v1/canjes?on_conflict=periodo,carnet_identidad"
         try:
             with httpx.Client(timeout=20.0) as client:
                 r = client.post(full_url, headers=headers_upsert, json=data)
