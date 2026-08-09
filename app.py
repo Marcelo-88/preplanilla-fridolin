@@ -75,7 +75,7 @@ opcion = st.sidebar.radio("Seleccione una vista:", [
     "📜 Bitácora de Auditoría"
 ])
 st.sidebar.divider()
-st.sidebar.caption("v2.5 - Filtro restaurado + Guardado de decisiones")
+st.sidebar.caption("v2.5 - Decisiones se cargan y se muestran")
 
 # 1. PARÁMETROS
 if opcion == "📊 Parámetros y Reglas":
@@ -139,10 +139,10 @@ elif opcion == "📝 Novedades y Permisos":
     todas = nov_mgr.obtener_todas_novedades()
     st.dataframe(pd.DataFrame(todas), use_container_width=True) if todas else st.info("Sin novedades")
 
-# 4. APROBACIONES (CON FILTRO + GUARDADO)
+# 4. APROBACIONES (CON CARGA DE DECISIONES GUARDADAS)
 elif opcion == "✅ Aprobaciones Supervisores":
     st.header("✅ Panel de Aprobaciones de Supervisores")
-    st.caption("Modo temporal: cálculo sin consultar novedades (rápido)")
+    st.caption("Las decisiones guardadas se cargan y se muestran en la tabla")
 
     try:
         df_bio = cached_load_sheet_data("02_Importacion_Biometrico")
@@ -170,7 +170,7 @@ elif opcion == "✅ Aprobaciones Supervisores":
         st.divider()
 
         if st.button("🔄 Cargar Excepciones del Período", type="primary"):
-            with st.spinner("Procesando marcaciones..."):
+            with st.spinner("Procesando marcaciones y cargando decisiones guardadas..."):
                 df_params = cached_load_sheet_data("05_Parametros_y_Reglas")
                 df_emp = cached_load_sheet_data("01_Maestro_Empleados")
                 df_bio_p = df_bio[df_bio['dt_temp'].dt.strftime('%Y-%m') == periodo_sel].copy()
@@ -185,9 +185,34 @@ elif opcion == "✅ Aprobaciones Supervisores":
                     except:
                         pass
 
+                # === CARGAR DECISIONES GUARDADAS Y FUSIONARLAS ===
+                if df_exc is not None and not df_exc.empty:
+                    decisiones = db_mgr.obtener_decisiones_periodo(periodo_sel)
+                    if decisiones:
+                        df_dec = pd.DataFrame(decisiones)
+
+                        # Detectar columnas clave
+                        col_ci = next((c for c in df_exc.columns if 'carnet' in str(c).lower() or c == 'ID'), None)
+                        col_fecha = next((c for c in df_exc.columns if 'fecha' in str(c).lower()), None)
+
+                        if col_ci and col_fecha and 'carnet_identidad' in df_dec.columns and 'fecha' in df_dec.columns:
+                            df_exc = df_exc.copy()
+                            df_exc['_key'] = df_exc[col_ci].astype(str).str.strip() + "_" + df_exc[col_fecha].astype(str).str[:10]
+                            df_dec['_key'] = df_dec['carnet_identidad'].astype(str).str.strip() + "_" + df_dec['fecha'].astype(str).str[:10]
+
+                            mapa_decision = dict(zip(df_dec['_key'], df_dec['decision']))
+                            mapa_tipo_falta = dict(zip(df_dec['_key'], df_dec['tipo_falta']))
+
+                            if 'Decisión Supervisor' in df_exc.columns:
+                                df_exc['Decisión Supervisor'] = df_exc['_key'].map(mapa_decision).fillna(df_exc['Decisión Supervisor'])
+                            if 'Tipo Falta' in df_exc.columns:
+                                df_exc['Tipo Falta'] = df_exc['_key'].map(mapa_tipo_falta).fillna(df_exc['Tipo Falta'])
+
+                            df_exc.drop(columns=['_key'], inplace=True, errors='ignore')
+
                 st.session_state['df_exc'] = df_exc
                 st.session_state['periodo_cargado'] = periodo_sel
-                st.success(f"Se cargaron {len(df_exc) if df_exc is not None else 0} excepciones.")
+                st.success(f"Se cargaron {len(df_exc) if df_exc is not None else 0} excepciones (con decisiones guardadas).")
 
         if 'df_exc' in st.session_state and st.session_state.get('periodo_cargado') == periodo_sel:
             df_exc = st.session_state['df_exc']
@@ -250,6 +275,8 @@ elif opcion == "✅ Aprobaciones Supervisores":
                         if db_mgr.guardar_decision(data).get("exito"):
                             guardadas += 1
                     st.success(f"✅ {guardadas} decisiones guardadas correctamente.")
+                    # Forzar recarga para ver los cambios
+                    st.rerun()
             else:
                 st.success("No hay excepciones en este período.")
         else:
