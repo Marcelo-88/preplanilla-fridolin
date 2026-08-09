@@ -54,7 +54,7 @@ opcion = st.sidebar.radio("Seleccione una vista:", [
     "📜 Bitácora de Auditoría"
 ])
 st.sidebar.divider()
-st.sidebar.caption("v2.7 - Regularización de marcaciones agregada")
+st.sidebar.caption("v2.7.1 - Regularización + Bitácora corregida")
 
 # 1. PARÁMETROS
 if opcion == "📊 Parámetros y Reglas":
@@ -153,7 +153,7 @@ elif opcion == "✅ Aprobaciones Supervisores":
 
         st.divider()
 
-        # ---------- CARGAR EXCEPCIONES ----------
+        # Cargar excepciones
         if st.button("🔄 Cargar Excepciones del Período", type="primary"):
             with st.spinner("Procesando marcaciones..."):
                 df_params = cached_load_sheet_data("05_Parametros_y_Reglas")
@@ -169,7 +169,6 @@ elif opcion == "✅ Aprobaciones Supervisores":
                     except:
                         pass
 
-                # Cargar decisiones previas
                 if df_exc is not None and not df_exc.empty:
                     decisiones = db_mgr.obtener_decisiones_periodo(periodo_sel)
                     if decisiones:
@@ -197,7 +196,7 @@ elif opcion == "✅ Aprobaciones Supervisores":
                 st.session_state['periodo_cargado'] = periodo_sel
                 st.success(f"Se cargaron {len(df_exc) if df_exc is not None else 0} excepciones.")
 
-        # ---------- TABLA DE EXCEPCIONES + GUARDADO ----------
+        # Tabla de excepciones
         if 'df_exc' in st.session_state and st.session_state.get('periodo_cargado') == periodo_sel:
             df_exc = st.session_state['df_exc']
 
@@ -298,12 +297,11 @@ elif opcion == "✅ Aprobaciones Supervisores":
         else:
             st.info("Haz clic en **Cargar Excepciones del Período** para ver las anomalías.")
 
-        # ---------- REGULARIZACIÓN (Método 2) ----------
+        # ---------- REGULARIZACIÓN ----------
         st.divider()
         st.subheader("🛠️ Regularización de Marcaciones Faltantes")
-        st.caption("Use esta sección cuando el trabajador sí asistió pero faltó una o ambas marcaciones.")
+        st.caption("Use esta sección cuando el trabajador sí asistió pero faltó una o ambas marcaciones. La regularización queda registrada en la Bitácora.")
 
-        # Lista de empleados del supervisor
         lista_empleados = empleados_permitidos if empleados_permitidos else []
         if not lista_empleados:
             try:
@@ -317,7 +315,7 @@ elif opcion == "✅ Aprobaciones Supervisores":
         with st.form("form_regularizacion"):
             col1, col2 = st.columns(2)
             with col1:
-                emp_reg = st.selectbox("Empleado*", options=lista_empleados if lista_empleados else ["(Cargar empleados)"])
+                emp_reg = st.selectbox("Empleado*", options=lista_empleados if lista_empleados else ["(Sin empleados)"])
                 fecha_reg = st.date_input("Fecha de la marcación omisa*")
                 tipo_reg = st.selectbox("Tipo de marcación faltante*", [
                     "Entrada Omisa",
@@ -332,28 +330,32 @@ elif opcion == "✅ Aprobaciones Supervisores":
             submitted_reg = st.form_submit_button("✅ Registrar Regularización", type="primary")
 
             if submitted_reg:
-                if not emp_reg or not motivo_reg:
-                    st.warning("Complete los campos obligatorios (*).")
+                if not emp_reg or emp_reg == "(Sin empleados)" or not motivo_reg:
+                    st.warning("Complete todos los campos obligatorios (*).")
                 elif not es_editable:
-                    st.error("El período debe estar EN PROCESO para regularizar.")
+                    st.error("El período debe estar en estado EN_PROCESO para poder regularizar.")
                 else:
-                    # Registrar en bitácora
-                    audit_log.registrar_evento(
+                    detalles = {
+                        "empleado": emp_reg,
+                        "fecha": str(fecha_reg),
+                        "tipo": tipo_reg,
+                        "hora_entrada": str(hora_entrada),
+                        "hora_salida": str(hora_salida),
+                        "motivo": motivo_reg,
+                        "periodo": periodo_sel
+                    }
+                    ok = audit_log.registrar_evento(
                         usuario_actual,
                         usuario_actual,
                         "REGULARIZACION_OMISION",
                         "Aprobaciones",
-                        {
-                            "empleado": emp_reg,
-                            "fecha": str(fecha_reg),
-                            "tipo": tipo_reg,
-                            "hora_entrada": str(hora_entrada),
-                            "hora_salida": str(hora_salida),
-                            "motivo": motivo_reg
-                        }
+                        detalles
                     )
-                    st.success(f"✅ Regularización registrada para **{emp_reg}** el {fecha_reg}.")
-                    st.info("La regularización quedó en la bitácora. En la próxima versión se recalculará automáticamente la jornada.")
+                    if ok:
+                        st.success(f"✅ Regularización registrada para **{emp_reg}** el {fecha_reg}.")
+                        st.info("La regularización quedó guardada en la Bitácora. En la siguiente fase se usará para recalcular automáticamente la jornada y las horas extras.")
+                    else:
+                        st.error("No se pudo registrar en la bitácora. Intente nuevamente.")
 
     except Exception as e:
         st.error(f"Error: {e}")
@@ -433,11 +435,14 @@ elif opcion == "📑 Pre-Planilla y Reportes":
     st.header("📑 Pre-Planilla")
     st.info("Seleccione período y procese desde Aprobaciones primero.")
 
-# 8. BITÁCORA
+# 8. BITÁCORA (CORREGIDA)
 elif opcion == "📜 Bitácora de Auditoría":
-    st.header("📜 Bitácora")
-    logs = audit_log.obtener_logs(300)
-    if logs:
-        st.dataframe(pd.DataFrame(logs), use_container_width=True, hide_index=True)
-    else:
-        st.info("Sin registros")
+    st.header("📜 Bitácora de Auditoría")
+    try:
+        logs = audit_log.obtener_logs(300)
+        if logs is not None and len(logs) > 0:
+            st.dataframe(pd.DataFrame(logs), use_container_width=True, hide_index=True)
+        else:
+            st.info("Sin registros en la bitácora.")
+    except Exception as e:
+        st.error(f"Error al cargar bitácora: {e}")
