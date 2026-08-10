@@ -26,18 +26,20 @@ def get_managers():
 
 audit_log, lock_mgr, nov_mgr, db_mgr = get_managers()
 
-@st.cache_data(ttl=300, show_spinner=False)
+@st.cache_data(ttl=120, show_spinner="Cargando datos de Google Sheets...")
 def cached_load_sheet_data(sheet_name):
-    return load_sheet_data(sheet_name)
+    try:
+        return load_sheet_data(sheet_name)
+    except Exception as e:
+        st.warning(f"No se pudo cargar {sheet_name}: {e}")
+        return None
 
 def aplicar_decisiones_a_asistencia(df_res, decisiones, regularizaciones, canjes):
-    """Aplica decisiones, regularizaciones y canjes a los datos de asistencia antes de exportar."""
     if df_res is None or df_res.empty:
         return df_res
 
     df = df_res.copy()
 
-    # Detectar columnas
     col_ci = next((c for c in df.columns if 'carnet' in str(c).lower() or str(c).upper() in ['ID', 'CI']), None)
     col_nom = next((c for c in df.columns if 'nombre' in str(c).lower()), None)
     col_fec = next((c for c in df.columns if 'fecha' in str(c).lower()), None)
@@ -50,7 +52,6 @@ def aplicar_decisiones_a_asistencia(df_res, decisiones, regularizaciones, canjes
     if not col_ci or not col_fec:
         return df
 
-    # Crear columnas si no existen
     if col_he is None:
         df['Horas Extras'] = 0.0
         col_he = 'Horas Extras'
@@ -70,13 +71,12 @@ def aplicar_decisiones_a_asistencia(df_res, decisiones, regularizaciones, canjes
     df['_key'] = df[col_ci].astype(str).str.strip() + "_" + df[col_fec].astype(str).str[:10]
     df[col_obs] = df[col_obs].astype(str).replace('nan', '')
 
-    # ---------- 1. REGULARIZACIONES ----------
+    # Regularizaciones
     if regularizaciones:
         df_reg = pd.DataFrame(regularizaciones)
         keys_reg = set()
         for _, r in df_reg.iterrows():
-            k1 = str(r.get('nombre', '')).strip() + "_" + str(r.get('fecha', ''))[:10]
-            keys_reg.add(k1)
+            keys_reg.add(str(r.get('nombre', '')).strip() + "_" + str(r.get('fecha', ''))[:10])
             if r.get('carnet_identidad'):
                 keys_reg.add(str(r.get('carnet_identidad')).strip() + "_" + str(r.get('fecha', ''))[:10])
 
@@ -86,7 +86,7 @@ def aplicar_decisiones_a_asistencia(df_res, decisiones, regularizaciones, canjes
         df.loc[mask_reg, col_atr] = 0
         df.loc[mask_reg, col_obs] = df.loc[mask_reg, col_obs] + " | Regularizado"
 
-    # ---------- 2. DECISIONES DEL SUPERVISOR ----------
+    # Decisiones
     if decisiones:
         df_dec = pd.DataFrame(decisiones)
         df_dec['_key'] = df_dec['carnet_identidad'].astype(str).str.strip() + "_" + df_dec['fecha'].astype(str).str[:10]
@@ -96,42 +96,33 @@ def aplicar_decisiones_a_asistencia(df_res, decisiones, regularizaciones, canjes
             decision = str(dec.get('decision', '')).strip()
             tipo_falta = str(dec.get('tipo_falta', 'N/A')).strip()
             mask = df['_key'] == key
-
             if not mask.any():
                 continue
 
-            # Observaciones
             texto = f" | {decision}"
             if tipo_falta and tipo_falta != 'N/A':
                 texto += f" ({tipo_falta})"
             df.loc[mask, col_obs] = df.loc[mask, col_obs] + texto
 
-            # Horas Extra
             if "Acumular" in decision:
                 df.loc[mask, col_he] = pd.to_numeric(df.loc[mask, col_he], errors='coerce').fillna(0) + 2.0
 
-            # Faltas y Atrasos según decisión
             if "Aprobado" in decision or "Justificado" in decision:
                 df.loc[mask, col_fi] = 0
                 df.loc[mask, col_atr] = 0
-
                 if tipo_falta == "Justificada":
                     df.loc[mask, col_fj] = 1
-                    df.loc[mask, col_fi] = 0
                 else:
                     df.loc[mask, col_fj] = 0
-                    df.loc[mask, col_fi] = 0
-
             elif tipo_falta == "Justificada":
                 df.loc[mask, col_fj] = 1
                 df.loc[mask, col_fi] = 0
                 df.loc[mask, col_atr] = 0
-
             elif tipo_falta == "Injustificada":
                 df.loc[mask, col_fj] = 0
                 df.loc[mask, col_fi] = 1
 
-    # ---------- 3. CANJES (aproximación) ----------
+    # Canjes
     if canjes:
         df_canje = pd.DataFrame(canjes)
         for _, c in df_canje.iterrows():
@@ -143,7 +134,7 @@ def aplicar_decisiones_a_asistencia(df_res, decisiones, regularizaciones, canjes
                 if total_he > 0 and horas_usadas > 0:
                     factor = max(0.0, 1.0 - (horas_usadas / total_he))
                     df.loc[mask_emp, col_he] = pd.to_numeric(df.loc[mask_emp, col_he], errors='coerce').fillna(0) * factor
-                df.loc[mask_emp, col_obs] = df.loc[mask_emp, col_obs] + f" | Canje {c.get('dias_canjeados', 0)} día(s)"
+                df.loc[mask_emp, col_obs] = df.loc[mask_emp, col_obs] + f" | Canje {c.get('dias_canjeados', 0)}d"
 
     df.drop(columns=['_key'], inplace=True, errors='ignore')
     return df
@@ -154,12 +145,21 @@ st.title("🏭 Control de Asistencia y Reportes - Fridolin")
 st.sidebar.image("https://em-content.zobj.net/source/apple/354/factory_1f3ed.png", width=80)
 st.sidebar.title("Menú Principal")
 
+# Carga defensiva del Maestro
+usuario_actual = "Invitado"
+rol_actual = "Jefe de Producción"
+empleados_permitidos = []
+pin_ok = True
+df_emp_master = None
+
 try:
     df_emp_master = cached_load_sheet_data("01_Maestro_Empleados")
-    usuario_actual, rol_actual, empleados_permitidos, pin_ok = render_user_selector(df_emp_master)
+    if df_emp_master is not None and not df_emp_master.empty:
+        usuario_actual, rol_actual, empleados_permitidos, pin_ok = render_user_selector(df_emp_master)
+    else:
+        st.sidebar.warning("No se pudo cargar el Maestro de Empleados.")
 except Exception as e:
-    usuario_actual, rol_actual, empleados_permitidos, pin_ok = "Invitado", "Jefe de Producción", [], True
-    st.sidebar.error(str(e))
+    st.sidebar.error(f"Error al cargar usuarios: {e}")
 
 st.sidebar.divider()
 opcion = st.sidebar.radio("Seleccione una vista:", [
@@ -173,9 +173,9 @@ opcion = st.sidebar.radio("Seleccione una vista:", [
     "📜 Bitácora de Auditoría"
 ])
 st.sidebar.divider()
-st.sidebar.caption("v2.13 - Ajustes A: Extras + Faltas + Observaciones")
+st.sidebar.caption("v2.14 - Carga resistente")
 
-# ==================== VISTAS (resto igual, solo cambio en Pre-Planilla) ====================
+# ==================== VISTAS ====================
 
 if opcion == "📊 Parámetros y Reglas":
     st.header("⚙️ Parámetros y Reglas")
@@ -191,9 +191,11 @@ elif opcion == "⏱️ Importación Biométrico":
     st.header("⏱️ Importación Biométrico")
     try:
         df = cached_load_sheet_data("02_Importacion_Biometrico")
-        st.success(f"{len(df)} registros") if df is not None else st.warning("Sin datos")
         if df is not None:
+            st.success(f"{len(df)} registros")
             st.dataframe(df.head(30), use_container_width=True)
+        else:
+            st.warning("No se pudieron cargar las marcaciones.")
     except Exception as e:
         st.error(str(e))
 
@@ -202,13 +204,14 @@ elif opcion == "📝 Novedades y Permisos":
     dict_nombre_ci = {}
     try:
         df_emp = cached_load_sheet_data("01_Maestro_Empleados")
-        cols = {str(c).lower(): c for c in df_emp.columns}
-        c_nom = next((cols[k] for k in cols if 'nombre' in k), None)
-        c_ci = next((cols[k] for k in cols if any(x in k for x in ['carnet','ci','id'])), None)
-        if c_nom and c_ci:
-            df_f = df_emp[df_emp[c_nom].astype(str).str.strip().isin(empleados_permitidos)] if empleados_permitidos else df_emp
-            for _, r in df_f.iterrows():
-                dict_nombre_ci[str(r[c_nom]).strip()] = clean_ci(r[c_ci])
+        if df_emp is not None and not df_emp.empty:
+            cols = {str(c).lower(): c for c in df_emp.columns}
+            c_nom = next((cols[k] for k in cols if 'nombre' in k), None)
+            c_ci = next((cols[k] for k in cols if any(x in k for x in ['carnet','ci','id'])), None)
+            if c_nom and c_ci:
+                df_f = df_emp[df_emp[c_nom].astype(str).str.strip().isin(empleados_permitidos)] if empleados_permitidos else df_emp
+                for _, r in df_f.iterrows():
+                    dict_nombre_ci[str(r[c_nom]).strip()] = clean_ci(r[c_ci])
     except:
         pass
 
@@ -243,6 +246,10 @@ elif opcion == "✅ Aprobaciones Supervisores":
     st.header("✅ Panel de Aprobaciones de Supervisores")
     try:
         df_bio = cached_load_sheet_data("02_Importacion_Biometrico")
+        if df_bio is None or df_bio.empty:
+            st.error("No se pudieron cargar las marcaciones biométricas.")
+            st.stop()
+
         df_bio['dt_temp'] = pd.to_datetime(df_bio.iloc[:, 2], dayfirst=True, errors='coerce')
         periodos = sorted(df_bio['dt_temp'].dt.strftime('%Y-%m').dropna().unique().tolist(), reverse=True) or [datetime.now().strftime('%Y-%m')]
         periodo_sel = st.selectbox("Período:", periodos)
@@ -271,53 +278,57 @@ elif opcion == "✅ Aprobaciones Supervisores":
                 df_params = cached_load_sheet_data("05_Parametros_y_Reglas")
                 df_emp = cached_load_sheet_data("01_Maestro_Empleados")
                 df_bio_p = df_bio[df_bio['dt_temp'].dt.strftime('%Y-%m') == periodo_sel].copy()
-                df_res = process_attendance(df_bio_p, df_params, None, df_emp, None)
-                df_exc = detect_exceptions(df_res)
 
-                if empleados_permitidos and rol_actual != "Jefe de Producción":
-                    try:
-                        df_exc = filter_dataframe_by_supervisor(df_exc, "Nombre", empleados_permitidos, rol_actual)
-                    except:
-                        pass
+                if df_params is None or df_emp is None:
+                    st.error("Faltan hojas de parámetros o maestro.")
+                else:
+                    df_res = process_attendance(df_bio_p, df_params, None, df_emp, None)
+                    df_exc = detect_exceptions(df_res)
 
-                if df_exc is not None and not df_exc.empty:
-                    regs = db_mgr.obtener_regularizaciones_periodo(periodo_sel)
-                    if regs:
-                        df_reg = pd.DataFrame(regs)
-                        col_nom = next((c for c in df_exc.columns if 'nombre' in str(c).lower()), None)
-                        col_fec = next((c for c in df_exc.columns if 'fecha' in str(c).lower()), None)
-                        if col_nom and col_fec:
-                            df_exc = df_exc.copy()
-                            df_exc['_key'] = df_exc[col_nom].astype(str).str.strip() + "_" + df_exc[col_fec].astype(str).str[:10]
-                            keys_reg = set(df_reg['nombre'].astype(str).str.strip() + "_" + df_reg['fecha'].astype(str).str[:10])
-                            df_exc = df_exc[~df_exc['_key'].isin(keys_reg)].copy()
-                            df_exc.drop(columns=['_key'], inplace=True, errors='ignore')
+                    if empleados_permitidos and rol_actual != "Jefe de Producción":
+                        try:
+                            df_exc = filter_dataframe_by_supervisor(df_exc, "Nombre", empleados_permitidos, rol_actual)
+                        except:
+                            pass
 
-                    decisiones = db_mgr.obtener_decisiones_periodo(periodo_sel)
-                    if decisiones and not df_exc.empty:
-                        df_dec = pd.DataFrame(decisiones)
-                        col_ci = next((c for c in df_exc.columns if 'carnet' in str(c).lower() or str(c).upper() in ['ID','CI']), None)
-                        col_fecha = next((c for c in df_exc.columns if 'fecha' in str(c).lower()), None)
-                        if col_ci and col_fecha:
-                            df_exc = df_exc.copy()
-                            df_exc['_key'] = df_exc[col_ci].astype(str).str.strip() + "_" + df_exc[col_fecha].astype(str).str[:10]
-                            df_dec['_key'] = df_dec['carnet_identidad'].astype(str).str.strip() + "_" + df_dec['fecha'].astype(str).str[:10]
-                            keys_aprobados = set(df_dec[df_dec['decision'].astype(str).str.contains("Aprobado", case=False, na=False)]['_key'])
-                            if "Tipo Excepción" in df_exc.columns:
-                                mask_falta = df_exc["Tipo Excepción"].astype(str).str.contains("Falta", case=False, na=False)
-                                df_exc = df_exc[~(mask_falta & df_exc['_key'].isin(keys_aprobados))].copy()
-                            mapa_dec = dict(zip(df_dec['_key'], df_dec.get('decision', '')))
-                            mapa_tf = dict(zip(df_dec['_key'], df_dec.get('tipo_falta', '')))
-                            for col in df_exc.columns:
-                                if 'decisión' in str(col).lower() or 'decision' in str(col).lower():
-                                    df_exc[col] = df_exc['_key'].map(mapa_dec).fillna(df_exc[col])
-                                if 'tipo falta' in str(col).lower():
-                                    df_exc[col] = df_exc['_key'].map(mapa_tf).fillna(df_exc[col])
-                            df_exc.drop(columns=['_key'], inplace=True, errors='ignore')
+                    if df_exc is not None and not df_exc.empty:
+                        regs = db_mgr.obtener_regularizaciones_periodo(periodo_sel)
+                        if regs:
+                            df_reg = pd.DataFrame(regs)
+                            col_nom = next((c for c in df_exc.columns if 'nombre' in str(c).lower()), None)
+                            col_fec = next((c for c in df_exc.columns if 'fecha' in str(c).lower()), None)
+                            if col_nom and col_fec:
+                                df_exc = df_exc.copy()
+                                df_exc['_key'] = df_exc[col_nom].astype(str).str.strip() + "_" + df_exc[col_fec].astype(str).str[:10]
+                                keys_reg = set(df_reg['nombre'].astype(str).str.strip() + "_" + df_reg['fecha'].astype(str).str[:10])
+                                df_exc = df_exc[~df_exc['_key'].isin(keys_reg)].copy()
+                                df_exc.drop(columns=['_key'], inplace=True, errors='ignore')
 
-                st.session_state['df_exc'] = df_exc
-                st.session_state['periodo_cargado'] = periodo_sel
-                st.success(f"Se cargaron {len(df_exc) if df_exc is not None else 0} excepciones.")
+                        decisiones = db_mgr.obtener_decisiones_periodo(periodo_sel)
+                        if decisiones and not df_exc.empty:
+                            df_dec = pd.DataFrame(decisiones)
+                            col_ci = next((c for c in df_exc.columns if 'carnet' in str(c).lower() or str(c).upper() in ['ID','CI']), None)
+                            col_fecha = next((c for c in df_exc.columns if 'fecha' in str(c).lower()), None)
+                            if col_ci and col_fecha:
+                                df_exc = df_exc.copy()
+                                df_exc['_key'] = df_exc[col_ci].astype(str).str.strip() + "_" + df_exc[col_fecha].astype(str).str[:10]
+                                df_dec['_key'] = df_dec['carnet_identidad'].astype(str).str.strip() + "_" + df_dec['fecha'].astype(str).str[:10]
+                                keys_aprobados = set(df_dec[df_dec['decision'].astype(str).str.contains("Aprobado", case=False, na=False)]['_key'])
+                                if "Tipo Excepción" in df_exc.columns:
+                                    mask_falta = df_exc["Tipo Excepción"].astype(str).str.contains("Falta", case=False, na=False)
+                                    df_exc = df_exc[~(mask_falta & df_exc['_key'].isin(keys_aprobados))].copy()
+                                mapa_dec = dict(zip(df_dec['_key'], df_dec.get('decision', '')))
+                                mapa_tf = dict(zip(df_dec['_key'], df_dec.get('tipo_falta', '')))
+                                for col in df_exc.columns:
+                                    if 'decisión' in str(col).lower() or 'decision' in str(col).lower():
+                                        df_exc[col] = df_exc['_key'].map(mapa_dec).fillna(df_exc[col])
+                                    if 'tipo falta' in str(col).lower():
+                                        df_exc[col] = df_exc['_key'].map(mapa_tf).fillna(df_exc[col])
+                                df_exc.drop(columns=['_key'], inplace=True, errors='ignore')
+
+                    st.session_state['df_exc'] = df_exc
+                    st.session_state['periodo_cargado'] = periodo_sel
+                    st.success(f"Se cargaron {len(df_exc) if df_exc is not None else 0} excepciones.")
 
         if 'df_exc' in st.session_state and st.session_state.get('periodo_cargado') == periodo_sel:
             df_exc = st.session_state['df_exc']
@@ -404,9 +415,10 @@ elif opcion == "✅ Aprobaciones Supervisores":
         if not lista_empleados:
             try:
                 df_emp = cached_load_sheet_data("01_Maestro_Empleados")
-                col_nom = next((c for c in df_emp.columns if 'nombre' in str(c).lower()), None)
-                if col_nom:
-                    lista_empleados = sorted(df_emp[col_nom].astype(str).str.strip().unique().tolist())
+                if df_emp is not None:
+                    col_nom = next((c for c in df_emp.columns if 'nombre' in str(c).lower()), None)
+                    if col_nom:
+                        lista_empleados = sorted(df_emp[col_nom].astype(str).str.strip().unique().tolist())
             except:
                 pass
 
@@ -450,6 +462,9 @@ elif opcion == "🔄 Canje de Horas":
     st.header("🔄 Canje de Horas Extras por Faltas")
     try:
         df_bio = cached_load_sheet_data("02_Importacion_Biometrico")
+        if df_bio is None:
+            st.error("No se pudieron cargar marcaciones.")
+            st.stop()
         df_bio['dt_temp'] = pd.to_datetime(df_bio.iloc[:, 2], dayfirst=True, errors='coerce')
         periodos = sorted(df_bio['dt_temp'].dt.strftime('%Y-%m').dropna().unique().tolist(), reverse=True) or [datetime.now().strftime('%Y-%m')]
         periodo_sel = st.selectbox("Período:", periodos, key="canje_periodo")
@@ -491,7 +506,7 @@ elif opcion == "🔄 Canje de Horas":
                         }
                         res = db_mgr.guardar_canje(data)
                         if res.get("exito"):
-                            st.success(f"✅ Canje guardado")
+                            st.success("✅ Canje guardado")
                             st.rerun()
                         else:
                             st.error(res.get("mensaje"))
@@ -513,6 +528,10 @@ elif opcion == "📑 Pre-Planilla y Reportes":
 
     try:
         df_bio = cached_load_sheet_data("02_Importacion_Biometrico")
+        if df_bio is None:
+            st.error("No se pudieron cargar marcaciones.")
+            st.stop()
+
         df_bio['dt_temp'] = pd.to_datetime(df_bio.iloc[:, 2], dayfirst=True, errors='coerce')
         periodos = sorted(df_bio['dt_temp'].dt.strftime('%Y-%m').dropna().unique().tolist(), reverse=True) or [datetime.now().strftime('%Y-%m')]
         periodo_sel = st.selectbox("Período:", periodos, key="preplanilla_periodo")
@@ -531,7 +550,6 @@ elif opcion == "📑 Pre-Planilla y Reportes":
 
         st.divider()
         st.subheader("Descargar Pre-Planilla Oficial")
-        st.caption("Se aplican decisiones, regularizaciones y canjes antes de exportar.")
 
         if st.button("📥 Generar y Descargar Excel Oficial", type="primary"):
             with st.spinner("Procesando + aplicando decisiones..."):
@@ -539,42 +557,44 @@ elif opcion == "📑 Pre-Planilla y Reportes":
                 df_emp = cached_load_sheet_data("01_Maestro_Empleados")
                 df_bio_p = df_bio[df_bio['dt_temp'].dt.strftime('%Y-%m') == periodo_sel].copy()
 
-                df_res = process_attendance(df_bio_p, df_params, None, df_emp, None)
+                if df_params is None or df_emp is None:
+                    st.error("Faltan hojas necesarias.")
+                else:
+                    df_res = process_attendance(df_bio_p, df_params, None, df_emp, None)
 
-                if empleados_permitidos and rol_actual != "Jefe de Producción":
-                    try:
-                        col_nom = next((c for c in df_res.columns if 'nombre' in str(c).lower()), None)
-                        if col_nom:
-                            df_res = df_res[df_res[col_nom].astype(str).str.strip().isin(empleados_permitidos)]
-                    except:
-                        pass
+                    if empleados_permitidos and rol_actual != "Jefe de Producción":
+                        try:
+                            col_nom = next((c for c in df_res.columns if 'nombre' in str(c).lower()), None)
+                            if col_nom:
+                                df_res = df_res[df_res[col_nom].astype(str).str.strip().isin(empleados_permitidos)]
+                        except:
+                            pass
 
-                # Aplicar decisiones
-                df_res = aplicar_decisiones_a_asistencia(df_res, decisiones, regularizaciones, canjes)
+                    df_res = aplicar_decisiones_a_asistencia(df_res, decisiones, regularizaciones, canjes)
 
-                datos_asistencia = df_res.to_dict('records') if df_res is not None and not df_res.empty else []
-                maestro = df_emp.to_dict('records') if df_emp is not None else []
+                    datos_asistencia = df_res.to_dict('records') if df_res is not None and not df_res.empty else []
+                    maestro = df_emp.to_dict('records') if df_emp is not None else []
 
-                nombre_archivo = f"PrePlanilla_Fridolin_{periodo_sel}_{usuario_actual.replace(' ', '_')}.xlsx"
-                resultado = ExcelExporter.exportar_preplanilla_oficial(
-                    datos_asistencia=datos_asistencia,
-                    maestro_empleados=maestro,
-                    periodo=periodo_sel,
-                    nombre_archivo=nombre_archivo
-                )
-
-                try:
-                    with open(resultado, "rb") as f:
-                        excel_bytes = f.read()
-                    st.success(f"✅ Excel generado ({len(datos_asistencia)} registros).")
-                    st.download_button(
-                        label="⬇️ Descargar Pre-Planilla Oficial",
-                        data=excel_bytes,
-                        file_name=nombre_archivo,
-                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+                    nombre_archivo = f"PrePlanilla_Fridolin_{periodo_sel}_{usuario_actual.replace(' ', '_')}.xlsx"
+                    resultado = ExcelExporter.exportar_preplanilla_oficial(
+                        datos_asistencia=datos_asistencia,
+                        maestro_empleados=maestro,
+                        periodo=periodo_sel,
+                        nombre_archivo=nombre_archivo
                     )
-                except Exception as e_file:
-                    st.error(f"Error al leer archivo: {e_file}")
+
+                    try:
+                        with open(resultado, "rb") as f:
+                            excel_bytes = f.read()
+                        st.success(f"✅ Excel generado ({len(datos_asistencia)} registros).")
+                        st.download_button(
+                            label="⬇️ Descargar Pre-Planilla Oficial",
+                            data=excel_bytes,
+                            file_name=nombre_archivo,
+                            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+                        )
+                    except Exception as e_file:
+                        st.error(f"Error al leer archivo: {e_file}")
 
         st.divider()
         if decisiones:
