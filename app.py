@@ -4,7 +4,7 @@ from datetime import datetime, time
 
 from modules.data_loader import load_sheet_data
 from modules.attendance_processor import process_attendance, detect_exceptions
-from modules.auth_permissions import render_user_selector, filter_dataframe_by_supervisor
+from modules.auth_permissions import render_user_selector
 from modules.excel_exporter import ExcelExporter
 
 from modules.audit_logger import AuditLogger
@@ -33,26 +33,49 @@ def cached_load_sheet_data(sheet_name):
     except Exception:
         return None
 
-def filtrar_bio_por_empleados(df_bio, empleados_permitidos, rol_actual):
-    """Filtra el biométrico ANTES de procesar para ganar velocidad."""
+def obtener_cis_permitidos(df_emp, empleados_permitidos):
+    """Convierte la lista de nombres permitidos a sus CI oficiales."""
+    if df_emp is None or df_emp.empty or not empleados_permitidos:
+        return set()
+
+    cols = {str(c).lower(): c for c in df_emp.columns}
+    c_nom = next((cols[k] for k in cols if 'nombre' in k), None)
+    c_ci = next((cols[k] for k in cols if any(x in k for x in ['carnet', 'ci', 'id', 'codigo'])), None)
+
+    if not c_nom or not c_ci:
+        return set()
+
+    cis = set()
+    nombres_set = set(str(n).strip().upper() for n in empleados_permitidos)
+    for _, row in df_emp.iterrows():
+        nom = str(row[c_nom]).strip().upper()
+        if nom in nombres_set:
+            ci = clean_ci(row[c_ci])
+            if ci:
+                cis.add(ci)
+    return cis
+
+def filtrar_bio_por_ci(df_bio, cis_permitidos, rol_actual):
+    """Filtra biométrico por CI (más confiable que por nombre)."""
     if df_bio is None or df_bio.empty:
         return df_bio
-    if not empleados_permitidos or rol_actual == "Jefe de Producción":
+    if not cis_permitidos or rol_actual == "Jefe de Producción":
         return df_bio
 
-    # Buscar columna de nombre
-    col_nom = None
+    # Buscar columna de ID/CI en biométrico
+    col_id = None
     for c in df_bio.columns:
-        if 'nombre' in str(c).lower() or 'empleado' in str(c).lower():
-            col_nom = c
+        cl = str(c).lower()
+        if any(x in cl for x in ['id', 'carnet', 'ci', 'codigo']):
+            col_id = c
             break
-    if col_nom is None and len(df_bio.columns) > 1:
-        col_nom = df_bio.columns[1]
+    if col_id is None:
+        col_id = df_bio.columns[0]
 
-    if col_nom is None:
-        return df_bio
+    def _match(val):
+        return clean_ci(val) in cis_permitidos
 
-    mask = df_bio[col_nom].astype(str).str.strip().isin(empleados_permitidos)
+    mask = df_bio[col_id].apply(_match)
     return df_bio[mask].copy()
 
 def aplicar_decisiones_a_asistencia(df_res, decisiones, regularizaciones, canjes):
@@ -189,7 +212,7 @@ opcion = st.sidebar.radio("Seleccione una vista:", [
     "📜 Bitácora de Auditoría"
 ])
 st.sidebar.divider()
-st.sidebar.caption("v2.18 - Optimizado (solo 16 empleados)")
+st.sidebar.caption("v2.19 - Filtro por CI")
 
 if opcion == "📊 Parámetros y Reglas":
     st.header("⚙️ Parámetros y Reglas")
@@ -284,13 +307,16 @@ elif opcion == "✅ Aprobaciones Supervisores":
         st.divider()
 
         if st.button("🔄 Cargar Excepciones", type="primary"):
-            with st.spinner("Procesando solo tu personal..."):
+            with st.spinner("Procesando solo tu personal (filtro CI)..."):
                 df_params = cached_load_sheet_data("05_Parametros_y_Reglas")
                 df_emp = cached_load_sheet_data("01_Maestro_Empleados")
                 df_bio_p = df_bio[df_bio['dt_temp'].dt.strftime('%Y-%m') == periodo_sel].copy()
 
-                # FILTRO TEMPRANO: solo 16 empleados
-                df_bio_p = filtrar_bio_por_empleados(df_bio_p, empleados_permitidos, rol_actual)
+                # FILTRO POR CI
+                cis_ok = obtener_cis_permitidos(df_emp, empleados_permitidos)
+                df_bio_p = filtrar_bio_por_ci(df_bio_p, cis_ok, rol_actual)
+
+                st.caption(f"Marcaciones filtradas: {len(df_bio_p)} | CIs permitidos: {len(cis_ok)}")
 
                 if df_params is None or df_emp is None:
                     st.error("Faltan hojas.")
@@ -447,7 +473,7 @@ elif opcion == "✅ Aprobaciones Supervisores":
                     }
                     res = db_mgr.guardar_regularizacion(data_reg)
                     if res.get("exito"):
-                        st.success(f"✅ Regularización guardada.")
+                        st.success("✅ Regularización guardada.")
                     else:
                         st.error(res.get("mensaje"))
 
@@ -538,13 +564,13 @@ elif opcion == "📑 Pre-Planilla y Reportes":
 
         st.divider()
         if st.button("📥 Generar Excel Oficial", type="primary"):
-            with st.spinner("Procesando solo tu personal..."):
+            with st.spinner("Procesando solo tu personal (filtro CI)..."):
                 df_params = cached_load_sheet_data("05_Parametros_y_Reglas")
                 df_emp = cached_load_sheet_data("01_Maestro_Empleados")
                 df_bio_p = df_bio[df_bio['dt_temp'].dt.strftime('%Y-%m') == periodo_sel].copy()
 
-                # FILTRO TEMPRANO
-                df_bio_p = filtrar_bio_por_empleados(df_bio_p, empleados_permitidos, rol_actual)
+                cis_ok = obtener_cis_permitidos(df_emp, empleados_permitidos)
+                df_bio_p = filtrar_bio_por_ci(df_bio_p, cis_ok, rol_actual)
 
                 if df_params is None or df_emp is None:
                     st.error("Faltan hojas.")
@@ -593,3 +619,4 @@ elif opcion == "📜 Bitácora de Auditoría":
             st.info("Sin registros.")
     except Exception as e:
         st.error(f"Error: {e}")
+        
