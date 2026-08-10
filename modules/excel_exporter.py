@@ -149,25 +149,16 @@ class ExcelExporter:
             horas_extra = sum(ExcelExporter._safe_float(r.get('Horas Extras', r.get('Horas_Extra', 0))) for r in regs)
 
             # ===== ½ TURNOS =====
-            # Para personal Nocturno: cuenta TODOS los días con turno nocturno trabajado
-            # Para Diurno: solo cuenta si hay Turnos Computados >= 1.5 (casi nunca)
-            es_nocturno_maestro = "nocturn" in str(info_m.get('Turno', '')).lower()
+            # Cuenta TODOS los días donde el procesador marcó turno nocturno
+            # (Nocturno o Nocturno Especial) y hubo horas trabajadas.
+            # Así Albert Oliva y cualquier nocturno real aparecen correctamente.
+            medio_turnos = sum(
+                1 for r in regs
+                if "nocturn" in str(r.get('Turno Dominante', '')).lower()
+                and ExcelExporter._safe_float(r.get('Horas Trabajadas', 0)) > 0
+            )
 
-            if es_nocturno_maestro:
-                # Cuenta días donde el procesador marcó Nocturno o Nocturno Especial
-                medio_turnos = sum(
-                    1 for r in regs
-                    if "nocturn" in str(r.get('Turno Dominante', '')).lower()
-                    and ExcelExporter._safe_float(r.get('Horas Trabajadas', 0)) > 0
-                )
-            else:
-                # Diurno: solo los 1.5 reales (si los hubiera)
-                medio_turnos = sum(
-                    1 for r in regs
-                    if ExcelExporter._safe_float(r.get('Turnos Computados', 0)) >= 1.5
-                )
-
-            # REC. NOCTURNO: solo horas de días nocturnos, tope 8h/día
+            # REC. NOCTURNO: horas de días nocturnos, tope 8h/día
             rec_nocturno = 0.0
             for r in regs:
                 turno = str(r.get('Turno Dominante', '')).lower()
@@ -179,7 +170,12 @@ class ExcelExporter:
                 1 for r in regs
                 if r.get('Es Dominical', False) or str(r.get('Día', '')).lower() == 'domingo'
             )
-            atrasos_min = sum(int(ExcelExporter._safe_float(r.get('Atraso (Minutos)', r.get('Atrasos', 0)))) for r in regs)
+
+            # Atrasos: sumar pero con tope de seguridad (evitar valores absurdos)
+            atrasos_raw = sum(int(ExcelExporter._safe_float(r.get('Atraso (Minutos)', r.get('Atrasos', 0)))) for r in regs)
+            # Tope razonable: máx 120 min por día trabajado
+            atrasos_min = min(atrasos_raw, dias_trab * 120)
+
             faltas_just = sum(int(ExcelExporter._safe_float(r.get('Falta Justificada', 0))) for r in regs)
             faltas_injust = sum(int(ExcelExporter._safe_float(r.get('Falta Injustificada', 0))) for r in regs)
 
