@@ -34,7 +34,6 @@ def cached_load_sheet_data(sheet_name):
         return None
 
 def obtener_cis_y_maestro_filtrado(df_emp, empleados_permitidos):
-    """Devuelve (set de CIs, df_emp filtrado solo a los 16)."""
     if df_emp is None or df_emp.empty or not empleados_permitidos:
         return set(), df_emp
 
@@ -208,7 +207,7 @@ opcion = st.sidebar.radio("Seleccione una vista:", [
     "📜 Bitácora de Auditoría"
 ])
 st.sidebar.divider()
-st.sidebar.caption("v2.20 - Filtro Maestro + CI")
+st.sidebar.caption("v2.21 - UI expanders + filtro CI")
 
 if opcion == "📊 Parámetros y Reglas":
     st.header("⚙️ Parámetros y Reglas")
@@ -308,16 +307,14 @@ elif opcion == "✅ Aprobaciones Supervisores":
                 df_emp = cached_load_sheet_data("01_Maestro_Empleados")
                 df_bio_p = df_bio[df_bio['dt_temp'].dt.strftime('%Y-%m') == periodo_sel].copy()
 
-                # FILTRO DOBLE: Maestro + Biométrico solo a los 16
                 cis_ok, df_emp_filtrado = obtener_cis_y_maestro_filtrado(df_emp, empleados_permitidos)
                 df_bio_p = filtrar_bio_por_ci(df_bio_p, cis_ok, rol_actual)
 
-                st.caption(f"Marcaciones: {len(df_bio_p)} | Empleados maestro: {len(df_emp_filtrado) if df_emp_filtrado is not None else 0} | CIs: {len(cis_ok)}")
+                st.caption(f"Marcaciones: {len(df_bio_p)} | Empleados: {len(df_emp_filtrado) if df_emp_filtrado is not None else 0} | CIs: {len(cis_ok)}")
 
                 if df_params is None or df_emp_filtrado is None or df_emp_filtrado.empty:
-                    st.error("Faltan hojas o no hay empleados filtrados.")
+                    st.error("Faltan hojas o empleados filtrados.")
                 else:
-                    # Solo el maestro filtrado → el processor no genera faltas de otros
                     df_res = process_attendance(df_bio_p, df_params, None, df_emp_filtrado, None)
                     df_exc = detect_exceptions(df_res)
 
@@ -599,9 +596,26 @@ elif opcion == "📑 Pre-Planilla y Reportes":
                     except Exception as e_file:
                         st.error(f"Error: {e_file}")
 
+        st.divider()
+        st.subheader("Resumen de cambios aplicados")
+
         if decisiones:
-            with st.expander("Decisiones"):
+            with st.expander(f"📋 Decisiones ({len(decisiones)})", expanded=False):
                 st.dataframe(pd.DataFrame(decisiones), use_container_width=True, hide_index=True)
+        else:
+            st.caption("Sin decisiones guardadas.")
+
+        if regularizaciones:
+            with st.expander(f"🛠️ Regularizaciones ({len(regularizaciones)})", expanded=False):
+                st.dataframe(pd.DataFrame(regularizaciones), use_container_width=True, hide_index=True)
+        else:
+            st.caption("Sin regularizaciones.")
+
+        if canjes:
+            with st.expander(f"🔄 Canjes ({len(canjes)})", expanded=False):
+                st.dataframe(pd.DataFrame(canjes), use_container_width=True, hide_index=True)
+        else:
+            st.caption("Sin canjes.")
 
     except Exception as e:
         st.error(f"Error: {e}")
