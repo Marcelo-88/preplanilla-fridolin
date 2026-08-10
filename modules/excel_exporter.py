@@ -5,76 +5,41 @@ from openpyxl.utils import get_column_letter
 from datetime import datetime
 from typing import List, Dict, Any, Optional
 
-from modules.tarifas_manager import obtener_tarifa_empleado
+try:
+    from modules.tarifas_manager import obtener_tarifa_empleado
+except ImportError:
+    def obtener_tarifa_empleado(ci, tipo):
+        return 0.0
 
 
 class ExcelExporter:
-    
+
     @staticmethod
     def _aplicar_autoajuste(ws):
-        """Ajusta automáticamente el ancho de las columnas."""
         for col in ws.columns:
             max_len = 0
             col_letter = get_column_letter(col[0].column)
             for cell in col:
                 val_str = str(cell.value or '')
-                if cell.number_format and 'Bs' in cell.number_format:
+                if cell.number_format and 'Bs' in str(cell.number_format):
                     val_str += '    '
                 max_len = max(max_len, len(val_str))
             ws.column_dimensions[col_letter].width = max(max_len + 3, 12)
 
     @staticmethod
-    def _aplicar_estilo_hoja(ws, titulo: str, periodo: str, datos_tabla: List[Dict[str, Any]]):
-        ws.views.sheetView[0].showGridLines = True
-
-        header_fill = PatternFill(start_color="1F4E79", end_color="1F4E79", fill_type="solid")
-        header_font = Font(name="Calibri", size=11, bold=True, color="FFFFFF")
-        title_font = Font(name="Calibri", size=15, bold=True, color="1F4E79")
-        subtitle_font = Font(name="Calibri", size=10, italic=True, color="595959")
-        
-        border_thin = Border(
-            left=Side(style='thin', color='D9D9D9'),
-            right=Side(style='thin', color='D9D9D9'),
-            top=Side(style='thin', color='D9D9D9'),
-            bottom=Side(style='thin', color='D9D9D9')
-        )
-        fill_even = PatternFill(start_color="F2F7FA", end_color="F2F7FA", fill_type="solid")
-
-        ws['A1'] = titulo
-        ws['A1'].font = title_font
-        ws['A2'] = f"Período Evaluado: {periodo} | Exportado: {datetime.now().strftime('%Y-%m-%d %H:%M')}"
-        ws['A2'].font = subtitle_font
-
-        ws.append([])
-
-        if not datos_tabla:
-            ws.append(["Sin datos disponibles para el período seleccionado"])
-            return
-
-        headers = list(datos_tabla[0].keys())
-        row_start = 4
-        ws.append(headers)
-
-        for col_num, h in enumerate(headers, 1):
-            cell = ws.cell(row=row_start, column=col_num)
-            cell.fill = header_fill
-            cell.font = header_font
-            cell.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
-
-        current_row = row_start + 1
-        for idx, item in enumerate(datos_tabla):
-            row_data = [item.get(h, "") for h in headers]
-            ws.append(row_data)
-
-            is_even = idx % 2 == 0
-            for col_num in range(1, len(headers) + 1):
-                c = ws.cell(row=current_row, column=col_num)
-                c.border = border_thin
-                if is_even:
-                    c.fill = fill_even
-            current_row += 1
-
-        ExcelExporter._aplicar_autoajuste(ws)
+    def _safe_float(val, default=0.0):
+        """Convierte a float de forma segura. Evita fechas basura."""
+        try:
+            if val is None:
+                return default
+            if isinstance(val, (int, float)):
+                return float(val)
+            # Si viene como fecha/hora, devolver 0
+            if hasattr(val, 'year') or hasattr(val, 'hour'):
+                return default
+            return float(str(val).replace(',', '.'))
+        except Exception:
+            return default
 
     @staticmethod
     def exportar_preplanilla_oficial(
@@ -87,25 +52,25 @@ class ExcelExporter:
         Genera la Pre-Planilla oficial de 3 pestañas:
         1. Fijos y Eventuales
         2. Jornaleros
-        3. Bonos (Módulo Producción)
+        3. Bonos Producción
         """
         wb = openpyxl.Workbook()
-        wb.remove(wb.active) # Eliminar pestaña por defecto
+        wb.remove(wb.active)
 
-        # Diccionario auxiliar del Maestro de Empleados
+        # Diccionario del Maestro
         dict_maestro = {}
         for emp in maestro_empleados:
-            ci = str(emp.get('Carnet_Identidad', '')).strip()
+            ci = str(emp.get('Carnet_Identidad', emp.get('CI', emp.get('Id', '')))).strip()
             if ci:
                 dict_maestro[ci] = {
                     'Nombre_Completo': emp.get('Nombre_Completo', emp.get('Nombre', 'SIN NOMBRE')),
-                    'Area_Sector': emp.get('Area_Departamento', emp.get('Area_Sector', 'FABRICA')),
+                    'Area_Sector': emp.get('Area_Departamento', emp.get('Area_Sector', emp.get('Sector', 'FABRICA'))),
                     'Cargo': emp.get('Rol', emp.get('Cargo', 'OPERARIO')),
                     'Centro_Costo': emp.get('Centro_Costo', 'FRIDOLIN'),
                     'Tipo_Personal': emp.get('Tipo_Personal', 'Fijo')
                 }
 
-        # Estilos generales
+        # Estilos
         font_titulo = Font(name="Calibri", size=14, bold=True, color="FFFFFF")
         font_header_white = Font(name="Calibri", size=11, bold=True, color="FFFFFF")
         font_header_black = Font(name="Calibri", size=11, bold=True, color="000000")
@@ -163,10 +128,10 @@ class ExcelExporter:
             c.alignment = align_center
             c.border = border_thin
 
-        # Agrupar datos por empleado
+        # Agrupar por empleado
         grouped_emp = {}
         for reg in datos_asistencia:
-            ci = str(reg.get('Carnet_Identidad', reg.get('ID', ''))).strip()
+            ci = str(reg.get('Carnet_Identidad', reg.get('ID', reg.get('CI', '')))).strip()
             if not ci:
                 continue
             if ci not in grouped_emp:
@@ -183,18 +148,25 @@ class ExcelExporter:
                 'Tipo_Personal': 'Fijo'
             })
 
-            # Excluir Jornaleros de Pestaña 1
             if str(info_m.get('Tipo_Personal', '')).strip().upper() == 'JORNALERO':
                 continue
 
             dias_trab = len(regs)
-            horas_extra = sum(float(r.get('Horas Extras', 0) or 0) for r in regs)
-            medio_turnos = sum(float(r.get('1/2 Turnos', 0) or 0) for r in regs)
-            rec_nocturno = sum(float(r.get('Horas Nocturnas', 0) or 0) for r in regs)
+            horas_extra = sum(ExcelExporter._safe_float(r.get('Horas Extras', r.get('Horas_Extra', 0))) for r in regs)
+            medio_turnos = sum(ExcelExporter._safe_float(r.get('1/2 Turnos', r.get('Medio Turno', 0))) for r in regs)
+            rec_nocturno = sum(ExcelExporter._safe_float(r.get('Horas Nocturnas', r.get('Recargo Nocturno', 0))) for r in regs)
             dominicales = sum(1 for r in regs if r.get('Es Dominical', False))
-            atrasos_min = sum(int(r.get('Atraso (Minutos)', 0) or 0) for r in regs)
-            faltas_just = sum(int(r.get('Falta Justificada', 0) or 0) for r in regs)
-            faltas_injust = sum(int(r.get('Falta Injustificada', 0) or 0) for r in regs)
+            atrasos_min = sum(int(ExcelExporter._safe_float(r.get('Atraso (Minutos)', r.get('Atrasos', 0)))) for r in regs)
+            faltas_just = sum(int(ExcelExporter._safe_float(r.get('Falta Justificada', 0))) for r in regs)
+            faltas_injust = sum(int(ExcelExporter._safe_float(r.get('Falta Injustificada', 0))) for r in regs)
+
+            # Observaciones: juntar las únicas
+            obs_list = []
+            for r in regs:
+                obs = str(r.get('Observaciones', r.get('Observacion', ''))).strip()
+                if obs and obs not in obs_list and obs.lower() not in ['nan', 'none', '']:
+                    obs_list.append(obs)
+            observaciones = " | ".join(obs_list)[:200]  # limitar largo
 
             vals_1 = [
                 info_m['Nombre_Completo'],
@@ -203,21 +175,21 @@ class ExcelExporter:
                 info_m['Cargo'],
                 info_m['Centro_Costo'],
                 dias_trab,
-                horas_extra,
-                medio_turnos,
-                rec_nocturno,
+                round(horas_extra, 2),
+                round(medio_turnos, 2),
+                round(rec_nocturno, 2),
                 dominicales,
                 atrasos_min,
                 faltas_just,
                 faltas_injust,
-                ""
+                observaciones
             ]
 
             for c_idx, val in enumerate(vals_1, start=1):
                 cell = ws1.cell(row=row_idx, column=c_idx, value=val)
                 cell.font = font_body
                 cell.border = border_thin
-                if c_idx in [1, 3, 4, 5]:
+                if c_idx in [1, 3, 4, 5, 14]:
                     cell.alignment = align_left
                 elif c_idx == 2:
                     cell.alignment = align_center
@@ -271,20 +243,18 @@ class ExcelExporter:
                 'Tipo_Personal': 'Jornalero'
             })
 
-            # Incluir solo Jornaleros (o todos si no se especificó)
             if str(info_m.get('Tipo_Personal', '')).strip().upper() != 'JORNALERO':
                 continue
 
-            # Conteo de turnos según tipo
-            d_norm = sum(1 for r in regs if r.get('Turno Dominante') == 'Diurno' and float(r.get('Horas Trabajadas', 0) or 0) <= 9)
-            d_15 = sum(1 for r in regs if r.get('Turno Dominante') == 'Diurno' and float(r.get('Horas Trabajadas', 0) or 0) > 9)
-            n_norm = sum(1 for r in regs if r.get('Turno Dominante') == 'Nocturno' and float(r.get('Horas Trabajadas', 0) or 0) <= 8)
-            n_15 = sum(1 for r in regs if r.get('Turno Dominante') == 'Nocturno' and float(r.get('Horas Trabajadas', 0) or 0) > 8)
+            d_norm = sum(1 for r in regs if r.get('Turno Dominante') == 'Diurno' and ExcelExporter._safe_float(r.get('Horas Trabajadas', 0)) <= 9)
+            d_15 = sum(1 for r in regs if r.get('Turno Dominante') == 'Diurno' and ExcelExporter._safe_float(r.get('Horas Trabajadas', 0)) > 9)
+            n_norm = sum(1 for r in regs if r.get('Turno Dominante') == 'Nocturno' and ExcelExporter._safe_float(r.get('Horas Trabajadas', 0)) <= 8)
+            n_15 = sum(1 for r in regs if r.get('Turno Dominante') == 'Nocturno' and ExcelExporter._safe_float(r.get('Horas Trabajadas', 0)) > 8)
 
-            t_d_norm = obtener_tarifa_empleado(ci, "diurno_normal_8h")
-            t_d_15 = obtener_tarifa_empleado(ci, "diurno_1_5_12h")
-            t_n_norm = obtener_tarifa_empleado(ci, "nocturno_normal_8h")
-            t_n_15 = obtener_tarifa_empleado(ci, "nocturno_1_5_12h")
+            t_d_norm = ExcelExporter._safe_float(obtener_tarifa_empleado(ci, "diurno_normal_8h"))
+            t_d_15 = ExcelExporter._safe_float(obtener_tarifa_empleado(ci, "diurno_1_5_12h"))
+            t_n_norm = ExcelExporter._safe_float(obtener_tarifa_empleado(ci, "nocturno_normal_8h"))
+            t_n_15 = ExcelExporter._safe_float(obtener_tarifa_empleado(ci, "nocturno_1_5_12h"))
 
             m_d_norm = d_norm * t_d_norm
             m_d_15 = d_15 * t_d_15
@@ -296,11 +266,11 @@ class ExcelExporter:
                 info_m['Nombre_Completo'],
                 ci,
                 info_m['Area_Sector'],
-                d_norm, m_d_norm,
-                d_15, m_d_15,
-                n_norm, m_n_norm,
+                d_norm, round(m_d_norm, 2),
+                d_15, round(m_d_15, 2),
+                n_norm, round(m_n_norm, 2),
                 n_15,
-                total_jornal
+                round(total_jornal, 2)
             ]
 
             for c_idx, val in enumerate(vals_2, start=1):
@@ -309,19 +279,17 @@ class ExcelExporter:
                 cell.border = border_thin
                 if c_idx in [1, 3]:
                     cell.alignment = align_left
-                elif c_idx == 2:
-                    cell.alignment = align_center
                 else:
                     cell.alignment = align_right
-                    if c_idx in [5, 7, 9, 11]:
-                        cell.number_format = 'Bs#,##0.00'
+                    if isinstance(val, float):
+                        cell.number_format = '#,##0.00'
 
             row_idx_2 += 1
 
         ExcelExporter._aplicar_autoajuste(ws2)
 
         # ==========================================
-        # PESTAÑA 3: BONOS (MÓDULO PRODUCCIÓN)
+        # PESTAÑA 3: BONOS PRODUCCIÓN
         # ==========================================
         ws3 = wb.create_sheet(title="Bonos Producción")
         ws3.views.sheetView[0].showGridLines = True
@@ -350,11 +318,11 @@ class ExcelExporter:
             c.border = border_thin
 
         row_idx_3 = 4
-        for ci, info_m in list(dict_maestro.items()):
+        for ci, info_m in dict_maestro.items():
             vals_3 = [
-                info_m['Nombre_Completo'],
+                info_m.get('Nombre_Completo', ''),
                 ci,
-                info_m['Area_Sector'],
+                info_m.get('Area_Sector', ''),
                 0, 0, 0.0, 0.0
             ]
             for c_idx, val in enumerate(vals_3, start=1):
@@ -363,49 +331,11 @@ class ExcelExporter:
                 cell.border = border_thin
                 if c_idx in [1, 3]:
                     cell.alignment = align_left
-                elif c_idx == 2:
-                    cell.alignment = align_center
                 else:
                     cell.alignment = align_right
-                    if c_idx in [6, 7]:
-                        cell.number_format = 'Bs#,##0.00'
-
             row_idx_3 += 1
 
         ExcelExporter._aplicar_autoajuste(ws3)
-
-        wb.save(nombre_archivo)
-        return nombre_archivo
-
-    @staticmethod
-    def exportar_preplanilla(
-        datos_tabla: List[Dict[str, Any]],
-        periodo: str,
-        nombre_archivo: str = "PrePlanilla_Export.xlsx"
-    ) -> str:
-        wb = openpyxl.Workbook()
-        ws = wb.active
-        ws.title = "Pre-Planilla"
-        ExcelExporter._aplicar_estilo_hoja(ws, "REPORTE CONSOLIDADO DE PRE-PLANILLA DE ASISTENCIA", periodo, datos_tabla)
-        wb.save(nombre_archivo)
-        return nombre_archivo
-
-    @staticmethod
-    def exportar_aprobaciones(
-        datos_excepciones: List[Dict[str, Any]],
-        periodo: str,
-        nombre_archivo: str = "Aprobaciones_Export.xlsx",
-        datos_canje: Optional[List[Dict[str, Any]]] = None
-    ) -> str:
-        wb = openpyxl.Workbook()
-        
-        ws_exc = wb.active
-        ws_exc.title = "Excepciones Supervisores"
-        ExcelExporter._aplicar_estilo_hoja(ws_exc, "CENTRO DE APROBACIONES Y EXCEPCIONES", periodo, datos_excepciones)
-
-        if datos_canje:
-            ws_canje = wb.create_sheet(title="Bolsa Canje HE")
-            ExcelExporter._aplicar_estilo_hoja(ws_canje, "RESUMEN BOLSAS DE CANJE Y FALTAS", periodo, datos_canje)
 
         wb.save(nombre_archivo)
         return nombre_archivo
