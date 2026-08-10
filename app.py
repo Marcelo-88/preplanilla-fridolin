@@ -30,22 +30,18 @@ audit_log, lock_mgr, nov_mgr, db_mgr = get_managers()
 def cached_load_sheet_data(sheet_name):
     try:
         return load_sheet_data(sheet_name)
-    except Exception as e:
+    except Exception:
         return None
 
 def aplicar_decisiones_a_asistencia(df_res, decisiones, regularizaciones, canjes):
-    """Aplica decisiones, regularizaciones y canjes de forma robusta."""
     if df_res is None or df_res.empty:
         return df_res
 
     df = df_res.copy()
 
-    # Detectar columnas de forma flexible
     col_ci = next((c for c in df.columns if 'carnet' in str(c).lower() or str(c).upper() in ['ID', 'CI']), None)
     col_nom = next((c for c in df.columns if 'nombre' in str(c).lower()), None)
     col_fec = next((c for c in df.columns if 'fecha' in str(c).lower()), None)
-
-    # Columnas de resultado (crear si no existen)
     col_he = next((c for c in df.columns if 'horas extra' in str(c).lower() or 'horas_extra' in str(c).lower()), None)
     col_fj = next((c for c in df.columns if 'falta justificada' in str(c).lower()), None)
     col_fi = next((c for c in df.columns if 'falta injustificada' in str(c).lower()), None)
@@ -71,7 +67,6 @@ def aplicar_decisiones_a_asistencia(df_res, decisiones, regularizaciones, canjes
         df['Observaciones'] = ""
         col_obs = 'Observaciones'
 
-    # Asegurar tipos numéricos
     df[col_he] = pd.to_numeric(df[col_he], errors='coerce').fillna(0.0)
     df[col_fj] = pd.to_numeric(df[col_fj], errors='coerce').fillna(0).astype(int)
     df[col_fi] = pd.to_numeric(df[col_fi], errors='coerce').fillna(0).astype(int)
@@ -80,7 +75,6 @@ def aplicar_decisiones_a_asistencia(df_res, decisiones, regularizaciones, canjes
 
     df['_key'] = df[col_ci].astype(str).str.strip() + "_" + df[col_fec].astype(str).str[:10]
 
-    # ========== 1. REGULARIZACIONES ==========
     if regularizaciones:
         df_reg = pd.DataFrame(regularizaciones)
         keys_reg = set()
@@ -99,7 +93,6 @@ def aplicar_decisiones_a_asistencia(df_res, decisiones, regularizaciones, canjes
         df.loc[mask, col_atr] = 0
         df.loc[mask, col_obs] = df.loc[mask, col_obs] + " | Regularizado"
 
-    # ========== 2. DECISIONES ==========
     if decisiones:
         df_dec = pd.DataFrame(decisiones)
         df_dec['_key'] = (
@@ -115,24 +108,20 @@ def aplicar_decisiones_a_asistencia(df_res, decisiones, regularizaciones, canjes
             if not mask.any():
                 continue
 
-            # Observaciones
             obs = f" | {decision}"
             if tipo_falta and tipo_falta != 'N/A':
                 obs += f" ({tipo_falta})"
             df.loc[mask, col_obs] = df.loc[mask, col_obs] + obs
 
-            # Horas Extra
             if "Acumular" in decision:
                 df.loc[mask, col_he] = df.loc[mask, col_he] + 2.0
 
-            # Faltas y Atrasos
             if "Aprobado" in decision or "Justificado" in decision:
                 df.loc[mask, col_atr] = 0
                 if tipo_falta == "Justificada":
                     df.loc[mask, col_fj] = 1
                     df.loc[mask, col_fi] = 0
                 else:
-                    # Aprobado sin falta = día normal
                     df.loc[mask, col_fj] = 0
                     df.loc[mask, col_fi] = 0
             elif tipo_falta == "Justificada":
@@ -143,7 +132,6 @@ def aplicar_decisiones_a_asistencia(df_res, decisiones, regularizaciones, canjes
                 df.loc[mask, col_fj] = 0
                 df.loc[mask, col_fi] = 1
 
-    # ========== 3. CANJES ==========
     if canjes:
         df_canje = pd.DataFrame(canjes)
         for _, c in df_canje.iterrows():
@@ -159,8 +147,6 @@ def aplicar_decisiones_a_asistencia(df_res, decisiones, regularizaciones, canjes
 
     df.drop(columns=['_key'], inplace=True, errors='ignore')
     return df
-
-# ==================== APP ====================
 
 st.set_page_config(page_title="Pre-Planilla Fridolin", page_icon="🏭", layout="wide")
 st.title("🏭 Control de Asistencia y Reportes - Fridolin")
@@ -194,7 +180,7 @@ opcion = st.sidebar.radio("Seleccione una vista:", [
     "📜 Bitácora de Auditoría"
 ])
 st.sidebar.divider()
-st.sidebar.caption("v2.15 - Paquete fuerte")
+st.sidebar.caption("v2.16 - Parte 1: Novedades + Turno asignado")
 
 # ---------- VISTAS ----------
 
@@ -205,6 +191,8 @@ if opcion == "📊 Parámetros y Reglas":
         {"Parámetro": "Tiempo Comida", "Valor": "30 min", "Descripción": "Descuento automático 0.5h"},
         {"Parámetro": "Jornada Diurna", "Valor": "07:00-15:30", "Descripción": "8h netas = 1 turno"},
         {"Parámetro": "Jornada Nocturna", "Valor": "22:00-05:30", "Descripción": "7h netas = 1 turno"},
+        {"Parámetro": "Lactancia", "Valor": "7 hrs", "Descripción": "Jornada reducida por maternidad"},
+        {"Parámetro": "Turno y Medio", "Valor": "Solo Nocturno", "Descripción": "Viernes/Domingo 16:00-19:30"},
     ]
     st.dataframe(pd.DataFrame(data), use_container_width=True, hide_index=True)
 
@@ -292,7 +280,7 @@ elif opcion == "✅ Aprobaciones Supervisores":
         st.divider()
 
         if st.button("🔄 Cargar Excepciones del Período", type="primary"):
-            with st.spinner("Procesando..."):
+            with st.spinner("Procesando con novedades y reglas de turno..."):
                 df_params = cached_load_sheet_data("05_Parametros_y_Reglas")
                 df_emp = cached_load_sheet_data("01_Maestro_Empleados")
                 df_bio_p = df_bio[df_bio['dt_temp'].dt.strftime('%Y-%m') == periodo_sel].copy()
@@ -300,7 +288,8 @@ elif opcion == "✅ Aprobaciones Supervisores":
                 if df_params is None or df_emp is None:
                     st.error("Faltan hojas necesarias.")
                 else:
-                    df_res = process_attendance(df_bio_p, df_params, None, df_emp, None)
+                    # === NOVEDADES ACTIVAS ===
+                    df_res = process_attendance(df_bio_p, df_params, None, df_emp, nov_mgr)
                     df_exc = detect_exceptions(df_res)
 
                     if empleados_permitidos and rol_actual != "Jefe de Producción":
@@ -310,7 +299,6 @@ elif opcion == "✅ Aprobaciones Supervisores":
                             pass
 
                     if df_exc is not None and not df_exc.empty:
-                        # Filtrar regularizaciones
                         regs = db_mgr.obtener_regularizaciones_periodo(periodo_sel)
                         if regs:
                             df_reg = pd.DataFrame(regs)
@@ -323,7 +311,6 @@ elif opcion == "✅ Aprobaciones Supervisores":
                                 df_exc = df_exc[~df_exc['_key'].isin(keys_reg)].copy()
                                 df_exc.drop(columns=['_key'], inplace=True, errors='ignore')
 
-                        # Aplicar decisiones guardadas
                         decisiones = db_mgr.obtener_decisiones_periodo(periodo_sel)
                         if decisiones and not df_exc.empty:
                             df_dec = pd.DataFrame(decisiones)
@@ -579,7 +566,7 @@ elif opcion == "📑 Pre-Planilla y Reportes":
         st.subheader("Descargar Pre-Planilla Oficial")
 
         if st.button("📥 Generar y Descargar Excel Oficial", type="primary"):
-            with st.spinner("Procesando + aplicando decisiones..."):
+            with st.spinner("Procesando con novedades + reglas de turno..."):
                 df_params = cached_load_sheet_data("05_Parametros_y_Reglas")
                 df_emp = cached_load_sheet_data("01_Maestro_Empleados")
                 df_bio_p = df_bio[df_bio['dt_temp'].dt.strftime('%Y-%m') == periodo_sel].copy()
@@ -587,7 +574,8 @@ elif opcion == "📑 Pre-Planilla y Reportes":
                 if df_params is None or df_emp is None:
                     st.error("Faltan hojas necesarias.")
                 else:
-                    df_res = process_attendance(df_bio_p, df_params, None, df_emp, None)
+                    # === NOVEDADES ACTIVAS ===
+                    df_res = process_attendance(df_bio_p, df_params, None, df_emp, nov_mgr)
 
                     if empleados_permitidos and rol_actual != "Jefe de Producción":
                         try:
@@ -597,7 +585,6 @@ elif opcion == "📑 Pre-Planilla y Reportes":
                         except:
                             pass
 
-                    # Aplicar decisiones (paquete fuerte)
                     df_res = aplicar_decisiones_a_asistencia(df_res, decisiones, regularizaciones, canjes)
 
                     datos_asistencia = df_res.to_dict('records') if df_res is not None and not df_res.empty else []
