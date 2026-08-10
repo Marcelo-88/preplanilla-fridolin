@@ -180,7 +180,7 @@ opcion = st.sidebar.radio("Seleccione una vista:", [
     "📜 Bitácora de Auditoría"
 ])
 st.sidebar.divider()
-st.sidebar.caption("v2.16 - Parte 1: Novedades + Turno asignado")
+st.sidebar.caption("v2.17 - Excel rápido (novedades en pausa)")
 
 # ---------- VISTAS ----------
 
@@ -191,8 +191,7 @@ if opcion == "📊 Parámetros y Reglas":
         {"Parámetro": "Tiempo Comida", "Valor": "30 min", "Descripción": "Descuento automático 0.5h"},
         {"Parámetro": "Jornada Diurna", "Valor": "07:00-15:30", "Descripción": "8h netas = 1 turno"},
         {"Parámetro": "Jornada Nocturna", "Valor": "22:00-05:30", "Descripción": "7h netas = 1 turno"},
-        {"Parámetro": "Lactancia", "Valor": "7 hrs", "Descripción": "Jornada reducida por maternidad"},
-        {"Parámetro": "Turno y Medio", "Valor": "Solo Nocturno", "Descripción": "Viernes/Domingo 16:00-19:30"},
+        {"Parámetro": "Turno y Medio", "Valor": "Solo Nocturno", "Descripción": "Personal Diurno no genera ½ turno"},
     ]
     st.dataframe(pd.DataFrame(data), use_container_width=True, hide_index=True)
 
@@ -280,7 +279,7 @@ elif opcion == "✅ Aprobaciones Supervisores":
         st.divider()
 
         if st.button("🔄 Cargar Excepciones del Período", type="primary"):
-            with st.spinner("Procesando con novedades y reglas de turno..."):
+            with st.spinner("Procesando..."):
                 df_params = cached_load_sheet_data("05_Parametros_y_Reglas")
                 df_emp = cached_load_sheet_data("01_Maestro_Empleados")
                 df_bio_p = df_bio[df_bio['dt_temp'].dt.strftime('%Y-%m') == periodo_sel].copy()
@@ -288,8 +287,8 @@ elif opcion == "✅ Aprobaciones Supervisores":
                 if df_params is None or df_emp is None:
                     st.error("Faltan hojas necesarias.")
                 else:
-                    # === NOVEDADES ACTIVAS ===
-                    df_res = process_attendance(df_bio_p, df_params, None, df_emp, nov_mgr)
+                    # Novedades en pausa por rendimiento (None)
+                    df_res = process_attendance(df_bio_p, df_params, None, df_emp, None)
                     df_exc = detect_exceptions(df_res)
 
                     if empleados_permitidos and rol_actual != "Jefe de Producción":
@@ -566,7 +565,7 @@ elif opcion == "📑 Pre-Planilla y Reportes":
         st.subheader("Descargar Pre-Planilla Oficial")
 
         if st.button("📥 Generar y Descargar Excel Oficial", type="primary"):
-            with st.spinner("Procesando con novedades + reglas de turno..."):
+            with st.spinner("Procesando..."):
                 df_params = cached_load_sheet_data("05_Parametros_y_Reglas")
                 df_emp = cached_load_sheet_data("01_Maestro_Empleados")
                 df_bio_p = df_bio[df_bio['dt_temp'].dt.strftime('%Y-%m') == periodo_sel].copy()
@@ -574,8 +573,8 @@ elif opcion == "📑 Pre-Planilla y Reportes":
                 if df_params is None or df_emp is None:
                     st.error("Faltan hojas necesarias.")
                 else:
-                    # === NOVEDADES ACTIVAS ===
-                    df_res = process_attendance(df_bio_p, df_params, None, df_emp, nov_mgr)
+                    # Novedades en pausa por rendimiento (None)
+                    df_res = process_attendance(df_bio_p, df_params, None, df_emp, None)
 
                     if empleados_permitidos and rol_actual != "Jefe de Producción":
                         try:
