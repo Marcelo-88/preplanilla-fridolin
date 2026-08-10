@@ -1,7 +1,6 @@
 import streamlit as st
 import pandas as pd
 from datetime import datetime, time
-import io
 
 from modules.data_loader import load_sheet_data
 from modules.attendance_processor import process_attendance, detect_exceptions
@@ -31,6 +30,124 @@ audit_log, lock_mgr, nov_mgr, db_mgr = get_managers()
 def cached_load_sheet_data(sheet_name):
     return load_sheet_data(sheet_name)
 
+def aplicar_decisiones_a_asistencia(df_res, decisiones, regularizaciones, canjes):
+    """Aplica decisiones, regularizaciones y canjes a los datos de asistencia antes de exportar."""
+    if df_res is None or df_res.empty:
+        return df_res
+
+    df = df_res.copy()
+
+    # Detectar columnas
+    col_ci = next((c for c in df.columns if 'carnet' in str(c).lower() or str(c).upper() in ['ID', 'CI']), None)
+    col_nom = next((c for c in df.columns if 'nombre' in str(c).lower()), None)
+    col_fec = next((c for c in df.columns if 'fecha' in str(c).lower()), None)
+    col_he = next((c for c in df.columns if 'horas extra' in str(c).lower() or 'horas_extra' in str(c).lower()), None)
+    col_fj = next((c for c in df.columns if 'falta justificada' in str(c).lower()), None)
+    col_fi = next((c for c in df.columns if 'falta injustificada' in str(c).lower()), None)
+    col_atr = next((c for c in df.columns if 'atraso' in str(c).lower()), None)
+    col_obs = next((c for c in df.columns if 'observacion' in str(c).lower()), None)
+
+    if not col_ci or not col_fec:
+        return df
+
+    # Crear columnas si no existen
+    if col_he is None:
+        df['Horas Extras'] = 0.0
+        col_he = 'Horas Extras'
+    if col_fj is None:
+        df['Falta Justificada'] = 0
+        col_fj = 'Falta Justificada'
+    if col_fi is None:
+        df['Falta Injustificada'] = 0
+        col_fi = 'Falta Injustificada'
+    if col_atr is None:
+        df['Atraso (Minutos)'] = 0
+        col_atr = 'Atraso (Minutos)'
+    if col_obs is None:
+        df['Observaciones'] = ""
+        col_obs = 'Observaciones'
+
+    df['_key'] = df[col_ci].astype(str).str.strip() + "_" + df[col_fec].astype(str).str[:10]
+    df[col_obs] = df[col_obs].astype(str).replace('nan', '')
+
+    # ---------- 1. REGULARIZACIONES ----------
+    if regularizaciones:
+        df_reg = pd.DataFrame(regularizaciones)
+        keys_reg = set()
+        for _, r in df_reg.iterrows():
+            k1 = str(r.get('nombre', '')).strip() + "_" + str(r.get('fecha', ''))[:10]
+            keys_reg.add(k1)
+            if r.get('carnet_identidad'):
+                keys_reg.add(str(r.get('carnet_identidad')).strip() + "_" + str(r.get('fecha', ''))[:10])
+
+        mask_reg = df['_key'].isin(keys_reg) | (df[col_nom].astype(str).str.strip() + "_" + df[col_fec].astype(str).str[:10]).isin(keys_reg)
+        df.loc[mask_reg, col_fi] = 0
+        df.loc[mask_reg, col_fj] = 0
+        df.loc[mask_reg, col_atr] = 0
+        df.loc[mask_reg, col_obs] = df.loc[mask_reg, col_obs] + " | Regularizado"
+
+    # ---------- 2. DECISIONES DEL SUPERVISOR ----------
+    if decisiones:
+        df_dec = pd.DataFrame(decisiones)
+        df_dec['_key'] = df_dec['carnet_identidad'].astype(str).str.strip() + "_" + df_dec['fecha'].astype(str).str[:10]
+
+        for _, dec in df_dec.iterrows():
+            key = dec['_key']
+            decision = str(dec.get('decision', '')).strip()
+            tipo_falta = str(dec.get('tipo_falta', 'N/A')).strip()
+            mask = df['_key'] == key
+
+            if not mask.any():
+                continue
+
+            # Observaciones
+            texto = f" | {decision}"
+            if tipo_falta and tipo_falta != 'N/A':
+                texto += f" ({tipo_falta})"
+            df.loc[mask, col_obs] = df.loc[mask, col_obs] + texto
+
+            # Horas Extra
+            if "Acumular" in decision:
+                df.loc[mask, col_he] = pd.to_numeric(df.loc[mask, col_he], errors='coerce').fillna(0) + 2.0
+
+            # Faltas y Atrasos según decisión
+            if "Aprobado" in decision or "Justificado" in decision:
+                df.loc[mask, col_fi] = 0
+                df.loc[mask, col_atr] = 0
+
+                if tipo_falta == "Justificada":
+                    df.loc[mask, col_fj] = 1
+                    df.loc[mask, col_fi] = 0
+                else:
+                    df.loc[mask, col_fj] = 0
+                    df.loc[mask, col_fi] = 0
+
+            elif tipo_falta == "Justificada":
+                df.loc[mask, col_fj] = 1
+                df.loc[mask, col_fi] = 0
+                df.loc[mask, col_atr] = 0
+
+            elif tipo_falta == "Injustificada":
+                df.loc[mask, col_fj] = 0
+                df.loc[mask, col_fi] = 1
+
+    # ---------- 3. CANJES (aproximación) ----------
+    if canjes:
+        df_canje = pd.DataFrame(canjes)
+        for _, c in df_canje.iterrows():
+            nombre = str(c.get('nombre', '')).strip()
+            horas_usadas = float(c.get('horas_usadas', 0) or 0)
+            mask_emp = df[col_nom].astype(str).str.strip() == nombre
+            if mask_emp.any():
+                total_he = pd.to_numeric(df.loc[mask_emp, col_he], errors='coerce').fillna(0).sum()
+                if total_he > 0 and horas_usadas > 0:
+                    factor = max(0.0, 1.0 - (horas_usadas / total_he))
+                    df.loc[mask_emp, col_he] = pd.to_numeric(df.loc[mask_emp, col_he], errors='coerce').fillna(0) * factor
+                df.loc[mask_emp, col_obs] = df.loc[mask_emp, col_obs] + f" | Canje {c.get('dias_canjeados', 0)} día(s)"
+
+    df.drop(columns=['_key'], inplace=True, errors='ignore')
+    return df
+
 st.set_page_config(page_title="Pre-Planilla Fridolin", page_icon="🏭", layout="wide")
 st.title("🏭 Control de Asistencia y Reportes - Fridolin")
 
@@ -56,9 +173,10 @@ opcion = st.sidebar.radio("Seleccione una vista:", [
     "📜 Bitácora de Auditoría"
 ])
 st.sidebar.divider()
-st.sidebar.caption("v2.11 - Exportación Excel oficial")
+st.sidebar.caption("v2.13 - Ajustes A: Extras + Faltas + Observaciones")
 
-# 1. PARÁMETROS
+# ==================== VISTAS (resto igual, solo cambio en Pre-Planilla) ====================
+
 if opcion == "📊 Parámetros y Reglas":
     st.header("⚙️ Parámetros y Reglas")
     data = [
@@ -69,7 +187,6 @@ if opcion == "📊 Parámetros y Reglas":
     ]
     st.dataframe(pd.DataFrame(data), use_container_width=True, hide_index=True)
 
-# 2. BIOMÉTRICO
 elif opcion == "⏱️ Importación Biométrico":
     st.header("⏱️ Importación Biométrico")
     try:
@@ -80,7 +197,6 @@ elif opcion == "⏱️ Importación Biométrico":
     except Exception as e:
         st.error(str(e))
 
-# 3. NOVEDADES
 elif opcion == "📝 Novedades y Permisos":
     st.header("📝 Novedades y Permisos")
     dict_nombre_ci = {}
@@ -114,22 +230,17 @@ elif opcion == "📝 Novedades y Permisos":
         if st.form_submit_button("Registrar"):
             if emp_id and emp_nombre:
                 res = nov_mgr.registrar_novedad(emp_id, emp_nombre, tipo, str(f_ini), str(f_fin), just, usuario_actual)
-                if res.get("exito"):
-                    st.success(res["mensaje"])
-                else:
-                    st.error(res.get("mensaje"))
+                st.success(res["mensaje"]) if res.get("exito") else st.error(res.get("mensaje"))
 
     st.subheader("Novedades Registradas")
     todas = nov_mgr.obtener_todas_novedades()
     if todas:
         st.dataframe(pd.DataFrame(todas), use_container_width=True, hide_index=True)
     else:
-        st.info("Sin novedades registradas")
+        st.info("Sin novedades")
 
-# 4. APROBACIONES
 elif opcion == "✅ Aprobaciones Supervisores":
     st.header("✅ Panel de Aprobaciones de Supervisores")
-
     try:
         df_bio = cached_load_sheet_data("02_Importacion_Biometrico")
         df_bio['dt_temp'] = pd.to_datetime(df_bio.iloc[:, 2], dayfirst=True, errors='coerce')
@@ -160,7 +271,6 @@ elif opcion == "✅ Aprobaciones Supervisores":
                 df_params = cached_load_sheet_data("05_Parametros_y_Reglas")
                 df_emp = cached_load_sheet_data("01_Maestro_Empleados")
                 df_bio_p = df_bio[df_bio['dt_temp'].dt.strftime('%Y-%m') == periodo_sel].copy()
-
                 df_res = process_attendance(df_bio_p, df_params, None, df_emp, None)
                 df_exc = detect_exceptions(df_res)
 
@@ -188,26 +298,21 @@ elif opcion == "✅ Aprobaciones Supervisores":
                         df_dec = pd.DataFrame(decisiones)
                         col_ci = next((c for c in df_exc.columns if 'carnet' in str(c).lower() or str(c).upper() in ['ID','CI']), None)
                         col_fecha = next((c for c in df_exc.columns if 'fecha' in str(c).lower()), None)
-
                         if col_ci and col_fecha:
                             df_exc = df_exc.copy()
                             df_exc['_key'] = df_exc[col_ci].astype(str).str.strip() + "_" + df_exc[col_fecha].astype(str).str[:10]
                             df_dec['_key'] = df_dec['carnet_identidad'].astype(str).str.strip() + "_" + df_dec['fecha'].astype(str).str[:10]
-
                             keys_aprobados = set(df_dec[df_dec['decision'].astype(str).str.contains("Aprobado", case=False, na=False)]['_key'])
                             if "Tipo Excepción" in df_exc.columns:
                                 mask_falta = df_exc["Tipo Excepción"].astype(str).str.contains("Falta", case=False, na=False)
                                 df_exc = df_exc[~(mask_falta & df_exc['_key'].isin(keys_aprobados))].copy()
-
                             mapa_dec = dict(zip(df_dec['_key'], df_dec.get('decision', '')))
                             mapa_tf = dict(zip(df_dec['_key'], df_dec.get('tipo_falta', '')))
-
                             for col in df_exc.columns:
                                 if 'decisión' in str(col).lower() or 'decision' in str(col).lower():
                                     df_exc[col] = df_exc['_key'].map(mapa_dec).fillna(df_exc[col])
                                 if 'tipo falta' in str(col).lower():
                                     df_exc[col] = df_exc['_key'].map(mapa_tf).fillna(df_exc[col])
-
                             df_exc.drop(columns=['_key'], inplace=True, errors='ignore')
 
                 st.session_state['df_exc'] = df_exc
@@ -216,7 +321,6 @@ elif opcion == "✅ Aprobaciones Supervisores":
 
         if 'df_exc' in st.session_state and st.session_state.get('periodo_cargado') == periodo_sel:
             df_exc = st.session_state['df_exc']
-
             if df_exc is not None and not df_exc.empty:
                 col_f1, col_f2 = st.columns(2)
                 with col_f1:
@@ -237,32 +341,16 @@ elif opcion == "✅ Aprobaciones Supervisores":
                 with st.form("form_guardar_decisiones"):
                     col_decision = next((c for c in df_fil.columns if 'decisión' in str(c).lower() or 'decision' in str(c).lower()), None)
                     col_tipo_falta = next((c for c in df_fil.columns if 'tipo falta' in str(c).lower()), None)
-
                     column_config = {}
                     if col_decision:
-                        column_config[col_decision] = st.column_config.SelectboxColumn(
-                            "Decisión",
-                            options=["Pendiente", "Aprobado (Pago)", "Acumular (Próx. Mes)", "Rechazado", "Justificado", "Canjeado"]
-                        )
+                        column_config[col_decision] = st.column_config.SelectboxColumn("Decisión", options=["Pendiente", "Aprobado (Pago)", "Acumular (Próx. Mes)", "Rechazado", "Justificado", "Canjeado"])
                     if col_tipo_falta:
-                        column_config[col_tipo_falta] = st.column_config.SelectboxColumn(
-                            "Tipo Falta",
-                            options=["N/A", "Justificada", "Injustificada"]
-                        )
+                        column_config[col_tipo_falta] = st.column_config.SelectboxColumn("Tipo Falta", options=["N/A", "Justificada", "Injustificada"])
 
-                    df_edited = st.data_editor(
-                        df_fil,
-                        use_container_width=True,
-                        hide_index=True,
-                        disabled=not es_editable,
-                        column_config=column_config,
-                        key="editor_form"
-                    )
-
+                    df_edited = st.data_editor(df_fil, use_container_width=True, hide_index=True, disabled=not es_editable, column_config=column_config, key="editor_form")
                     submitted = st.form_submit_button("💾 Guardar Decisiones", type="primary", disabled=not es_editable)
 
                     if submitted:
-                        st.write("⏳ Procesando...")
                         col_ci = next((c for c in df_edited.columns if 'carnet' in str(c).lower() or str(c).upper() in ['ID','CI']), None)
                         col_nom = next((c for c in df_edited.columns if 'nombre' in str(c).lower()), None)
                         col_fec = next((c for c in df_edited.columns if 'fecha' in str(c).lower()), None)
@@ -276,10 +364,8 @@ elif opcion == "✅ Aprobaciones Supervisores":
                                 ci_val = str(row.get(col_ci, "")).strip()
                                 if not ci_val or ci_val.lower() in ['nan', 'none', '']:
                                     continue
-
                                 decision_val = str(row.get(col_dec, "Pendiente")).strip() if col_dec else "Pendiente"
                                 tipo_exc = str(row.get(col_tip, "")).strip() if col_tip else ""
-
                                 data = {
                                     "periodo": periodo_sel,
                                     "carnet_identidad": ci_val,
@@ -291,7 +377,6 @@ elif opcion == "✅ Aprobaciones Supervisores":
                                     "observaciones": "",
                                     "registrado_por": usuario_actual
                                 }
-
                                 res = db_mgr.guardar_decision(data)
                                 if res.get("exito"):
                                     guardadas += 1
@@ -307,9 +392,7 @@ elif opcion == "✅ Aprobaciones Supervisores":
                                             "registrado_por": usuario_actual
                                         }
                                         db_mgr.guardar_regularizacion(data_reg)
-
                             st.success(f"✅ {guardadas} decisiones guardadas.")
-                            st.info("Si aprobaste faltas, vuelve a Cargar Excepciones.")
             else:
                 st.success("No hay excepciones pendientes.")
         else:
@@ -337,7 +420,6 @@ elif opcion == "✅ Aprobaciones Supervisores":
                 hora_entrada = st.time_input("Hora Entrada", value=time(7, 0))
                 hora_salida = st.time_input("Hora Salida", value=time(15, 30))
                 motivo_reg = st.text_area("Motivo*")
-
             if st.form_submit_button("✅ Registrar Regularización", type="primary"):
                 if not emp_reg or emp_reg == "(Sin)" or not motivo_reg:
                     st.warning("Complete los campos.")
@@ -358,17 +440,14 @@ elif opcion == "✅ Aprobaciones Supervisores":
                     audit_log.registrar_evento(usuario_actual, usuario_actual, "REGULARIZACION_OMISION", "Aprobaciones", data_reg)
                     if res.get("exito"):
                         st.success(f"✅ Regularización guardada para {emp_reg}.")
-                        st.info("Vuelve a Cargar Excepciones.")
                     else:
                         st.error(res.get("mensaje"))
 
     except Exception as e:
         st.error(f"Error: {e}")
 
-# 5. CANJE
 elif opcion == "🔄 Canje de Horas":
     st.header("🔄 Canje de Horas Extras por Faltas")
-
     try:
         df_bio = cached_load_sheet_data("02_Importacion_Biometrico")
         df_bio['dt_temp'] = pd.to_datetime(df_bio.iloc[:, 2], dayfirst=True, errors='coerce')
@@ -383,23 +462,17 @@ elif opcion == "🔄 Canje de Horas":
         else:
             df_dec = pd.DataFrame(decisiones)
             df_acum = df_dec[df_dec['decision'].astype(str).str.contains("Acumular", case=False, na=False)].copy()
-
             if df_acum.empty:
                 st.info("No hay horas marcadas como “Acumular (Próx. Mes)”.")
             else:
-                st.subheader("Detalle de horas acumuladas")
                 st.dataframe(df_acum[["nombre", "fecha", "tipo_excepcion", "decision"]], use_container_width=True, hide_index=True)
-
-                resumen = df_acum.groupby("nombre").size().reset_index(name="Registros Acumulados")
-                st.subheader("Resumen por empleado")
+                resumen = df_acum.groupby("nombre").size().reset_index(name="Registros")
                 st.dataframe(resumen, use_container_width=True, hide_index=True)
 
-                st.divider()
                 empleados_con_he = sorted(df_acum['nombre'].dropna().unique().tolist())
-                emp_sel = st.selectbox("Empleado a canjear:", empleados_con_he)
+                emp_sel = st.selectbox("Empleado:", empleados_con_he)
                 cant = len(df_acum[df_acum['nombre'] == emp_sel])
-                st.info(f"**{emp_sel}** tiene {cant} registro(s) acumulado(s).")
-
+                st.info(f"**{emp_sel}** → {cant} registro(s)")
                 dias_a_canjear = st.number_input("Días a canjear:", min_value=0.0, max_value=10.0, step=0.5, value=0.0)
 
                 if st.button("💾 Guardar Canje", type="primary"):
@@ -418,27 +491,23 @@ elif opcion == "🔄 Canje de Horas":
                         }
                         res = db_mgr.guardar_canje(data)
                         if res.get("exito"):
-                            st.success(f"✅ Canje guardado para {emp_sel}")
+                            st.success(f"✅ Canje guardado")
                             st.rerun()
                         else:
                             st.error(res.get("mensaje"))
 
         st.divider()
-        st.subheader("Canjes realizados")
         if canjes_existentes:
             st.dataframe(pd.DataFrame(canjes_existentes), use_container_width=True, hide_index=True)
         else:
             st.info("Aún no hay canjes.")
-
     except Exception as e:
         st.error(str(e))
 
-# 6. VALORES
 elif opcion == "💵 Valores Monetizados":
     st.header("💵 Valores Monetizados")
     st.info("Módulo de tarifas.")
 
-# 7. PRE-PLANILLA + EXPORTACIÓN EXCEL
 elif opcion == "📑 Pre-Planilla y Reportes":
     st.header("📑 Pre-Planilla Consolidada")
 
@@ -451,7 +520,6 @@ elif opcion == "📑 Pre-Planilla y Reportes":
         estado = lock_mgr.obtener_estado_periodo(periodo_sel, usuario=usuario_actual)
         st.info(f"**Estado del período:** {estado}")
 
-        # Resumen rápido
         decisiones = db_mgr.obtener_decisiones_periodo(periodo_sel)
         regularizaciones = db_mgr.obtener_regularizaciones_periodo(periodo_sel)
         canjes = db_mgr.obtener_canjes_periodo(periodo_sel)
@@ -462,21 +530,17 @@ elif opcion == "📑 Pre-Planilla y Reportes":
         col3.metric("Canjes", len(canjes) if canjes else 0)
 
         st.divider()
-
-        # Botón de descarga
-        st.subheader("Descargar Pre-Planilla Oficial (3 pestañas)")
-        st.caption("Se exportan solo los empleados de tu área (si eres supervisor) o todos (si eres superusuario).")
+        st.subheader("Descargar Pre-Planilla Oficial")
+        st.caption("Se aplican decisiones, regularizaciones y canjes antes de exportar.")
 
         if st.button("📥 Generar y Descargar Excel Oficial", type="primary"):
-            with st.spinner("Procesando marcaciones y generando Excel..."):
+            with st.spinner("Procesando + aplicando decisiones..."):
                 df_params = cached_load_sheet_data("05_Parametros_y_Reglas")
                 df_emp = cached_load_sheet_data("01_Maestro_Empleados")
                 df_bio_p = df_bio[df_bio['dt_temp'].dt.strftime('%Y-%m') == periodo_sel].copy()
 
-                # Procesar asistencia
                 df_res = process_attendance(df_bio_p, df_params, None, df_emp, None)
 
-                # Filtrar por supervisor si corresponde
                 if empleados_permitidos and rol_actual != "Jefe de Producción":
                     try:
                         col_nom = next((c for c in df_res.columns if 'nombre' in str(c).lower()), None)
@@ -485,14 +549,13 @@ elif opcion == "📑 Pre-Planilla y Reportes":
                     except:
                         pass
 
-                # Preparar datos para el exporter
+                # Aplicar decisiones
+                df_res = aplicar_decisiones_a_asistencia(df_res, decisiones, regularizaciones, canjes)
+
                 datos_asistencia = df_res.to_dict('records') if df_res is not None and not df_res.empty else []
                 maestro = df_emp.to_dict('records') if df_emp is not None else []
 
-                # Generar Excel
                 nombre_archivo = f"PrePlanilla_Fridolin_{periodo_sel}_{usuario_actual.replace(' ', '_')}.xlsx"
-                
-                # El exporter escribe el archivo y devuelve el nombre
                 resultado = ExcelExporter.exportar_preplanilla_oficial(
                     datos_asistencia=datos_asistencia,
                     maestro_empleados=maestro,
@@ -500,12 +563,10 @@ elif opcion == "📑 Pre-Planilla y Reportes":
                     nombre_archivo=nombre_archivo
                 )
 
-                # Leer el archivo generado para descargarlo
                 try:
                     with open(resultado, "rb") as f:
                         excel_bytes = f.read()
-                    
-                    st.success(f"✅ Excel generado correctamente ({len(datos_asistencia)} registros procesados).")
+                    st.success(f"✅ Excel generado ({len(datos_asistencia)} registros).")
                     st.download_button(
                         label="⬇️ Descargar Pre-Planilla Oficial",
                         data=excel_bytes,
@@ -513,14 +574,11 @@ elif opcion == "📑 Pre-Planilla y Reportes":
                         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
                     )
                 except Exception as e_file:
-                    st.error(f"Excel generado pero no se pudo leer el archivo: {e_file}")
-                    st.info(f"Archivo generado como: {resultado}")
+                    st.error(f"Error al leer archivo: {e_file}")
 
         st.divider()
-        st.subheader("Resumen de datos guardados")
-        
         if decisiones:
-            with st.expander("Decisiones del Supervisor"):
+            with st.expander("Decisiones"):
                 st.dataframe(pd.DataFrame(decisiones), use_container_width=True, hide_index=True)
         if regularizaciones:
             with st.expander("Regularizaciones"):
@@ -532,7 +590,6 @@ elif opcion == "📑 Pre-Planilla y Reportes":
     except Exception as e:
         st.error(f"Error: {e}")
 
-# 8. BITÁCORA
 elif opcion == "📜 Bitácora de Auditoría":
     st.header("📜 Bitácora de Auditoría")
     try:
