@@ -1,7 +1,6 @@
 import openpyxl
 from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
 from openpyxl.utils import get_column_letter
-from datetime import datetime
 from typing import List, Dict, Any
 
 try:
@@ -55,7 +54,8 @@ class ExcelExporter:
                     'Area_Sector': emp.get('Area_Departamento', emp.get('Area_Sector', emp.get('Sector', 'FABRICA'))),
                     'Cargo': emp.get('Rol', emp.get('Cargo', 'OPERARIO')),
                     'Centro_Costo': emp.get('Centro_Costo', 'FRIDOLIN'),
-                    'Tipo_Personal': emp.get('Tipo_Personal', 'Fijo')
+                    'Tipo_Personal': emp.get('Tipo_Personal', 'Fijo'),
+                    'Turno': str(emp.get('Turno', emp.get('Horario', 'Diurno'))).strip()
                 }
 
         font_titulo = Font(name="Calibri", size=14, bold=True, color="FFFFFF")
@@ -131,34 +131,54 @@ class ExcelExporter:
                 'Area_Sector': 'FABRICA',
                 'Cargo': 'OPERARIO',
                 'Centro_Costo': 'FRIDOLIN',
-                'Tipo_Personal': 'Fijo'
+                'Tipo_Personal': 'Fijo',
+                'Turno': 'Diurno'
             })
 
             if str(info_m.get('Tipo_Personal', '')).strip().upper() == 'JORNALERO':
                 continue
 
-            dias_trab = len([r for r in regs if ExcelExporter._safe_float(r.get('Horas Trabajadas', 0)) > 0 or ExcelExporter._safe_float(r.get('Turnos Computados', 0)) > 0])
+            dias_trab = len([
+                r for r in regs
+                if ExcelExporter._safe_float(r.get('Horas Trabajadas', 0)) > 0
+                or ExcelExporter._safe_float(r.get('Turnos Computados', 0)) > 0
+            ])
             if dias_trab == 0:
                 dias_trab = len(regs)
 
             horas_extra = sum(ExcelExporter._safe_float(r.get('Horas Extras', r.get('Horas_Extra', 0))) for r in regs)
 
-            # ½ TURNOS = cantidad de días con Turnos Computados == 1.5
-            medio_turnos = sum(
-                1 for r in regs
-                if ExcelExporter._safe_float(r.get('Turnos Computados', r.get('1/2 Turnos', 0))) >= 1.5
-            )
+            # ===== ½ TURNOS =====
+            # Para personal Nocturno: cuenta TODOS los días con turno nocturno trabajado
+            # Para Diurno: solo cuenta si hay Turnos Computados >= 1.5 (casi nunca)
+            es_nocturno_maestro = "nocturn" in str(info_m.get('Turno', '')).lower()
 
-            # REC. NOCTURNO: solo horas de días nocturnos, con tope razonable
+            if es_nocturno_maestro:
+                # Cuenta días donde el procesador marcó Nocturno o Nocturno Especial
+                medio_turnos = sum(
+                    1 for r in regs
+                    if "nocturn" in str(r.get('Turno Dominante', '')).lower()
+                    and ExcelExporter._safe_float(r.get('Horas Trabajadas', 0)) > 0
+                )
+            else:
+                # Diurno: solo los 1.5 reales (si los hubiera)
+                medio_turnos = sum(
+                    1 for r in regs
+                    if ExcelExporter._safe_float(r.get('Turnos Computados', 0)) >= 1.5
+                )
+
+            # REC. NOCTURNO: solo horas de días nocturnos, tope 8h/día
             rec_nocturno = 0.0
             for r in regs:
                 turno = str(r.get('Turno Dominante', '')).lower()
-                if 'nocturno' in turno:
+                if 'nocturn' in turno:
                     h = ExcelExporter._safe_float(r.get('Horas Nocturnas', r.get('Horas Trabajadas', 0)))
-                    # Tope por día: máximo 8 hrs de recargo
                     rec_nocturno += min(h, 8.0)
 
-            dominicales = sum(1 for r in regs if r.get('Es Dominical', False) or str(r.get('Día', '')).lower() == 'domingo')
+            dominicales = sum(
+                1 for r in regs
+                if r.get('Es Dominical', False) or str(r.get('Día', '')).lower() == 'domingo'
+            )
             atrasos_min = sum(int(ExcelExporter._safe_float(r.get('Atraso (Minutos)', r.get('Atrasos', 0)))) for r in regs)
             faltas_just = sum(int(ExcelExporter._safe_float(r.get('Falta Justificada', 0))) for r in regs)
             faltas_injust = sum(int(ExcelExporter._safe_float(r.get('Falta Injustificada', 0))) for r in regs)
@@ -250,8 +270,8 @@ class ExcelExporter:
 
             d_norm = sum(1 for r in regs if str(r.get('Turno Dominante', '')).lower() == 'diurno' and ExcelExporter._safe_float(r.get('Horas Trabajadas', 0)) <= 9)
             d_15 = sum(1 for r in regs if str(r.get('Turno Dominante', '')).lower() == 'diurno' and ExcelExporter._safe_float(r.get('Horas Trabajadas', 0)) > 9)
-            n_norm = sum(1 for r in regs if 'nocturno' in str(r.get('Turno Dominante', '')).lower() and ExcelExporter._safe_float(r.get('Turnos Computados', 1)) < 1.5)
-            n_15 = sum(1 for r in regs if 'nocturno' in str(r.get('Turno Dominante', '')).lower() and ExcelExporter._safe_float(r.get('Turnos Computados', 0)) >= 1.5)
+            n_norm = sum(1 for r in regs if 'nocturn' in str(r.get('Turno Dominante', '')).lower() and ExcelExporter._safe_float(r.get('Turnos Computados', 1)) < 1.5)
+            n_15 = sum(1 for r in regs if 'nocturn' in str(r.get('Turno Dominante', '')).lower() and ExcelExporter._safe_float(r.get('Turnos Computados', 0)) >= 1.5)
 
             t_d_norm = ExcelExporter._safe_float(obtener_tarifa_empleado(ci, "diurno_normal_8h"))
             t_d_15 = ExcelExporter._safe_float(obtener_tarifa_empleado(ci, "diurno_1_5_12h"))
